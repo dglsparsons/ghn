@@ -1,4 +1,5 @@
 import { Box, Text } from "@opentui/react";
+import { CommandBar } from "./components/CommandBar";
 import { useInput } from "@opentui/react/hooks";
 import { useGitHubToken } from "./hooks/useGitHubToken";
 import { useNotifications } from "./hooks/useNotifications";
@@ -45,9 +46,7 @@ export function App() {
         <Text>Notifications list (placeholder)</Text>
       </Box>
 
-      <Box height={1}>
-        <Text dimColor>&gt; command bar</Text>
-      </Box>
+      <CommandBar buffer="" />
     </Box>
   );
 }
