@@ -5,6 +5,8 @@ import { useCommandBuffer } from "./hooks/useCommandBuffer";
 import { useGitHubToken } from "./hooks/useGitHubToken";
 import { useNotifications } from "./hooks/useNotifications";
 import { executeCommands } from "./lib/executeCommands";
+import { useToast } from "./hooks/useToast";
+import { Toast } from "./components/Toast";
 
 export function App() {
   const { token, loading: tokenLoading, error: tokenError } = useGitHubToken();
@@ -16,6 +18,7 @@ export function App() {
   } = useNotifications(token);
 
   const { state: commandBuffer, addDigit, addAction, clear, backspace } = useCommandBuffer();
+  const { toast, showToast } = useToast();
 
   useInput(async (input: string, key: any) => {
     if (key.escape) {
@@ -41,10 +44,16 @@ export function App() {
       process.exit(0);
     }
 
-    if (input === "R") {
-      await refresh();
-      return;
-    }
+     if (input === "R") {
+       try {
+         await refresh();
+         showToast("Refreshed notifications", "success");
+       } catch (err) {
+         showToast("Refresh failed", "error");
+       }
+       return;
+     }
+
 
     if (/^[0-9]$/.test(input)) {
       addDigit(Number(input));
@@ -97,7 +106,9 @@ export function App() {
         )}
       </Box>
 
-      <CommandBar buffer={commandBuffer.raw} />
-    </Box>
+       <CommandBar buffer={commandBuffer.raw} />
+       {toast && toast.visible && <Toast message={toast.message} type={toast.type} />}
+     </Box>
+
   );
 }
