@@ -28,3 +28,8 @@ Thumbs.db
 .env
 .env.local
 .env.*.local
+
+# Dev notes
+PLAN.md
+PLAN_BACKUP.md
+progress.txt
