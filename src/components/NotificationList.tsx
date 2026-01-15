@@ -7,6 +7,14 @@ export type NotificationListProps = {
 };
 
 export function NotificationList({ notifications, pendingActions }: NotificationListProps) {
+  if (notifications.length === 0) {
+    return (
+      <div style={{ justifyContent: "center", alignItems: "center", height: "100%" }}>
+        No notifications
+      </div>
+    );
+  }
+
   return (
     <div>
       {notifications.map((notification, idx) => (
