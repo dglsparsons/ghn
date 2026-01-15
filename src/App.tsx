@@ -1,6 +1,6 @@
-import { Box, Text } from "@opentui/react";
+import { Box, Text, useInput } from "@opentui/react";
 import { CommandBar } from "./components/CommandBar";
-import { useInput } from "@opentui/react/hooks";
+import { useCommandBuffer } from "./hooks/useCommandBuffer";
 import { useGitHubToken } from "./hooks/useGitHubToken";
 import { useNotifications } from "./hooks/useNotifications";
 
@@ -11,6 +11,37 @@ export function App() {
     loading: notificationsLoading,
     error: notificationsError,
   } = useNotifications(token);
+
+  const { state: commandBuffer, addDigit, addAction, clear, backspace } = useCommandBuffer();
+
+  useInput((input: string, key: any) => {
+    if (key.escape) {
+      clear();
+      return;
+    }
+
+    if (key.backspace) {
+      backspace();
+      return;
+    }
+
+    if (input === "q") {
+      process.exit(0);
+    }
+
+    if (input === "R") {
+      return;
+    }
+
+    if (/^[0-9]$/.test(input)) {
+      addDigit(Number(input));
+      return;
+    }
+
+    if (["o", "y", "r", "d", "u"].includes(input)) {
+      addAction(input as any);
+    }
+  });
 
   if (tokenLoading || notificationsLoading) {
     return (
