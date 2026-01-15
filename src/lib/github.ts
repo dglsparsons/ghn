@@ -47,6 +47,15 @@ export async function fetchNotifications(
   }
 
   if (!response.ok) {
+    if (response.status === 429) {
+      const retryAfter = response.headers?.get?.("Retry-After");
+      const seconds = retryAfter ? Number.parseInt(retryAfter, 10) : null;
+      throw new Error(
+        seconds
+          ? `GitHub rate limited. Retrying in ${seconds}s.`
+          : "GitHub rate limited. Retrying later."
+      );
+    }
     if (response.status === 401 || response.status === 403) {
       throw new Error("GitHub authentication failed. Run 'gh auth login' to reauthenticate.");
     }
@@ -74,6 +83,15 @@ export async function markAsRead(token: string, threadId: string): Promise<boole
   });
 
   if (!response.ok) {
+    if (response.status === 429) {
+      const retryAfter = response.headers?.get?.("Retry-After");
+      const seconds = retryAfter ? Number.parseInt(retryAfter, 10) : null;
+      throw new Error(
+        seconds
+          ? `GitHub rate limited. Retrying in ${seconds}s.`
+          : "GitHub rate limited. Retrying later."
+      );
+    }
     if (response.status === 401 || response.status === 403) {
       throw new Error("GitHub authentication failed. Run 'gh auth login' to reauthenticate.");
     }
@@ -94,6 +112,15 @@ export async function markAsDone(token: string, threadId: string): Promise<boole
   });
 
   if (!response.ok) {
+    if (response.status === 429) {
+      const retryAfter = response.headers?.get?.("Retry-After");
+      const seconds = retryAfter ? Number.parseInt(retryAfter, 10) : null;
+      throw new Error(
+        seconds
+          ? `GitHub rate limited. Retrying in ${seconds}s.`
+          : "GitHub rate limited. Retrying later."
+      );
+    }
     if (response.status === 401 || response.status === 403) {
       throw new Error("GitHub authentication failed. Run 'gh auth login' to reauthenticate.");
     }
@@ -117,6 +144,15 @@ export async function unsubscribe(token: string, threadId: string): Promise<bool
   );
 
   if (!response.ok) {
+    if (response.status === 429) {
+      const retryAfter = response.headers?.get?.("Retry-After");
+      const seconds = retryAfter ? Number.parseInt(retryAfter, 10) : null;
+      throw new Error(
+        seconds
+          ? `GitHub rate limited. Retrying in ${seconds}s.`
+          : "GitHub rate limited. Retrying later."
+      );
+    }
     if (response.status === 401 || response.status === 403) {
       throw new Error("GitHub authentication failed. Run 'gh auth login' to reauthenticate.");
     }
