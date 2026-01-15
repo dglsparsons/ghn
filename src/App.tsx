@@ -1,3 +1,4 @@
+import React from "react";
 import { Box, Text, useInput } from "@opentui/react";
 import { CommandBar } from "./components/CommandBar";
 import { NotificationList } from "./components/NotificationList";
@@ -19,6 +20,7 @@ export function App({ showAll, intervalSeconds }: { showAll: boolean; intervalSe
 
   const { state: commandBuffer, addDigit, addAction, clear, backspace } = useCommandBuffer();
   const { toast, showToast } = useToast();
+  const [selectedIndex, setSelectedIndex] = React.useState(1);
 
   useInput(async (input: string, key: any) => {
     if (key.escape) {
@@ -44,6 +46,16 @@ export function App({ showAll, intervalSeconds }: { showAll: boolean; intervalSe
           clear();
           await refresh();
         }
+      return;
+    }
+
+    if (input === "j" || key.downArrow) {
+      setSelectedIndex((i) => Math.min(i + 1, notifications?.length ?? i));
+      return;
+    }
+
+    if (input === "k" || key.upArrow) {
+      setSelectedIndex((i) => Math.max(i - 1, 1));
       return;
     }
 
@@ -105,7 +117,7 @@ export function App({ showAll, intervalSeconds }: { showAll: boolean; intervalSe
 
       <Box flexGrow={1}>
         {notifications && (
-          <NotificationList notifications={notifications} pendingActions={pendingActions} />
+          <NotificationList notifications={notifications} pendingActions={pendingActions} selectedIndex={selectedIndex} />
         )}
       </Box>
 
