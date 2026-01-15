@@ -11,13 +11,16 @@ Usage:
   ghn [options]
 
 Options:
-  --all            Show all notifications, including read ones
-  --interval N     Poll interval in seconds (default from GitHub)
+  --unread         Show only unread notifications (default shows read + unread)
+  --interval N     Poll interval in seconds (default: 60)
   --help, -h       Show this help message
+
+Note: Requires 'notifications' scope. Run: gh auth refresh -h github.com -s notifications
 `);
   process.exit(0);
 }
-const showAll = args.includes("--all");
+
+const includeRead = !args.includes("--unread");
 
 let intervalSeconds: number | undefined;
 const intervalIndex = args.indexOf("--interval");
@@ -31,4 +34,4 @@ if (intervalIndex !== -1) {
 }
 
 const renderer = await createCliRenderer();
-createRoot(renderer).render(<App showAll={showAll} intervalSeconds={intervalSeconds} />);
+createRoot(renderer).render(<App includeRead={includeRead} intervalSeconds={intervalSeconds} />);

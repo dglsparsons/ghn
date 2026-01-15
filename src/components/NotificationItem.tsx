@@ -10,7 +10,7 @@ import { formatRelativeTime } from "../lib/time";
 
 function extractIssueNumber(url: string | null): string | null {
   if (!url) return null;
-  const match = url.match(/\/(issues|pulls)\/(\d+)/);
+  const match = url.match(/\/(issues|pulls?|discussions)\/(\d+)/);
   return match ? `#${match[2]}` : null;
 }
 

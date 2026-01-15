@@ -9,14 +9,14 @@ import { executeCommands } from "./lib/executeCommands";
 import { useToast } from "./hooks/useToast";
 import { Toast } from "./components/Toast";
 
-export function App({ showAll, intervalSeconds }: { showAll: boolean; intervalSeconds?: number }) {
+export function App({ includeRead, intervalSeconds }: { includeRead: boolean; intervalSeconds?: number }) {
   const { token, loading: tokenLoading, error: tokenError } = useGitHubToken();
   const {
     notifications,
     loading: notificationsLoading,
     error: notificationsError,
     refresh,
-  } = useNotifications(token, { all: showAll, intervalSeconds });
+  } = useNotifications(token, { includeRead, intervalSeconds });
 
   const { state: commandBuffer, addDigit, addAction, clear, backspace } = useCommandBuffer();
   const { toast, showToast } = useToast();
@@ -104,7 +104,11 @@ export function App({ showAll, intervalSeconds }: { showAll: boolean; intervalSe
   }
 
   if (notificationsError) {
-    showToast(String(notificationsError), "error");
+    return (
+      <box style={{ flexDirection: "column" }}>
+        <text fg="red">{String(notificationsError)}</text>
+      </box>
+    );
   }
 
   const pendingActions = new Map<number, any>();

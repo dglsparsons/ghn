@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Notification } from "../types";
 import { fetchNotifications } from "../lib/github";
 
@@ -9,34 +9,33 @@ interface UseNotificationsResult {
   refresh: () => Promise<void>;
 }
 
-export function useNotifications(token: string | null, options?: { all?: boolean; intervalSeconds?: number }): UseNotificationsResult {
+export function useNotifications(
+  token: string | null,
+  options?: { includeRead?: boolean; intervalSeconds?: number }
+): UseNotificationsResult {
+  const includeRead = options?.includeRead ?? false;
+  const intervalSeconds = options?.intervalSeconds ?? 60;
+
   const [notifications, setNotifications] = useState<Notification[] | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
-  const [lastModified, setLastModified] = useState<string | null>(null);
-  const [pollIntervalMs, setPollIntervalMs] = useState<number>(options?.intervalSeconds ? options.intervalSeconds * 1000 : 60000);
+  const pollIntervalRef = useRef(intervalSeconds * 1000);
 
   const load = useCallback(async () => {
     if (!token) return;
-    setLoading(true);
-    setError(null);
     try {
-      const result = await fetchNotifications(token, { since: lastModified ?? undefined, all: options?.all });
+      const result = await fetchNotifications(token, { includeRead });
       if (result.pollInterval) {
-        setPollIntervalMs(result.pollInterval * 1000);
+        pollIntervalRef.current = result.pollInterval * 1000;
       }
-      if (result.notifications !== null) {
-        setNotifications(result.notifications);
-      }
-      if (result.lastModified) {
-        setLastModified(result.lastModified);
-      }
+      setNotifications(result.notifications);
+      setError(null);
     } catch (err) {
       setError(err as Error);
     } finally {
       setLoading(false);
     }
-  }, [token, lastModified]);
+  }, [token, includeRead]);
 
   useEffect(() => {
     load();
@@ -44,11 +43,9 @@ export function useNotifications(token: string | null, options?: { all?: boolean
 
   useEffect(() => {
     if (!token) return;
-    const id = setInterval(() => {
-      load();
-    }, pollIntervalMs);
+    const id = setInterval(load, pollIntervalRef.current);
     return () => clearInterval(id);
-  }, [token, load, pollIntervalMs]);
+  }, [token, load]);
 
   return {
     notifications,
