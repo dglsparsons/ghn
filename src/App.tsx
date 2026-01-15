@@ -1,5 +1,5 @@
 import React from "react";
-import { Box, Text, useInput } from "@opentui/react";
+import { useKeyboard } from "@opentui/react";
 import { CommandBar } from "./components/CommandBar";
 import { NotificationList } from "./components/NotificationList";
 import { useCommandBuffer } from "./hooks/useCommandBuffer";
@@ -22,18 +22,21 @@ export function App({ showAll, intervalSeconds }: { showAll: boolean; intervalSe
   const { toast, showToast } = useToast();
   const [selectedIndex, setSelectedIndex] = React.useState(1);
 
-  useInput(async (input: string, key: any) => {
-    if (key.escape) {
+  useKeyboard(async (key) => {
+    // For regular characters, name contains the character itself
+    const input = key.name.length === 1 ? key.name : "";
+
+    if (key.name === "escape") {
       clear();
       return;
     }
 
-    if (key.backspace) {
+    if (key.name === "backspace") {
       backspace();
       return;
     }
 
-    if (key.return) {
+    if (key.name === "return") {
         if (token && notifications && commandBuffer.commands.length > 0) {
           const { succeeded, failed } = await executeCommands(commandBuffer.commands, notifications, token);
           if (failed > 0) {
@@ -49,12 +52,12 @@ export function App({ showAll, intervalSeconds }: { showAll: boolean; intervalSe
       return;
     }
 
-    if (input === "j" || key.downArrow) {
+    if (input === "j" || key.name === "down") {
       setSelectedIndex((i) => Math.min(i + 1, notifications?.length ?? i));
       return;
     }
 
-    if (input === "k" || key.upArrow) {
+    if (input === "k" || key.name === "up") {
       setSelectedIndex((i) => Math.max(i - 1, 1));
       return;
     }
@@ -86,17 +89,17 @@ export function App({ showAll, intervalSeconds }: { showAll: boolean; intervalSe
 
   if (tokenLoading || notificationsLoading) {
     return (
-      <Box flexDirection="column">
-        <Text>Loading…</Text>
-      </Box>
+      <box style={{ flexDirection: "column" }}>
+        <text>Loading…</text>
+      </box>
     );
   }
 
   if (tokenError) {
     return (
-      <Box flexDirection="column">
-        <Text color="red">{tokenError}</Text>
-      </Box>
+      <box style={{ flexDirection: "column" }}>
+        <text fg="red">{tokenError.message}</text>
+      </box>
     );
   }
 
@@ -110,20 +113,20 @@ export function App({ showAll, intervalSeconds }: { showAll: boolean; intervalSe
   }
 
   return (
-    <Box flexDirection="column" height="100%">
-      <Box height={1}>
-        <Text bold>ghn</Text>
-      </Box>
+    <box style={{ flexDirection: "column", height: "100%" }}>
+      <box style={{ height: 1 }}>
+        <text><strong>ghn</strong></text>
+      </box>
 
-      <Box flexGrow={1}>
+      <box style={{ flexGrow: 1 }}>
         {notifications && (
           <NotificationList notifications={notifications} pendingActions={pendingActions} selectedIndex={selectedIndex} />
         )}
-      </Box>
+      </box>
 
        <CommandBar buffer={commandBuffer.raw} />
        {toast && toast.visible && <Toast message={toast.message} type={toast.type} />}
-     </Box>
+     </box>
 
   );
 }

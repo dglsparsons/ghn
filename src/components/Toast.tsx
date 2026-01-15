@@ -1,4 +1,3 @@
-import { Box, Text } from "@opentui/react";
 import type { ToastType } from "../hooks/useToast";
 
 interface ToastProps {
@@ -7,19 +6,21 @@ interface ToastProps {
 }
 
 export function Toast({ message, type }: ToastProps) {
-  const color = type === "success" ? "green" : "red";
+  const fg = type === "success" ? "green" : "red";
 
   return (
-    <Box
-      position="absolute"
-      bottom={1}
-      left={0}
-      right={0}
-      justifyContent="center"
+    <box
+      style={{
+        position: "absolute",
+        bottom: 1,
+        left: 0,
+        right: 0,
+        justifyContent: "center",
+      }}
     >
-      <Box paddingX={1} paddingY={0} borderStyle="round">
-        <Text color={color}>{message}</Text>
-      </Box>
-    </Box>
+      <box style={{ paddingX: 1, paddingY: 0, border: "rounded" }}>
+        <text fg={fg}>{message}</text>
+      </box>
+    </box>
   );
 }

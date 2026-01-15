@@ -1,4 +1,3 @@
-import { Box, Text } from "@opentui/react";
 import type { Notification, Action } from "../types";
 import { formatRelativeTime } from "../lib/time";
 
@@ -20,7 +19,7 @@ function extractIssueNumber(url: string | null): string | null {
   const issueNumber = extractIssueNumber(notification.subject.url);
   const relativeTime = formatRelativeTime(notification.updated_at);
 
-  const color =
+  const fg =
     pendingAction === "o"
       ? "blue"
       : pendingAction === "y"
@@ -33,12 +32,13 @@ function extractIssueNumber(url: string | null): string | null {
       ? "red"
       : undefined;
 
+   const content = `${index}. ${notification.unread ? "● " : "  "}${repo} ${issueNumber ?? ""} ${notification.subject.title} (${relativeTime})`;
+
    return (
-     <Box height={1}>
-       <Text color={color} bold={selected}>
-         {index}. {notification.unread ? "● " : "  "}
-         {repo} {issueNumber ?? ""} {notification.subject.title} ({relativeTime})
-       </Text>
-     </Box>
+     <box style={{ height: 1 }}>
+       <text fg={fg}>
+         {selected ? <strong>{content}</strong> : content}
+       </text>
+     </box>
    );
 }

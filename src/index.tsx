@@ -1,4 +1,5 @@
-import { render } from "@opentui/react/renderer";
+import { createCliRenderer } from "@opentui/core";
+import { createRoot } from "@opentui/react";
 import { App } from "./App";
 
 const args = process.argv.slice(2);
@@ -29,4 +30,5 @@ if (intervalIndex !== -1) {
   intervalSeconds = value;
 }
 
-render(<App showAll={showAll} intervalSeconds={intervalSeconds} />);
+const renderer = await createCliRenderer();
+createRoot(renderer).render(<App showAll={showAll} intervalSeconds={intervalSeconds} />);

@@ -1,5 +1,3 @@
-import { Box, Text } from "@opentui/react";
-
 interface CommandBarProps {
   buffer: string;
 }
@@ -10,8 +8,8 @@ export function CommandBar({ buffer }: CommandBarProps) {
     : "> o:open r:read d:done y:yank u:unsub";
 
   return (
-    <Box height={1} borderTop>
-      <Text>{content}</Text>
-    </Box>
+    <box style={{ height: 1, borderTop: 1 }}>
+      <text>{content}</text>
+    </box>
   );
 }

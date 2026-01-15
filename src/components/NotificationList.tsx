@@ -10,14 +10,14 @@ import { NotificationItem } from "./NotificationItem";
  export function NotificationList({ notifications, pendingActions, selectedIndex }: NotificationListProps) {
   if (notifications.length === 0) {
     return (
-      <div style={{ justifyContent: "center", alignItems: "center", height: "100%" }}>
-        No notifications
-      </div>
+      <box style={{ justifyContent: "center", alignItems: "center", height: "100%" }}>
+        <text>No notifications</text>
+      </box>
     );
   }
 
   return (
-    <div>
+    <box style={{ flexDirection: "column" }}>
       {notifications.map((notification, idx) => (
          <NotificationItem
            key={notification.id}
@@ -27,6 +27,6 @@ import { NotificationItem } from "./NotificationItem";
            selected={selectedIndex === idx + 1}
          />
       ))}
-    </div>
+    </box>
   );
 }

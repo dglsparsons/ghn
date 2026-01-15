@@ -21,13 +21,11 @@ export function useGitHubToken(): GitHubTokenState {
           stderr: "pipe",
         });
 
-        const stdout = new TextDecoder().decode(
-          await (proc.stdout as any).arrayBuffer()
-        );
-        const stderr = new TextDecoder().decode(
-          await (proc.stderr as any).arrayBuffer()
-        );
-        const exitCode = await proc.exited;
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
 
         if (exitCode !== 0) {
           if (/not found|No such file/i.test(stderr)) {
