@@ -1,5 +1,6 @@
 import { Box, Text, useInput } from "@opentui/react";
 import { CommandBar } from "./components/CommandBar";
+import { NotificationList } from "./components/NotificationList";
 import { useCommandBuffer } from "./hooks/useCommandBuffer";
 import { useGitHubToken } from "./hooks/useGitHubToken";
 import { useNotifications } from "./hooks/useNotifications";
@@ -79,6 +80,11 @@ export function App() {
     );
   }
 
+  const pendingActions = new Map<number, any>();
+  for (const cmd of commandBuffer.commands) {
+    pendingActions.set(cmd.index, cmd.action);
+  }
+
   return (
     <Box flexDirection="column" height="100%">
       <Box height={1}>
@@ -86,10 +92,12 @@ export function App() {
       </Box>
 
       <Box flexGrow={1}>
-        <Text>Notifications list (placeholder)</Text>
+        {notifications && (
+          <NotificationList notifications={notifications} pendingActions={pendingActions} />
+        )}
       </Box>
 
-      <CommandBar buffer="" />
+      <CommandBar buffer={commandBuffer.raw} />
     </Box>
   );
 }

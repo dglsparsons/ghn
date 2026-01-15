@@ -19,9 +19,22 @@ export function NotificationItem({ notification, index, pendingAction }: Notific
   const issueNumber = extractIssueNumber(notification.subject.url);
   const relativeTime = formatRelativeTime(notification.updated_at);
 
+  const color =
+    pendingAction === "o"
+      ? "blue"
+      : pendingAction === "y"
+      ? "yellow"
+      : pendingAction === "r"
+      ? "gray"
+      : pendingAction === "d"
+      ? "green"
+      : pendingAction === "u"
+      ? "red"
+      : undefined;
+
   return (
     <Box height={1}>
-      <Text>
+      <Text color={color}>
         {index}. {notification.unread ? "● " : "  "}
         {repo} {issueNumber ?? ""} {notification.subject.title} ({relativeTime})
       </Text>
