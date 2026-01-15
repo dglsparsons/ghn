@@ -9,7 +9,7 @@ interface UseNotificationsResult {
   refresh: () => Promise<void>;
 }
 
-export function useNotifications(token: string | null): UseNotificationsResult {
+export function useNotifications(token: string | null, options?: { all?: boolean }): UseNotificationsResult {
   const [notifications, setNotifications] = useState<Notification[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
@@ -21,7 +21,7 @@ export function useNotifications(token: string | null): UseNotificationsResult {
     setLoading(true);
     setError(null);
     try {
-      const result = await fetchNotifications(token, { since: lastModified ?? undefined });
+      const result = await fetchNotifications(token, { since: lastModified ?? undefined, all: options?.all });
       if (result.pollInterval) {
         setPollIntervalMs(result.pollInterval * 1000);
       }

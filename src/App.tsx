@@ -8,14 +8,14 @@ import { executeCommands } from "./lib/executeCommands";
 import { useToast } from "./hooks/useToast";
 import { Toast } from "./components/Toast";
 
-export function App() {
+export function App({ showAll }: { showAll: boolean }) {
   const { token, loading: tokenLoading, error: tokenError } = useGitHubToken();
   const {
     notifications,
     loading: notificationsLoading,
     error: notificationsError,
     refresh,
-  } = useNotifications(token);
+  } = useNotifications(token, { all: showAll });
 
   const { state: commandBuffer, addDigit, addAction, clear, backspace } = useCommandBuffer();
   const { toast, showToast } = useToast();
