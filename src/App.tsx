@@ -3,6 +3,7 @@ import { CommandBar } from "./components/CommandBar";
 import { useCommandBuffer } from "./hooks/useCommandBuffer";
 import { useGitHubToken } from "./hooks/useGitHubToken";
 import { useNotifications } from "./hooks/useNotifications";
+import { executeCommands } from "./lib/executeCommands";
 
 export function App() {
   const { token, loading: tokenLoading, error: tokenError } = useGitHubToken();
@@ -10,11 +11,12 @@ export function App() {
     notifications,
     loading: notificationsLoading,
     error: notificationsError,
+    refresh,
   } = useNotifications(token);
 
   const { state: commandBuffer, addDigit, addAction, clear, backspace } = useCommandBuffer();
 
-  useInput((input: string, key: any) => {
+  useInput(async (input: string, key: any) => {
     if (key.escape) {
       clear();
       return;
@@ -25,11 +27,21 @@ export function App() {
       return;
     }
 
+    if (key.return) {
+      if (token && notifications && commandBuffer.commands.length > 0) {
+        await executeCommands(commandBuffer.commands, notifications, token);
+        clear();
+        await refresh();
+      }
+      return;
+    }
+
     if (input === "q") {
       process.exit(0);
     }
 
     if (input === "R") {
+      await refresh();
       return;
     }
 
