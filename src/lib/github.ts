@@ -93,3 +93,23 @@ export async function markAsDone(token: string, threadId: string): Promise<boole
 
   return true;
 }
+
+export async function unsubscribe(token: string, threadId: string): Promise<boolean> {
+  const response: any = await fetch(
+    `${GITHUB_API}/notifications/threads/${threadId}/subscription`,
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
+  }
+
+  return true;
+}
