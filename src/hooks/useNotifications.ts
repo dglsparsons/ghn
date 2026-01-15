@@ -14,6 +14,7 @@ export function useNotifications(token: string | null): UseNotificationsResult {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [lastModified, setLastModified] = useState<string | null>(null);
+  const [pollIntervalMs, setPollIntervalMs] = useState<number>(60000);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -21,6 +22,9 @@ export function useNotifications(token: string | null): UseNotificationsResult {
     setError(null);
     try {
       const result = await fetchNotifications(token, { since: lastModified ?? undefined });
+      if (result.pollInterval) {
+        setPollIntervalMs(result.pollInterval * 1000);
+      }
       if (result.notifications !== null) {
         setNotifications(result.notifications);
       }
@@ -37,6 +41,14 @@ export function useNotifications(token: string | null): UseNotificationsResult {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    if (!token) return;
+    const id = setInterval(() => {
+      load();
+    }, pollIntervalMs);
+    return () => clearInterval(id);
+  }, [token, load, pollIntervalMs]);
 
   return {
     notifications,
