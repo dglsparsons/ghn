@@ -47,6 +47,9 @@ export async function fetchNotifications(
   }
 
   if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("GitHub authentication failed. Run 'gh auth login' to reauthenticate.");
+    }
     throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
   }
 
@@ -71,6 +74,9 @@ export async function markAsRead(token: string, threadId: string): Promise<boole
   });
 
   if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("GitHub authentication failed. Run 'gh auth login' to reauthenticate.");
+    }
     throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
   }
 
@@ -88,6 +94,9 @@ export async function markAsDone(token: string, threadId: string): Promise<boole
   });
 
   if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("GitHub authentication failed. Run 'gh auth login' to reauthenticate.");
+    }
     throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
   }
 
@@ -108,6 +117,9 @@ export async function unsubscribe(token: string, threadId: string): Promise<bool
   );
 
   if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("GitHub authentication failed. Run 'gh auth login' to reauthenticate.");
+    }
     throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
   }
 
