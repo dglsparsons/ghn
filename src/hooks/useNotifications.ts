@@ -9,12 +9,12 @@ interface UseNotificationsResult {
   refresh: () => Promise<void>;
 }
 
-export function useNotifications(token: string | null, options?: { all?: boolean }): UseNotificationsResult {
+export function useNotifications(token: string | null, options?: { all?: boolean; intervalSeconds?: number }): UseNotificationsResult {
   const [notifications, setNotifications] = useState<Notification[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [lastModified, setLastModified] = useState<string | null>(null);
-  const [pollIntervalMs, setPollIntervalMs] = useState<number>(60000);
+  const [pollIntervalMs, setPollIntervalMs] = useState<number>(options?.intervalSeconds ? options.intervalSeconds * 1000 : 60000);
 
   const load = useCallback(async () => {
     if (!token) return;
