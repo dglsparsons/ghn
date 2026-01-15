@@ -82,11 +82,7 @@ export function App() {
   }
 
   if (notificationsError) {
-    return (
-      <Box flexDirection="column">
-        <Text color="red">{notificationsError}</Text>
-      </Box>
-    );
+    showToast(String(notificationsError), "error");
   }
 
   const pendingActions = new Map<number, any>();
