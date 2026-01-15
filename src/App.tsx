@@ -32,11 +32,18 @@ export function App({ showAll, intervalSeconds }: { showAll: boolean; intervalSe
     }
 
     if (key.return) {
-      if (token && notifications && commandBuffer.commands.length > 0) {
-        await executeCommands(commandBuffer.commands, notifications, token);
-        clear();
-        await refresh();
-      }
+        if (token && notifications && commandBuffer.commands.length > 0) {
+          const { succeeded, failed } = await executeCommands(commandBuffer.commands, notifications, token);
+          if (failed > 0) {
+            showToast(`${succeeded} succeeded, ${failed} failed`, "error");
+          } else if (succeeded === 1 && commandBuffer.commands[0]?.action === "y") {
+            showToast("URL copied", "success");
+          } else if (succeeded > 0) {
+            showToast(`${succeeded} actions completed`, "success");
+          }
+          clear();
+          await refresh();
+        }
       return;
     }
 
