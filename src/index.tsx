@@ -11,7 +11,7 @@ Usage:
   ghn [options]
 
 Options:
-  --unread         Show only unread notifications (default shows read + unread)
+  --unread-only    Show only unread notifications (default shows read + unread)
   --interval N     Poll interval in seconds (default: 60)
   --help, -h       Show this help message
 
@@ -20,7 +20,7 @@ Note: Requires 'notifications' scope. Run: gh auth refresh -h github.com -s noti
   process.exit(0);
 }
 
-const includeRead = !args.includes("--unread");
+const includeRead = !args.includes("--unread-only");
 
 let intervalSeconds: number | undefined;
 const intervalIndex = args.indexOf("--interval");
@@ -33,5 +33,6 @@ if (intervalIndex !== -1) {
   intervalSeconds = value;
 }
 
-const renderer = await createCliRenderer();
-createRoot(renderer).render(<App includeRead={includeRead} intervalSeconds={intervalSeconds} />);
+createRoot(await createCliRenderer()).render(
+  <App includeRead={includeRead} intervalSeconds={intervalSeconds} />
+);

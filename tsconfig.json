@@ -1,23 +1,31 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["ES2022"],
+    "target": "ESNext",
+    "lib": [
+      "ESNext",
+      "DOM"
+    ],
     "module": "ESNext",
-    "moduleResolution": "Bundler",
+    "moduleResolution": "bundler",
     "jsx": "react-jsx",
     "jsxImportSource": "@opentui/react",
     "strict": true,
-    "noEmit": true,
     "skipLibCheck": true,
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "types": ["bun-types"],
+    "noEmit": true,
+    "types": [
+      "bun-types"
+    ],
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": [
+        "src/*"
+      ]
     }
   },
-  "include": ["."],
-  "exclude": ["node_modules"]
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "node_modules"
+  ]
 }
