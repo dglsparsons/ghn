@@ -32,9 +32,6 @@ export function App({ includeRead, intervalSeconds }: { includeRead: boolean; in
       refresh().then(() => showToast("Refreshed notifications", "success"))
         .catch(() => showToast("Refresh failed", "error"));
     }
-    if (event.raw === "q") {
-      process.exit(0);
-    }
 
     if (event.name === "return" || event.name === "enter") {
       return; // Let onSubmit handle it
