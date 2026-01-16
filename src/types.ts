@@ -14,6 +14,8 @@ export interface NotificationRepository {
 
 export interface Notification {
   id: string;
+  nodeId: string;
+  subjectId: string | null;
   unread: boolean;
   reason: string;
   updated_at: string;
@@ -24,14 +26,3 @@ export interface Notification {
 }
 
 export type Action = 'o' | 'y' | 'r' | 'd' | 'u';
-
-export interface Command {
-  index: number;
-  action: Action;
-}
-
-export interface CommandBufferState {
-  raw: string;
-  commands: Command[];
-  pendingNumber: number | null;
-}

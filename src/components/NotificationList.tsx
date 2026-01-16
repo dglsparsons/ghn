@@ -1,17 +1,18 @@
 import type { Notification, Action } from "../types";
 import { NotificationItem } from "./NotificationItem";
 
- export type NotificationListProps = {
-   notifications: Notification[];
-   pendingActions?: Map<number, Action>;
-   selectedIndex?: number;
- };
+export type NotificationListProps = {
+  notifications: Notification[];
+  pendingActions?: Map<number, Action[]>;
+};
 
- export function NotificationList({ notifications, pendingActions, selectedIndex }: NotificationListProps) {
+export function NotificationList({ notifications, pendingActions }: NotificationListProps) {
   if (notifications.length === 0) {
     return (
       <box style={{ justifyContent: "center", alignItems: "center", height: "100%" }}>
-        <text>No notifications</text>
+        <box border padding={2}>
+          <text>No notifications</text>
+        </box>
       </box>
     );
   }
@@ -19,13 +20,12 @@ import { NotificationItem } from "./NotificationItem";
   return (
     <box style={{ flexDirection: "column" }}>
       {notifications.map((notification, idx) => (
-         <NotificationItem
-           key={notification.id}
-           notification={notification}
-           index={idx + 1}
-           pendingAction={pendingActions?.get(idx + 1) ?? null}
-           selected={selectedIndex === idx + 1}
-         />
+        <NotificationItem
+          key={notification.id}
+          notification={notification}
+          index={idx + 1}
+          pendingActions={pendingActions?.get(idx + 1) ?? null}
+        />
       ))}
     </box>
   );

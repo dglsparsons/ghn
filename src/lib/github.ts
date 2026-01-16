@@ -1,6 +1,5 @@
 import type { Notification } from "../types";
 
-const GITHUB_API = "https://api.github.com";
 const GITHUB_GRAPHQL = "https://api.github.com/graphql";
 
 interface FetchNotificationsOptions {
@@ -24,6 +23,12 @@ query GetNotifications($statuses: [NotificationStatus!]) {
         isUnread
         lastUpdatedAt
         reason
+        optionalSubject {
+          ... on Issue { id }
+          ... on PullRequest { id }
+          ... on Discussion { id }
+          ... on Commit { id }
+        }
       }
     }
   }
@@ -38,6 +43,7 @@ interface GraphQLNotification {
   isUnread: boolean;
   lastUpdatedAt: string;
   reason: string | null;
+  optionalSubject: { id: string } | null;
 }
 
 interface GraphQLResponse {
@@ -81,6 +87,8 @@ function transformNotification(gql: GraphQLNotification): Notification {
 
   return {
     id: gql.threadId,
+    nodeId: gql.id,
+    subjectId: gql.optionalSubject?.id ?? null,
     unread: gql.isUnread,
     reason: gql.reason ?? "subscribed",
     updated_at: gql.lastUpdatedAt,
@@ -162,29 +170,27 @@ export async function fetchNotifications(
 
 export async function markAsRead(
   token: string,
-  threadId: string
+  nodeId: string
 ): Promise<boolean> {
-  const response: any = await fetch(
-    `${GITHUB_API}/notifications/threads/${threadId}`,
-    {
-      method: "PATCH",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-    }
-  );
+  const response = await fetch(GITHUB_GRAPHQL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: `mutation MarkAsRead($id: ID!) {
+        markNotificationAsRead(input: { id: $id }) {
+          success
+        }
+      }`,
+      variables: { id: nodeId },
+    }),
+  });
 
   if (!response.ok) {
     if (response.status === 429) {
-      const retryAfter = response.headers?.get?.("Retry-After");
-      const seconds = retryAfter ? Number.parseInt(retryAfter, 10) : null;
-      throw new Error(
-        seconds
-          ? `GitHub rate limited. Retrying in ${seconds}s.`
-          : "GitHub rate limited. Retrying later."
-      );
+      throw new Error("GitHub rate limited. Retrying later.");
     }
     if (response.status === 401 || response.status === 403) {
       throw new Error(
@@ -194,6 +200,11 @@ export async function markAsRead(
     throw new Error(
       `GitHub API error: ${response.status} ${response.statusText}`
     );
+  }
+
+  const json = await response.json() as { errors?: Array<{ message: string }> };
+  if (json.errors) {
+    throw new Error(`GraphQL error: ${json.errors[0]?.message}`);
   }
 
   return true;
@@ -201,29 +212,27 @@ export async function markAsRead(
 
 export async function markAsDone(
   token: string,
-  threadId: string
+  nodeId: string
 ): Promise<boolean> {
-  const response: any = await fetch(
-    `${GITHUB_API}/notifications/threads/${threadId}`,
-    {
-      method: "DELETE",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-    }
-  );
+  const response = await fetch(GITHUB_GRAPHQL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: `mutation MarkAsDone($id: ID!) {
+        markNotificationAsDone(input: { id: $id }) {
+          success
+        }
+      }`,
+      variables: { id: nodeId },
+    }),
+  });
 
   if (!response.ok) {
     if (response.status === 429) {
-      const retryAfter = response.headers?.get?.("Retry-After");
-      const seconds = retryAfter ? Number.parseInt(retryAfter, 10) : null;
-      throw new Error(
-        seconds
-          ? `GitHub rate limited. Retrying in ${seconds}s.`
-          : "GitHub rate limited. Retrying later."
-      );
+      throw new Error("GitHub rate limited. Retrying later.");
     }
     if (response.status === 401 || response.status === 403) {
       throw new Error(
@@ -235,34 +244,37 @@ export async function markAsDone(
     );
   }
 
+  const json = await response.json() as { errors?: Array<{ message: string }> };
+  if (json.errors) {
+    throw new Error(`GraphQL error: ${json.errors[0]?.message}`);
+  }
+
   return true;
 }
 
 export async function unsubscribe(
   token: string,
-  threadId: string
+  nodeId: string
 ): Promise<boolean> {
-  const response: any = await fetch(
-    `${GITHUB_API}/notifications/threads/${threadId}/subscription`,
-    {
-      method: "DELETE",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-    }
-  );
+  const response = await fetch(GITHUB_GRAPHQL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: `mutation Unsubscribe($ids: [ID!]!) {
+        unsubscribeFromNotifications(input: { ids: $ids }) {
+          success
+        }
+      }`,
+      variables: { ids: [nodeId] },
+    }),
+  });
 
   if (!response.ok) {
     if (response.status === 429) {
-      const retryAfter = response.headers?.get?.("Retry-After");
-      const seconds = retryAfter ? Number.parseInt(retryAfter, 10) : null;
-      throw new Error(
-        seconds
-          ? `GitHub rate limited. Retrying in ${seconds}s.`
-          : "GitHub rate limited. Retrying later."
-      );
+      throw new Error("GitHub rate limited. Retrying later.");
     }
     if (response.status === 401 || response.status === 403) {
       throw new Error(
@@ -272,6 +284,11 @@ export async function unsubscribe(
     throw new Error(
       `GitHub API error: ${response.status} ${response.statusText}`
     );
+  }
+
+  const json = await response.json() as { errors?: Array<{ message: string }> };
+  if (json.errors) {
+    throw new Error(`GraphQL error: ${json.errors[0]?.message}`);
   }
 
   return true;
