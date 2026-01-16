@@ -28,6 +28,8 @@ async function executeAction(
         throw new Error("Cannot unsubscribe: notification has no subject");
       }
       await unsubscribe(token, notification.subjectId);
+      // Also mark as done to remove from inbox, matching GitHub UI behavior
+      await markAsDone(token, notification.nodeId);
       return;
     default:
       throw new Error(`Unknown action ${action}`);

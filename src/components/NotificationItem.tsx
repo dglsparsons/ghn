@@ -4,6 +4,7 @@ import { formatRelativeTime } from "../lib/time";
 export type NotificationItemProps = {
   notification: Notification;
   index: number;
+  maxRepoLength: number;
   pendingActions: Action[] | null;
 };
 
@@ -18,8 +19,8 @@ function getActionColor(action: Action | undefined): string | undefined {
   }
 }
 
-export function NotificationItem({ notification, index, pendingActions }: NotificationItemProps) {
-  const repo = notification.repository.full_name;
+export function NotificationItem({ notification, index, maxRepoLength, pendingActions }: NotificationItemProps) {
+  const repo = notification.repository.full_name.padEnd(maxRepoLength);
   const relativeTime = formatRelativeTime(notification.updated_at);
 
   // Display color based on first pending action
@@ -29,9 +30,9 @@ export function NotificationItem({ notification, index, pendingActions }: Notifi
   return (
     <box style={{ height: 1 }}>
       <text fg={fg}>
-        {`${paddedIndex} ${notification.unread ? "● " : "  "}${repo} `}
+        {`${paddedIndex} ${notification.unread ? "● " : "  "}${repo}  `}
         <strong>{notification.subject.title}</strong>
-        {`(${relativeTime})`}
+        {` (${relativeTime})`}
       </text>
     </box>
   );

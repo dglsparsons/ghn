@@ -17,6 +17,8 @@ export function NotificationList({ notifications, pendingActions }: Notification
     );
   }
 
+  const maxRepoLength = Math.max(...notifications.map((n) => n.repository.full_name.length));
+
   return (
     <box style={{ flexDirection: "column" }}>
       {notifications.map((notification, idx) => (
@@ -24,6 +26,7 @@ export function NotificationList({ notifications, pendingActions }: Notification
           key={notification.id}
           notification={notification}
           index={idx + 1}
+          maxRepoLength={maxRepoLength}
           pendingActions={pendingActions?.get(idx + 1) ?? null}
         />
       ))}
