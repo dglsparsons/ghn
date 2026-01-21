@@ -4,19 +4,19 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
 
 use crate::{
-    types::{Action, CiStatus, Notification, ReviewStatus, SubjectStatus},
+    types::{Action, CiStatus, MyPullRequest, Notification, ReviewStatus, Subject, SubjectStatus},
     AppState,
 };
 
-const COMMANDS_FULL: &str = "Commands: o open/read  y yank  r read  d done  q unsub";
-const COMMANDS_COMPACT: &str = "Cmds: o open/read  y yank  r read  d done  q unsub";
-const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q";
-const COMMANDS_TINY: &str = "o y r d q";
+const COMMANDS_FULL: &str = "Commands: o open/read  y yank  r read  d done  q unsub/ignore  s squash";
+const COMMANDS_COMPACT: &str = "Cmds: o open/read  y yank  r read  d done  q unsub/ign  s squash";
+const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q/s";
+const COMMANDS_TINY: &str = "o y r d q s";
 
 const TARGETS_FULL: &str =
     "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft";
@@ -62,6 +62,40 @@ const LEGEND_VARIANTS: [LegendVariant; 4] = [
     },
 ];
 
+trait ListItemLike {
+    fn unread(&self) -> bool;
+    fn subject(&self) -> &Subject;
+    fn repo_full_name(&self) -> &str;
+}
+
+impl ListItemLike for Notification {
+    fn unread(&self) -> bool {
+        self.unread
+    }
+
+    fn subject(&self) -> &Subject {
+        &self.subject
+    }
+
+    fn repo_full_name(&self) -> &str {
+        &self.repository.full_name
+    }
+}
+
+impl ListItemLike for MyPullRequest {
+    fn unread(&self) -> bool {
+        false
+    }
+
+    fn subject(&self) -> &Subject {
+        &self.subject
+    }
+
+    fn repo_full_name(&self) -> &str {
+        &self.repository.full_name
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &AppState) {
     let size = f.area();
     let status_lines = build_status_lines(size.width, app.status.as_deref());
@@ -70,66 +104,132 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),
+            Constraint::Min(8),
             Constraint::Length(status_height),
             Constraint::Length(2),
         ])
         .split(size);
 
-    draw_list(f, chunks[0], app);
+    draw_lists(f, chunks[0], app);
     draw_status(f, chunks[1], status_lines);
     draw_command(f, chunks[2], app);
 }
 
-fn draw_list(f: &mut Frame, area: Rect, app: &AppState) {
-    let max_kind = app
-        .notifications
+fn draw_lists(f: &mut Frame, area: Rect, app: &AppState) {
+    let (notifications_area, my_prs_area) =
+        split_list_area(area, app.notifications.len(), app.my_prs.len());
+    let total_count = app.notifications.len() + app.my_prs.len();
+
+    draw_list_section(
+        f,
+        notifications_area,
+        "Notifications",
+        &app.notifications,
+        &app.relative_times,
+        &app.pending,
+        0,
+        total_count,
+    );
+    draw_list_section(
+        f,
+        my_prs_area,
+        "My PRs",
+        &app.my_prs,
+        &app.my_pr_relative_times,
+        &app.pending,
+        app.notifications.len(),
+        total_count,
+    );
+}
+
+fn split_list_area(area: Rect, notifications_len: usize, my_prs_len: usize) -> (Rect, Rect) {
+    if area.height == 0 {
+        return (area, area);
+    }
+
+    let min_box = 3u16;
+    let notifications_weight = notifications_len.max(1) as u32;
+    let my_prs_weight = my_prs_len.max(1) as u32;
+    let total_weight = notifications_weight + my_prs_weight;
+
+    let mut notifications_height =
+        ((area.height as u32) * notifications_weight / total_weight) as u16;
+    let mut my_prs_height = area.height.saturating_sub(notifications_height);
+
+    if notifications_height < min_box {
+        notifications_height = min_box.min(area.height);
+        my_prs_height = area.height.saturating_sub(notifications_height);
+    }
+    if my_prs_height < min_box {
+        my_prs_height = min_box.min(area.height);
+        notifications_height = area.height.saturating_sub(my_prs_height);
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(notifications_height),
+            Constraint::Length(my_prs_height),
+        ])
+        .split(area);
+
+    (chunks[0], chunks[1])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_list_section<T: ListItemLike>(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    items: &[T],
+    relative_times: &[String],
+    pending: &HashMap<usize, Vec<Action>>,
+    index_offset: usize,
+    total_count: usize,
+) {
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner_area = block.inner(area);
+
+    let max_kind = items
         .iter()
-        .map(|notification| notification.subject.kind.chars().count())
+        .map(|item| item.subject().kind.chars().count())
         .max()
         .unwrap_or(0);
-    let max_time = app
-        .relative_times
+    let max_time = relative_times
         .iter()
         .map(|time| time.chars().count())
         .max()
         .unwrap_or(0);
-    let max_title = app
-        .notifications
+    let max_title = items
         .iter()
-        .map(|notification| notification.subject.title.chars().count())
+        .map(|item| item.subject().title.chars().count())
         .max()
         .unwrap_or(0);
-    let max_repo = app
-        .notifications
+    let max_repo = items
         .iter()
-        .map(|notification| {
-            notification.repository.full_name.chars().count() + status_prefix_len(notification)
-        })
+        .map(|item| item.repo_full_name().chars().count() + status_prefix_len(item.subject()))
         .max()
         .unwrap_or(0);
     let max_line = max_title.max(max_repo);
-    let max_ci = if app
-        .notifications
+    let max_ci = if items
         .iter()
-        .any(|notification| ci_indicator(notification).is_some())
+        .any(|item| ci_indicator(item.subject()).is_some())
     {
         MAX_CI_WIDTH
     } else {
         0
     };
-    let max_review = if app
-        .notifications
+    let max_review = if items
         .iter()
-        .any(|notification| effective_review_status(notification).is_some())
+        .any(|item| effective_review_status(item.subject()).is_some())
     {
         MAX_REVIEW_WIDTH
     } else {
         0
     };
     let widths = layout_widths(
-        area.width,
-        app.notifications.len(),
+        inner_area.width,
+        total_count,
         max_line,
         max_kind,
         max_time,
@@ -137,38 +237,32 @@ fn draw_list(f: &mut Frame, area: Rect, app: &AppState) {
         max_review,
     );
 
-    let items: Vec<ListItem> = app
-        .notifications
+    let items: Vec<ListItem> = items
         .iter()
         .enumerate()
-        .map(|(idx, notification)| {
-            let index = idx + 1;
-            let pending = app.pending.get(&index);
-            let base_style = base_notification_style(notification.unread);
+        .map(|(idx, item)| {
+            let index = index_offset + idx + 1;
+            let pending = pending.get(&index);
+            let base_style = base_notification_style(item.unread());
             let style = base_style.patch(pending_style(pending));
 
-            let dot = if notification.unread { "*" } else { " " };
-            let time = app
-                .relative_times
-                .get(idx)
-                .map(String::as_str)
-                .unwrap_or("?");
+            let dot = if item.unread() { "*" } else { " " };
+            let time = relative_times.get(idx).map(String::as_str).unwrap_or("?");
+            let subject = item.subject();
 
             let indent = " ".repeat(widths.prefix);
             let title_width = widths.title;
 
             let index_cell = pad_left(&index.to_string(), widths.index);
-            let status_prefix = status_prefix(notification);
-            let kind_cell = pad_left(
-                &truncate_with_suffix(&notification.subject.kind, widths.kind),
-                widths.kind,
-            );
+            let status_prefix = status_prefix(subject);
+            let kind_cell =
+                pad_left(&truncate_with_suffix(&subject.kind, widths.kind), widths.kind);
             let time_cell = pad_left(&truncate_with_suffix(time, widths.time), widths.time);
 
             let mut header_spans = vec![
                 Span::styled(index_cell, Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" ".repeat(NUMBER_MARKER_GAP)),
-                Span::styled(dot, unread_marker_style(notification.unread)),
+                Span::styled(dot, unread_marker_style(item.unread())),
                 Span::raw(" ".repeat(MARKER_REPO_GAP)),
             ];
 
@@ -179,7 +273,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &AppState) {
                 remaining = remaining.saturating_sub(prefix_len);
                 header_spans.push(Span::styled(prefix_text, prefix.style));
             }
-            let repo_text = truncate_with_suffix(&notification.repository.full_name, remaining);
+            let repo_text = truncate_with_suffix(item.repo_full_name(), remaining);
             let repo_padded = pad_right(&repo_text, remaining);
             header_spans.push(Span::styled(
                 repo_padded,
@@ -188,7 +282,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &AppState) {
             header_spans.push(Span::raw(" ".repeat(widths.repo_meta_gap)));
 
             if widths.ci > 0 {
-                let indicator = ci_indicator(notification);
+                let indicator = ci_indicator(subject);
                 let ci_cell = indicator.as_ref().map(|value| value.text).unwrap_or("");
                 let padded = pad_right(&truncate_with_suffix(ci_cell, widths.ci), widths.ci);
                 if let Some(indicator) = indicator {
@@ -203,9 +297,10 @@ fn draw_list(f: &mut Frame, area: Rect, app: &AppState) {
             }
 
             if widths.review > 0 {
-                let indicator = review_indicator(notification);
+                let indicator = review_indicator(subject);
                 let review_cell = indicator.as_ref().map(|value| value.text).unwrap_or("");
-                let padded = pad_right(&truncate_with_suffix(review_cell, widths.review), widths.review);
+                let padded =
+                    pad_right(&truncate_with_suffix(review_cell, widths.review), widths.review);
                 if let Some(indicator) = indicator {
                     header_spans.push(Span::styled(padded, indicator.style));
                 } else {
@@ -219,7 +314,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &AppState) {
 
             header_spans.push(Span::styled(
                 kind_cell,
-                Style::default().fg(kind_color(&notification.subject.kind)),
+                Style::default().fg(kind_color(&subject.kind)),
             ));
             header_spans.push(Span::raw(" "));
             header_spans.push(Span::styled(
@@ -229,11 +324,11 @@ fn draw_list(f: &mut Frame, area: Rect, app: &AppState) {
 
             let header = Line::from(header_spans);
 
-            let title_text = truncate_with_suffix(&notification.subject.title, title_width);
+            let title_text = truncate_with_suffix(&subject.title, title_width);
             let title = Line::from(vec![Span::raw(indent), Span::raw(title_text)]);
 
             let mut lines = vec![header, title];
-            if idx + 1 < app.notifications.len() {
+            if idx + 1 < items.len() {
                 lines.push(Line::from(Span::raw(" ")));
             }
 
@@ -241,7 +336,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &AppState) {
         })
         .collect();
 
-    let list = List::new(items);
+    let list = List::new(items).block(block);
     f.render_widget(list, area);
 }
 
@@ -269,6 +364,8 @@ fn build_status_lines(width: u16, status: Option<&str>) -> Vec<String> {
     let status = status.map(str::trim).filter(|text| !text.is_empty());
     if let Some(status) = status {
         lines.push(truncate_with_suffix(status, width));
+    } else {
+        lines.push(String::new());
     }
 
     lines.extend(select_legend_lines(width));
@@ -308,16 +405,15 @@ struct ReviewIndicator {
     style: Style,
 }
 
-fn status_prefix_len(notification: &Notification) -> usize {
-    notification
-        .subject
+fn status_prefix_len(subject: &Subject) -> usize {
+    subject
         .status
         .map(|status| status.label().chars().count() + 3)
         .unwrap_or(0)
 }
 
-fn status_prefix(notification: &Notification) -> Option<StatusLabel> {
-    let status = notification.subject.status?;
+fn status_prefix(subject: &Subject) -> Option<StatusLabel> {
+    let status = subject.status?;
     Some(StatusLabel {
         text: format!("[{}] ", status.label()),
         style: Style::default()
@@ -334,8 +430,8 @@ fn status_color(status: SubjectStatus) -> Color {
     }
 }
 
-fn ci_indicator(notification: &Notification) -> Option<CiIndicator> {
-    let status = notification.subject.ci_status?;
+fn ci_indicator(subject: &Subject) -> Option<CiIndicator> {
+    let status = subject.ci_status?;
     let (text, color) = match status {
         CiStatus::Success => ("✓", Color::Green),
         CiStatus::Pending => ("↻", Color::Yellow),
@@ -347,8 +443,8 @@ fn ci_indicator(notification: &Notification) -> Option<CiIndicator> {
     })
 }
 
-fn review_indicator(notification: &Notification) -> Option<ReviewIndicator> {
-    let status = effective_review_status(notification)?;
+fn review_indicator(subject: &Subject) -> Option<ReviewIndicator> {
+    let status = effective_review_status(subject)?;
     let (text, color) = match status {
         ReviewStatus::Approved => ("A", Color::Green),
         ReviewStatus::ReviewRequired => ("?", Color::Yellow),
@@ -360,10 +456,10 @@ fn review_indicator(notification: &Notification) -> Option<ReviewIndicator> {
     })
 }
 
-fn effective_review_status(notification: &Notification) -> Option<ReviewStatus> {
-    let status = notification.subject.review_status?;
+fn effective_review_status(subject: &Subject) -> Option<ReviewStatus> {
+    let status = subject.review_status?;
     if status == ReviewStatus::ReviewRequired {
-        if let Some(subject_status) = notification.subject.status {
+        if let Some(subject_status) = subject.status {
             if matches!(
                 subject_status,
                 SubjectStatus::Merged | SubjectStatus::Closed | SubjectStatus::Draft
@@ -397,6 +493,7 @@ fn action_color(action: Action) -> Color {
         Action::Read => Color::DarkGray,
         Action::Done => Color::Green,
         Action::Unsubscribe => Color::Red,
+        Action::SquashMerge => Color::Cyan,
     }
 }
 
@@ -417,7 +514,7 @@ struct LayoutWidths {
 
 fn layout_widths(
     area_width: u16,
-    notification_count: usize,
+    total_count: usize,
     max_title: usize,
     max_kind: usize,
     max_time: usize,
@@ -425,7 +522,7 @@ fn layout_widths(
     max_review: usize,
 ) -> LayoutWidths {
     let total = area_width as usize;
-    let index = notification_count.max(1).to_string().len().max(2);
+    let index = total_count.max(1).to_string().len().max(2);
     let prefix = index + NUMBER_MARKER_GAP + 1 + MARKER_REPO_GAP;
     let available = total.saturating_sub(prefix).max(1);
     let title = max_title.max(1).min(available);
@@ -547,52 +644,128 @@ fn kind_color(kind: &str) -> Color {
     }
 }
 
-fn build_target_map(notifications: &[Notification]) -> HashMap<char, Vec<usize>> {
+fn build_target_map(
+    notifications: &[Notification],
+    my_prs: &[MyPullRequest],
+) -> HashMap<char, Vec<usize>> {
     let mut targets: HashMap<char, Vec<usize>> = HashMap::new();
+
     for (idx, notification) in notifications.iter().enumerate() {
+        let index = idx + 1;
         if notification.unread {
-            targets.entry('u').or_default().push(idx + 1);
+            targets.entry('u').or_default().push(index);
         }
-        if let Some(status) = notification.subject.status {
-            let key = match status {
-                SubjectStatus::Merged => 'm',
-                SubjectStatus::Closed => 'c',
-                SubjectStatus::Draft => 'f',
-            };
-            targets.entry(key).or_default().push(idx + 1);
-        }
-        if let Some(review_status) = effective_review_status(notification) {
-            let key = match review_status {
-                ReviewStatus::ReviewRequired => '?',
-                ReviewStatus::Approved => 'a',
-                ReviewStatus::ChangesRequested => 'x',
-            };
-            targets.entry(key).or_default().push(idx + 1);
-        }
+        push_status_targets(&mut targets, index, &notification.subject);
     }
+
+    for (idx, pr) in my_prs.iter().enumerate() {
+        let index = notifications.len() + idx + 1;
+        push_status_targets(&mut targets, index, &pr.subject);
+    }
+
     targets
+}
+
+fn push_status_targets(targets: &mut HashMap<char, Vec<usize>>, index: usize, subject: &Subject) {
+    if let Some(status) = subject.status {
+        let key = match status {
+            SubjectStatus::Merged => 'm',
+            SubjectStatus::Closed => 'c',
+            SubjectStatus::Draft => 'f',
+        };
+        targets.entry(key).or_default().push(index);
+    }
+    if let Some(review_status) = effective_review_status(subject) {
+        let key = match review_status {
+            ReviewStatus::ReviewRequired => '?',
+            ReviewStatus::Approved => 'a',
+            ReviewStatus::ChangesRequested => 'x',
+        };
+        targets.entry(key).or_default().push(index);
+    }
 }
 
 pub fn build_pending_map(
     input: &str,
     notifications: &[Notification],
+    my_prs: &[MyPullRequest],
 ) -> HashMap<usize, Vec<Action>> {
-    let targets = build_target_map(notifications);
-    crate::commands::parse_commands(input, notifications.len(), &targets)
+    let targets = build_target_map(notifications, my_prs);
+    let parsed = crate::commands::parse_commands(input, notifications.len() + my_prs.len(), &targets);
+
+    filter_pending_actions(parsed, notifications, my_prs)
+}
+
+fn filter_pending_actions(
+    parsed: HashMap<usize, Vec<Action>>,
+    notifications: &[Notification],
+    my_prs: &[MyPullRequest],
+) -> HashMap<usize, Vec<Action>> {
+    let mut filtered: HashMap<usize, Vec<Action>> = HashMap::new();
+
+    for (index, actions) in parsed {
+        let entry = if index <= notifications.len() {
+            notifications.get(index - 1).map(PendingEntry::Notification)
+        } else {
+            let idx = index.saturating_sub(notifications.len() + 1);
+            my_prs.get(idx).map(|_| PendingEntry::MyPullRequest)
+        };
+
+        let Some(entry) = entry else {
+            continue;
+        };
+
+        let allowed: Vec<Action> = actions
+            .into_iter()
+            .filter(|action| action_allowed(action, &entry))
+            .collect();
+        if !allowed.is_empty() {
+            filtered.insert(index, allowed);
+        }
+    }
+
+    filtered
+}
+
+enum PendingEntry<'a> {
+    Notification(&'a Notification),
+    MyPullRequest,
+}
+
+fn action_allowed(action: &Action, entry: &PendingEntry<'_>) -> bool {
+    match entry {
+        PendingEntry::Notification(notification) => {
+            // Ignore merge unless it targets a PR with a known node id.
+            if *action == Action::SquashMerge {
+                notification.subject.kind.eq_ignore_ascii_case("pullrequest")
+                    && notification.subject_id.is_some()
+            } else {
+                true
+            }
+        }
+        // My PRs don't have notification semantics, so ignore read/done; q maps to ignore.
+        PendingEntry::MyPullRequest => {
+            matches!(
+                action,
+                Action::Open | Action::Yank | Action::SquashMerge | Action::Unsubscribe
+            )
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        base_notification_style, build_pending_map, build_status_lines, layout_widths, review_indicator,
-        truncate_with_suffix, READ_NOTIFICATION_COLOR,
+        base_notification_style, build_pending_map, build_status_lines, ci_indicator, kind_color,
+        layout_widths, pending_style, review_indicator, select_legend_lines, status_prefix,
+        truncate_with_suffix, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
     };
-    use crate::types::Action;
-    use ratatui::style::Style;
-    use crate::types::{Notification, Repository, ReviewStatus, Subject, SubjectStatus};
+    use crate::types::{Action, CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject, SubjectStatus};
+    use ratatui::style::{Color, Modifier, Style};
 
     #[test]
     fn build_pending_map_matches_parser() {
+        let my_prs = Vec::new();
         let notifications = vec![
             Notification {
                 id: "thread-1".to_string(),
@@ -638,13 +811,14 @@ mod tests {
             },
         ];
 
-        let map = build_pending_map("1o2r", &notifications);
+        let map = build_pending_map("1o2r", &notifications, &my_prs);
         assert_eq!(map.get(&1), Some(&vec![Action::Open]));
         assert_eq!(map.get(&2), Some(&vec![Action::Read]));
     }
 
     #[test]
     fn build_pending_map_targets_review_status() {
+        let my_prs = Vec::new();
         let notifications = vec![
             Notification {
                 id: "thread-1".to_string(),
@@ -753,20 +927,21 @@ mod tests {
             },
         ];
 
-        let pending = build_pending_map("?o", &notifications);
+        let pending = build_pending_map("?o", &notifications, &my_prs);
         assert_eq!(pending.get(&1), Some(&vec![Action::Open]));
         assert!(!pending.contains_key(&2));
         assert!(!pending.contains_key(&3));
 
-        let pending = build_pending_map("ao", &notifications);
+        let pending = build_pending_map("ao", &notifications, &my_prs);
         assert_eq!(pending.get(&4), Some(&vec![Action::Open]));
 
-        let pending = build_pending_map("xo", &notifications);
+        let pending = build_pending_map("xo", &notifications, &my_prs);
         assert_eq!(pending.get(&5), Some(&vec![Action::Open]));
     }
 
     #[test]
     fn build_pending_map_targets_unread() {
+        let my_prs = Vec::new();
         let notifications = vec![
             Notification {
                 id: "thread-1".to_string(),
@@ -812,9 +987,87 @@ mod tests {
             },
         ];
 
-        let pending = build_pending_map("uo", &notifications);
+        let pending = build_pending_map("uo", &notifications, &my_prs);
         assert_eq!(pending.get(&1), Some(&vec![Action::Open]));
         assert!(!pending.contains_key(&2));
+    }
+
+    #[test]
+    fn build_pending_map_filters_actions_for_my_prs() {
+        let notifications = vec![Notification {
+            id: "thread-1".to_string(),
+            node_id: "node-1".to_string(),
+            subject_id: Some("pr-1".to_string()),
+            unread: false,
+            reason: "mention".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: Subject {
+                title: "PR notification".to_string(),
+                url: "https://github.com/acme/widgets/pull/1".to_string(),
+                kind: "PullRequest".to_string(),
+                status: None,
+                ci_status: None,
+                review_status: None,
+            },
+            repository: Repository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+            },
+            url: "https://github.com/acme/widgets/pull/1".to_string(),
+        }];
+
+        let my_prs = vec![MyPullRequest {
+            id: "pr-2".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: Subject {
+                title: "My PR".to_string(),
+                url: "https://github.com/acme/widgets/pull/2".to_string(),
+                kind: "PullRequest".to_string(),
+                status: None,
+                ci_status: None,
+                review_status: None,
+            },
+            repository: Repository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+            },
+            url: "https://github.com/acme/widgets/pull/2".to_string(),
+        }];
+
+        let pending = build_pending_map("2dq", &notifications, &my_prs);
+        assert_eq!(pending.get(&2), Some(&vec![Action::Unsubscribe]));
+
+        let pending = build_pending_map("2s", &notifications, &my_prs);
+        assert_eq!(pending.get(&2), Some(&vec![Action::SquashMerge]));
+    }
+
+    #[test]
+    fn build_pending_map_ignores_merge_on_non_pr_notification() {
+        let my_prs = Vec::new();
+        let notifications = vec![Notification {
+            id: "thread-1".to_string(),
+            node_id: "node-1".to_string(),
+            subject_id: None,
+            unread: false,
+            reason: "mention".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: Subject {
+                title: "Issue".to_string(),
+                url: "https://github.com/acme/widgets/issues/1".to_string(),
+                kind: "Issue".to_string(),
+                status: None,
+                ci_status: None,
+                review_status: None,
+            },
+            repository: Repository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+            },
+            url: "https://github.com/acme/widgets/issues/1".to_string(),
+        }];
+
+        let pending = build_pending_map("1s", &notifications, &my_prs);
+        assert!(pending.is_empty());
     }
 
     #[test]
@@ -868,7 +1121,7 @@ mod tests {
             url: "https://github.com/acme/widgets/pull/3".to_string(),
         };
 
-        let indicator = review_indicator(&notification).expect("review indicator");
+        let indicator = review_indicator(&notification.subject).expect("review indicator");
         assert_eq!(indicator.text, "?");
     }
 
@@ -896,7 +1149,7 @@ mod tests {
             url: "https://github.com/acme/widgets/pull/4".to_string(),
         };
 
-        assert!(review_indicator(&notification).is_none());
+        assert!(review_indicator(&notification.subject).is_none());
     }
 
     #[test]
@@ -923,7 +1176,7 @@ mod tests {
             url: "https://github.com/acme/widgets/pull/5".to_string(),
         };
 
-        assert!(review_indicator(&notification).is_none());
+        assert!(review_indicator(&notification.subject).is_none());
     }
 
     #[test]
@@ -953,5 +1206,74 @@ mod tests {
         let first = lines.first().expect("status line");
         assert!(first.chars().count() <= width as usize);
         assert!(first.starts_with("Executed"));
+    }
+
+    #[test]
+    fn legend_includes_ignore_label() {
+        let lines = build_status_lines(200, None);
+        let joined = lines.join(" ");
+        assert!(joined.contains("unsub/ignore"));
+    }
+
+    #[test]
+    fn select_legend_lines_prefers_full_when_width_allows() {
+        let combined = format!("{}  |  {}", COMMANDS_FULL, TARGETS_FULL);
+        let width = combined.chars().count();
+        let lines = select_legend_lines(width);
+        assert_eq!(lines, vec![combined]);
+    }
+
+    #[test]
+    fn pending_style_uses_last_action() {
+        let actions = vec![Action::Read, Action::Unsubscribe];
+        let style = pending_style(Some(&actions));
+        assert_eq!(style, Style::default().fg(Color::Red));
+    }
+
+    #[test]
+    fn status_prefix_formats_label_and_style() {
+        let subject = Subject {
+            title: "Draft PR".to_string(),
+            url: "https://github.com/acme/widgets/pull/1".to_string(),
+            kind: "PullRequest".to_string(),
+            status: Some(SubjectStatus::Draft),
+            ci_status: None,
+            review_status: None,
+        };
+
+        let label = status_prefix(&subject).expect("status prefix");
+        assert_eq!(label.text, "[Draft] ");
+        assert_eq!(
+            label.style,
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn ci_indicator_formats_failure() {
+        let subject = Subject {
+            title: "PR".to_string(),
+            url: "https://github.com/acme/widgets/pull/2".to_string(),
+            kind: "PullRequest".to_string(),
+            status: None,
+            ci_status: Some(CiStatus::Failure),
+            review_status: None,
+        };
+
+        let indicator = ci_indicator(&subject).expect("ci indicator");
+        assert_eq!(indicator.text, "✗");
+        assert_eq!(
+            indicator.style,
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn kind_color_maps_issue() {
+        assert_eq!(kind_color("Issue"), Color::Yellow);
     }
 }

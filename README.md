@@ -8,6 +8,7 @@ A fast, keyboard-driven TUI for GitHub notifications. Built for power users who 
 - **Vim-style commands**: Batch actions with `1-3r` or `1 2 3o` then `Enter` to execute
 - **Visual feedback**: Notifications highlight based on pending action
 - **Full keyboard control**: Never touch the mouse
+- **My PRs**: Keeps your open pull requests visible even without notifications
 
 ## Installation
 
@@ -40,9 +41,13 @@ ghn
 
 3 * [Draft] someorg/repo ↻ ? PullRequest 10m
     Review requested: Update dependencies
-Commands: o open  y yank  r read  d done  q unsub  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
+Commands: o open  y yank  r read  d done  q unsub/ignore  s squash  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
 > 1-3r
 ```
+
+Your open pull requests appear in a separate "My PRs" panel and are de-duplicated from notifications.
+Archived repositories are omitted, and any PR URLs listed in `~/.config/ghn/ignores.txt` are hidden.
+Use `q` on a My PR to add it to the ignore list.
 
 ### Commands
 
@@ -50,6 +55,9 @@ Commands target one or more numbers followed by actions. Indices can be single n
 like `1-3`. You can also target status groups: `m` (merged PRs), `c` (closed PRs/issues), and `f` (draft PRs),
 as well as review states: `?` (pending review), `a` (approved), `x` (changes requested), plus `u` (unread).
 Queue multiple commands, then press `Enter` to execute.
+Consecutive digits are parsed greedily using the longest valid prefix for the current list size. If the full number
+is valid, it wins; otherwise it splits (e.g., with 50 items `123456r` -> `12 34 5 6`, with 9 items `10r` -> `1`).
+This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `3`).
 
 | Action | Key | Description |
 |--------|-----|-------------|
@@ -57,7 +65,8 @@ Queue multiple commands, then press `Enter` to execute.
 | Yank | `y` | Copy URL to clipboard |
 | Read | `r` | Mark as read |
 | Done | `d` | Mark as done (removes from inbox) |
-| Unsubscribe | `q` | Unsubscribe from thread |
+| Unsubscribe | `q` | Unsubscribe from thread; in My PRs, ignore PRs (saved to `~/.config/ghn/ignores.txt`) |
+| Squash merge | `s` | Squash-merge PR (marks notification done on success) |
 
 **Examples:**
 - `1o` - Open notification #1 in browser (marks it as read)
@@ -65,6 +74,7 @@ Queue multiple commands, then press `Enter` to execute.
 - `1,2,3r` - Same as above, using a list separator
 - `5y` - Copy URL of notification #5
 - `1r` - Mark #1 as read without opening
+- `23r` - With 10 items, marks #2 and #3; with 30 items, marks #23
 - `md` - Mark all merged PR notifications as done
 - `cd` - Mark all closed PR/issue notifications as done
 - `fd` - Mark all draft PR notifications as done
@@ -77,7 +87,7 @@ Queue multiple commands, then press `Enter` to execute.
 |-----|--------|
 | `0-9` | Build number for command |
 | `-` / `,` / `Space` | Range or list separators |
-| `o/y/r/d/q` | Queue action for current number |
+| `o/y/r/d/q/s` | Queue action for current number |
 | `Enter` | Execute all queued commands |
 | `Esc` | Clear command buffer |
 | `Backspace` | Delete last character |
@@ -103,6 +113,7 @@ When you queue a command, the targeted notification highlights with a color indi
 | Read | Gray/Dim |
 | Done | Green |
 | Unsubscribe | Red |
+| Squash merge | Cyan |
 
 PRs also show a CI indicator: `✓` success, `↻` running/pending, `✗` failed.
 Review indicators show status: `?` pending review, `A` approved, `X` changes requested.

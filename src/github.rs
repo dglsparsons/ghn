@@ -4,8 +4,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::types::{
-    CiStatus, GraphQlError, GraphQlResponse, Notification, Repository, ReviewStatus, Subject,
-    SubjectStatus,
+    CiStatus, GraphQlError, GraphQlResponse, MyPullRequest, Notification, Repository, ReviewStatus,
+    Subject, SubjectStatus,
 };
 
 const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
@@ -17,6 +17,7 @@ struct NotificationsData {
 
 #[derive(Debug, Deserialize)]
 struct Viewer {
+    login: String,
     #[serde(rename = "notificationThreads")]
     notification_threads: NotificationThreads,
 }
@@ -71,9 +72,47 @@ struct GraphQlStatusCheckRollup {
     state: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlRepository {
+    name: String,
+    name_with_owner: String,
+    is_archived: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlPullRequest {
+    id: String,
+    title: String,
+    url: String,
+    updated_at: String,
+    is_draft: bool,
+    review_decision: Option<String>,
+    repository: GraphQlRepository,
+    commits: Option<GraphQlPullRequestCommits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchData {
+    search: GraphQlSearchConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlSearchConnection {
+    nodes: Vec<Option<GraphQlPullRequest>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationsPayload {
+    pub notifications: Vec<Notification>,
+    pub viewer_login: String,
+}
+
 const NOTIFICATIONS_QUERY: &str = r#"
 query GetNotifications($statuses: [NotificationStatus!]) {
   viewer {
+    login
     notificationThreads(first: 50, filterBy: { statuses: $statuses }) {
       nodes {
         id
@@ -104,6 +143,47 @@ query GetNotifications($statuses: [NotificationStatus!]) {
           ... on Commit { id }
         }
       }
+    }
+  }
+}
+"#;
+
+const MY_PULL_REQUESTS_QUERY: &str = r#"
+query GetMyPullRequests($query: String!) {
+  search(query: $query, type: ISSUE, first: 50) {
+    nodes {
+      ... on PullRequest {
+        id
+        title
+        url
+        updatedAt
+        isDraft
+        reviewDecision
+        repository {
+          name
+          nameWithOwner
+          isArchived
+        }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                state
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+const MERGE_PULL_REQUEST_MUTATION: &str = r#"
+mutation MergePullRequest($input: MergePullRequestInput!) {
+  mergePullRequest(input: $input) {
+    pullRequest {
+      merged
     }
   }
 }
@@ -166,20 +246,7 @@ fn subject_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option<Subjec
     }
 }
 
-fn subject_ci_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option<CiStatus> {
-    let subject = subject?;
-    if !kind.eq_ignore_ascii_case("pullrequest") {
-        return None;
-    }
-
-    let state = subject
-        .commits
-        .as_ref()
-        .and_then(|commits| commits.nodes.last())
-        .and_then(|node| node.commit.as_ref())
-        .and_then(|commit| commit.status_check_rollup.as_ref())
-        .and_then(|rollup| rollup.state.as_deref());
-
+fn map_ci_status(state: Option<&str>) -> Option<CiStatus> {
     match state {
         Some(value) if value.eq_ignore_ascii_case("SUCCESS") => Some(CiStatus::Success),
         Some(value) if value.eq_ignore_ascii_case("NEUTRAL") => Some(CiStatus::Success),
@@ -194,13 +261,25 @@ fn subject_ci_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option<CiS
     }
 }
 
-fn subject_review_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option<ReviewStatus> {
+fn subject_ci_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option<CiStatus> {
     let subject = subject?;
     if !kind.eq_ignore_ascii_case("pullrequest") {
         return None;
     }
 
-    match subject.review_decision.as_deref() {
+    let state = subject
+        .commits
+        .as_ref()
+        .and_then(|commits| commits.nodes.last())
+        .and_then(|node| node.commit.as_ref())
+        .and_then(|commit| commit.status_check_rollup.as_ref())
+        .and_then(|rollup| rollup.state.as_deref());
+
+    map_ci_status(state)
+}
+
+fn map_review_status(review_decision: Option<&str>) -> Option<ReviewStatus> {
+    match review_decision {
         Some(value) if value.eq_ignore_ascii_case("APPROVED") => Some(ReviewStatus::Approved),
         Some(value) if value.eq_ignore_ascii_case("CHANGES_REQUESTED") => {
             Some(ReviewStatus::ChangesRequested)
@@ -210,6 +289,15 @@ fn subject_review_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option
         }
         _ => None,
     }
+}
+
+fn subject_review_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option<ReviewStatus> {
+    let subject = subject?;
+    if !kind.eq_ignore_ascii_case("pullrequest") {
+        return None;
+    }
+
+    map_review_status(subject.review_decision.as_deref())
 }
 
 fn transform_notification(gql: GraphQlNotification) -> Notification {
@@ -248,6 +336,60 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
     }
 }
 
+fn pull_request_ci_status(pr: &GraphQlPullRequest) -> Option<CiStatus> {
+    let state = pr
+        .commits
+        .as_ref()
+        .and_then(|commits| commits.nodes.last())
+        .and_then(|node| node.commit.as_ref())
+        .and_then(|commit| commit.status_check_rollup.as_ref())
+        .and_then(|rollup| rollup.state.as_deref());
+
+    map_ci_status(state)
+}
+
+fn pull_request_review_status(pr: &GraphQlPullRequest) -> Option<ReviewStatus> {
+    map_review_status(pr.review_decision.as_deref())
+}
+
+fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
+    let status = if pr.is_draft {
+        Some(SubjectStatus::Draft)
+    } else {
+        None
+    };
+    let ci_status = pull_request_ci_status(&pr);
+    let review_status = pull_request_review_status(&pr);
+    let subject = Subject {
+        title: pr.title,
+        url: pr.url.clone(),
+        kind: "PullRequest".to_string(),
+        status,
+        ci_status,
+        review_status,
+    };
+
+    MyPullRequest {
+        id: pr.id,
+        updated_at: pr.updated_at,
+        subject,
+        repository: Repository {
+            name: pr.repository.name,
+            full_name: pr.repository.name_with_owner,
+        },
+        url: pr.url,
+    }
+}
+
+fn filter_archived_pull_requests(
+    pull_requests: Vec<GraphQlPullRequest>,
+) -> Vec<GraphQlPullRequest> {
+    pull_requests
+        .into_iter()
+        .filter(|pr| !pr.repository.is_archived)
+        .collect()
+}
+
 fn handle_graphql_errors(errors: &[GraphQlError]) -> Result<()> {
     if errors.is_empty() {
         return Ok(());
@@ -273,7 +415,7 @@ pub async fn fetch_notifications(
     client: &Client,
     token: &str,
     include_read: bool,
-) -> Result<(Vec<Notification>, u64)> {
+) -> Result<NotificationsPayload> {
     let statuses = if include_read {
         vec!["UNREAD", "READ"]
     } else {
@@ -317,14 +459,128 @@ pub async fn fetch_notifications(
         handle_graphql_errors(&errors)?;
     }
 
-    let nodes = payload
-        .data
-        .map(|data| data.viewer.notification_threads.nodes)
-        .unwrap_or_default();
+    let (viewer_login, nodes) = match payload.data {
+        Some(data) => {
+            let viewer = data.viewer;
+            (viewer.login, viewer.notification_threads.nodes)
+        }
+        None => ("unknown".to_string(), Vec::new()),
+    };
 
     let notifications = nodes.into_iter().map(transform_notification).collect();
 
-    Ok((notifications, 60))
+    Ok(NotificationsPayload {
+        notifications,
+        viewer_login,
+    })
+}
+
+pub async fn fetch_my_pull_requests(
+    client: &Client,
+    token: &str,
+    viewer_login: &str,
+) -> Result<Vec<MyPullRequest>> {
+    if viewer_login.trim().is_empty() || viewer_login == "unknown" {
+        return Ok(Vec::new());
+    }
+
+    let query = format!("is:pr is:open author:{viewer_login}");
+    let response = client
+        .post(GITHUB_GRAPHQL)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "ghn")
+        .json(&json!({
+            "query": MY_PULL_REQUESTS_QUERY,
+            "variables": { "query": query }
+        }))
+        .send()
+        .await
+        .context("failed to fetch pull requests")?;
+
+    if response.status() == 429 {
+        return Err(anyhow!("GitHub rate limited. Retrying later."));
+    }
+    if response.status() == 401 || response.status() == 403 {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "GitHub authentication failed ({}). {}",
+            status,
+            body.trim()
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "GitHub API error: {}",
+            response.status()
+        ));
+    }
+
+    let payload: GraphQlResponse<SearchData> = response.json().await?;
+    if let Some(errors) = payload.errors {
+        handle_graphql_errors(&errors)?;
+    }
+
+    let nodes = payload
+        .data
+        .map(|data| data.search.nodes)
+        .unwrap_or_default();
+    let pull_requests = nodes
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let pull_requests = filter_archived_pull_requests(pull_requests)
+        .into_iter()
+        .map(transform_pull_request)
+        .collect();
+
+    Ok(pull_requests)
+}
+
+pub async fn fetch_notifications_and_my_prs(
+    client: &Client,
+    token: &str,
+    include_read: bool,
+) -> Result<(Vec<Notification>, Vec<MyPullRequest>)> {
+    let notifications = fetch_notifications(client, token, include_read).await?;
+    let pull_requests = fetch_my_pull_requests(client, token, &notifications.viewer_login).await?;
+    let pull_requests = dedupe_pull_requests(pull_requests, &notifications.notifications);
+
+    Ok((notifications.notifications, pull_requests))
+}
+
+pub async fn merge_pull_request(client: &Client, token: &str, pull_request_id: &str) -> Result<()> {
+    run_mutation(
+        client,
+        token,
+        MERGE_PULL_REQUEST_MUTATION,
+        json!({ "input": { "pullRequestId": pull_request_id, "mergeMethod": "SQUASH" } }),
+    )
+    .await
+}
+
+fn dedupe_pull_requests(
+    pull_requests: Vec<MyPullRequest>,
+    notifications: &[Notification],
+) -> Vec<MyPullRequest> {
+    let mut ids = std::collections::HashSet::new();
+    let mut urls = std::collections::HashSet::new();
+
+    for notification in notifications {
+        if !notification.subject.kind.eq_ignore_ascii_case("pullrequest") {
+            continue;
+        }
+        if let Some(subject_id) = notification.subject_id.as_ref() {
+            ids.insert(subject_id.clone());
+        }
+        urls.insert(notification.subject.url.clone());
+    }
+
+    pull_requests
+        .into_iter()
+        .filter(|pr| !ids.contains(&pr.id) && !urls.contains(&pr.url))
+        .collect()
 }
 
 async fn run_mutation(client: &Client, token: &str, query: &str, variables: serde_json::Value) -> Result<()> {
@@ -403,8 +659,31 @@ pub async fn unsubscribe(client: &Client, token: &str, node_id: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_repo_from_url, parse_subject_type, transform_notification, GraphQlNotification, GraphQlSubject};
-    use crate::types::{CiStatus, ReviewStatus, SubjectStatus};
+    use super::{
+        dedupe_pull_requests, filter_archived_pull_requests, parse_repo_from_url, parse_subject_type,
+        transform_notification, transform_pull_request, GraphQlNotification, GraphQlPullRequest,
+        GraphQlRepository, GraphQlSubject,
+    };
+    use crate::types::{
+        CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject, SubjectStatus,
+    };
+
+    fn sample_graphql_pr(id: &str, is_archived: bool) -> GraphQlPullRequest {
+        GraphQlPullRequest {
+            id: id.to_string(),
+            title: format!("{id}-title"),
+            url: format!("https://github.com/acme/widgets/pull/{id}"),
+            updated_at: "2024-01-06T00:00:00Z".to_string(),
+            is_draft: false,
+            review_decision: None,
+            repository: GraphQlRepository {
+                name: "widgets".to_string(),
+                name_with_owner: "acme/widgets".to_string(),
+                is_archived,
+            },
+            commits: None,
+        }
+    }
 
     #[test]
     fn parse_repo_from_url_handles_standard() {
@@ -564,5 +843,116 @@ mod tests {
             notification.subject.review_status,
             Some(ReviewStatus::ChangesRequested)
         );
+    }
+
+    #[test]
+    fn transform_pull_request_maps_fields() {
+        let gql = GraphQlPullRequest {
+            id: "pr-1".to_string(),
+            title: "My PR".to_string(),
+            url: "https://github.com/acme/widgets/pull/1".to_string(),
+            updated_at: "2024-01-06T00:00:00Z".to_string(),
+            is_draft: false,
+            review_decision: Some("APPROVED".to_string()),
+            repository: GraphQlRepository {
+                name: "widgets".to_string(),
+                name_with_owner: "acme/widgets".to_string(),
+                is_archived: false,
+            },
+            commits: Some(super::GraphQlPullRequestCommits {
+                nodes: vec![super::GraphQlPullRequestCommit {
+                    commit: Some(super::GraphQlCommit {
+                        status_check_rollup: Some(super::GraphQlStatusCheckRollup {
+                            state: Some("SUCCESS".to_string()),
+                        }),
+                    }),
+                }],
+            }),
+        };
+
+        let pr = transform_pull_request(gql);
+        assert_eq!(pr.id, "pr-1");
+        assert_eq!(pr.subject.title, "My PR");
+        assert_eq!(pr.subject.kind, "PullRequest");
+        assert_eq!(pr.subject.ci_status, Some(CiStatus::Success));
+        assert_eq!(pr.subject.review_status, Some(ReviewStatus::Approved));
+        assert_eq!(pr.repository.full_name, "acme/widgets");
+        assert_eq!(pr.repository.name, "widgets");
+    }
+
+    #[test]
+    fn dedupe_pull_requests_removes_notification_dupes() {
+        let notifications = vec![Notification {
+            id: "thread-1".to_string(),
+            node_id: "node-1".to_string(),
+            subject_id: Some("pr-1".to_string()),
+            unread: false,
+            reason: "mention".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: Subject {
+                title: "My PR".to_string(),
+                url: "https://github.com/acme/widgets/pull/1".to_string(),
+                kind: "PullRequest".to_string(),
+                status: None,
+                ci_status: None,
+                review_status: None,
+            },
+            repository: Repository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+            },
+            url: "https://github.com/acme/widgets/pull/1".to_string(),
+        }];
+
+        let pull_requests = vec![
+            MyPullRequest {
+                id: "pr-1".to_string(),
+                updated_at: "2024-01-02T00:00:00Z".to_string(),
+                subject: Subject {
+                    title: "My PR".to_string(),
+                    url: "https://github.com/acme/widgets/pull/1".to_string(),
+                    kind: "PullRequest".to_string(),
+                    status: None,
+                    ci_status: None,
+                    review_status: None,
+                },
+                repository: Repository {
+                    name: "widgets".to_string(),
+                    full_name: "acme/widgets".to_string(),
+                },
+                url: "https://github.com/acme/widgets/pull/1".to_string(),
+            },
+            MyPullRequest {
+                id: "pr-2".to_string(),
+                updated_at: "2024-01-03T00:00:00Z".to_string(),
+                subject: Subject {
+                    title: "Another PR".to_string(),
+                    url: "https://github.com/acme/widgets/pull/2".to_string(),
+                    kind: "PullRequest".to_string(),
+                    status: None,
+                    ci_status: None,
+                    review_status: None,
+                },
+                repository: Repository {
+                    name: "widgets".to_string(),
+                    full_name: "acme/widgets".to_string(),
+                },
+                url: "https://github.com/acme/widgets/pull/2".to_string(),
+            },
+        ];
+
+        let deduped = dedupe_pull_requests(pull_requests, &notifications);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].id, "pr-2");
+    }
+
+    #[test]
+    fn filter_archived_pull_requests_drops_archived() {
+        let active = sample_graphql_pr("pr-1", false);
+        let archived = sample_graphql_pr("pr-2", true);
+
+        let filtered = filter_archived_pull_requests(vec![active, archived]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "pr-1");
     }
 }

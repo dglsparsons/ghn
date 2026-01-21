@@ -6,6 +6,46 @@ pub fn is_target_char(ch: char) -> bool {
     matches!(ch, 'm' | 'c' | 'f' | '?' | 'a' | 'x' | 'u')
 }
 
+// Greedily split concatenated digits into the longest valid indices based on the list size.
+fn split_digits(digits: &str, notification_count: usize) -> Vec<usize> {
+    let mut remaining = digits;
+    let mut indices = Vec::new();
+
+    while !remaining.is_empty() {
+        if let Some((value, len)) = longest_valid_prefix(remaining, notification_count) {
+            indices.push(value);
+            remaining = &remaining[len..];
+        } else {
+            break;
+        }
+    }
+
+    indices
+}
+
+fn longest_valid_prefix(digits: &str, notification_count: usize) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut value: usize = 0;
+
+    for (idx, ch) in digits.chars().enumerate() {
+        let digit = ch.to_digit(10).unwrap_or(0) as usize;
+        value = match value.checked_mul(10).and_then(|current| current.checked_add(digit)) {
+            Some(next) => next,
+            None => break,
+        };
+
+        if value >= 1 && value <= notification_count {
+            best = Some((value, idx + 1));
+        }
+
+        if value > notification_count && value != 0 {
+            break;
+        }
+    }
+
+    best
+}
+
 fn push_index(indices: &mut Vec<usize>, index: usize, notification_count: usize) {
     if index >= 1 && index <= notification_count {
         indices.push(index);
@@ -20,20 +60,59 @@ fn push_range(indices: &mut Vec<usize>, start: usize, end: usize, notification_c
 }
 
 fn finalize_pending(
-    current_number: &mut Option<usize>,
+    current_digits: &mut String,
     range_start: &mut Option<usize>,
     indices: &mut Vec<usize>,
     notification_count: usize,
 ) {
-    if let Some(number) = current_number.take() {
+    if current_digits.is_empty() {
         if let Some(start) = range_start.take() {
-            push_range(indices, start, number, notification_count);
-        } else {
-            push_index(indices, number, notification_count);
+            push_index(indices, start, notification_count);
         }
-    } else if let Some(start) = range_start.take() {
-        push_index(indices, start, notification_count);
+        return;
     }
+
+    let parsed = split_digits(current_digits, notification_count);
+    current_digits.clear();
+
+    if let Some(start) = range_start.take() {
+        if let Some((end, rest)) = parsed.split_first() {
+            push_range(indices, start, *end, notification_count);
+            for index in rest {
+                push_index(indices, *index, notification_count);
+            }
+        } else {
+            push_index(indices, start, notification_count);
+        }
+    } else {
+        for index in parsed {
+            push_index(indices, index, notification_count);
+        }
+    }
+}
+
+fn finalize_range_start(
+    current_digits: &mut String,
+    range_start: &mut Option<usize>,
+    indices: &mut Vec<usize>,
+    notification_count: usize,
+) {
+    if current_digits.is_empty() {
+        return;
+    }
+
+    let parsed = split_digits(current_digits, notification_count);
+    current_digits.clear();
+
+    if parsed.is_empty() {
+        *range_start = None;
+        return;
+    }
+
+    for index in &parsed[..parsed.len() - 1] {
+        push_index(indices, *index, notification_count);
+    }
+    *range_start = parsed.last().copied();
 }
 
 pub fn parse_commands(
@@ -43,26 +122,21 @@ pub fn parse_commands(
 ) -> HashMap<usize, Vec<Action>> {
     let mut result: HashMap<usize, Vec<Action>> = HashMap::new();
 
-    let mut current_number: Option<usize> = None;
+    let mut current_digits = String::new();
     let mut range_start: Option<usize> = None;
     let mut indices: Vec<usize> = Vec::new();
     let mut after_action = false;
 
     for ch in input.chars() {
         if ch.is_ascii_digit() {
-            let digit = ch.to_digit(10).unwrap_or(0) as usize;
             if after_action {
                 indices.clear();
                 range_start = None;
-                current_number = None;
+                current_digits.clear();
                 after_action = false;
             }
 
-            let next = current_number
-                .unwrap_or(0)
-                .saturating_mul(10)
-                .saturating_add(digit);
-            current_number = Some(next);
+            current_digits.push(ch);
             continue;
         }
 
@@ -70,14 +144,22 @@ pub fn parse_commands(
             if after_action {
                 continue;
             }
-            if let Some(number) = current_number.take() {
-                range_start = Some(number);
-            }
+            finalize_range_start(
+                &mut current_digits,
+                &mut range_start,
+                &mut indices,
+                notification_count,
+            );
             continue;
         }
 
         if ch == ' ' || ch == ',' {
-            finalize_pending(&mut current_number, &mut range_start, &mut indices, notification_count);
+            finalize_pending(
+                &mut current_digits,
+                &mut range_start,
+                &mut indices,
+                notification_count,
+            );
             continue;
         }
 
@@ -85,11 +167,16 @@ pub fn parse_commands(
             if after_action {
                 indices.clear();
                 range_start = None;
-                current_number = None;
+                current_digits.clear();
                 after_action = false;
             }
 
-            finalize_pending(&mut current_number, &mut range_start, &mut indices, notification_count);
+            finalize_pending(
+                &mut current_digits,
+                &mut range_start,
+                &mut indices,
+                notification_count,
+            );
             if let Some(group) = targets.get(&ch) {
                 for index in group {
                     if !indices.contains(index) {
@@ -101,7 +188,12 @@ pub fn parse_commands(
         }
 
         if let Some(action) = Action::from_char(ch) {
-            finalize_pending(&mut current_number, &mut range_start, &mut indices, notification_count);
+            finalize_pending(
+                &mut current_digits,
+                &mut range_start,
+                &mut indices,
+                notification_count,
+            );
 
             if !indices.is_empty() {
                 for index in &indices {
@@ -114,7 +206,7 @@ pub fn parse_commands(
             continue;
         }
 
-        current_number = None;
+        current_digits.clear();
         range_start = None;
         indices.clear();
         after_action = false;
@@ -156,6 +248,51 @@ mod tests {
 
         let result = parse_commands("123d", 200, &targets);
         assert_eq!(result.get(&123), Some(&vec![Action::Done]));
+    }
+
+    #[test]
+    fn splits_concatenated_indices_when_out_of_range() {
+        let targets = HashMap::new();
+        let result = parse_commands("23r", 10, &targets);
+        assert_eq!(result.get(&2), Some(&vec![Action::Read]));
+        assert_eq!(result.get(&3), Some(&vec![Action::Read]));
+        assert!(!result.contains_key(&23));
+    }
+
+    #[test]
+    fn keeps_multi_digit_index_when_in_range() {
+        let targets = HashMap::new();
+        let result = parse_commands("23r", 30, &targets);
+        assert_eq!(result.get(&23), Some(&vec![Action::Read]));
+        assert!(!result.contains_key(&2));
+        assert!(!result.contains_key(&3));
+    }
+
+    #[test]
+    fn splits_long_runs_greedily() {
+        let targets = HashMap::new();
+        let result = parse_commands("123456r", 50, &targets);
+        assert_eq!(result.get(&12), Some(&vec![Action::Read]));
+        assert_eq!(result.get(&34), Some(&vec![Action::Read]));
+        assert_eq!(result.get(&5), Some(&vec![Action::Read]));
+        assert_eq!(result.get(&6), Some(&vec![Action::Read]));
+    }
+
+    #[test]
+    fn splits_trailing_zero_when_out_of_range() {
+        let targets = HashMap::new();
+        let result = parse_commands("10r", 9, &targets);
+        assert_eq!(result.get(&1), Some(&vec![Action::Read]));
+        assert!(!result.contains_key(&10));
+    }
+
+    #[test]
+    fn splits_ranges_with_greedy_endpoints() {
+        let targets = HashMap::new();
+        let result = parse_commands("1-23r", 10, &targets);
+        assert_eq!(result.get(&1), Some(&vec![Action::Read]));
+        assert_eq!(result.get(&2), Some(&vec![Action::Read]));
+        assert_eq!(result.get(&3), Some(&vec![Action::Read]));
     }
 
     #[test]

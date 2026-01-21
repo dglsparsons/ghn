@@ -14,6 +14,15 @@ pub struct Notification {
 }
 
 #[derive(Debug, Clone)]
+pub struct MyPullRequest {
+    pub id: String,
+    pub updated_at: String,
+    pub subject: Subject,
+    pub repository: Repository,
+    pub url: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Subject {
     pub title: String,
     pub url: String,
@@ -67,6 +76,7 @@ pub enum Action {
     Read,
     Done,
     Unsubscribe,
+    SquashMerge,
 }
 
 impl Action {
@@ -77,6 +87,7 @@ impl Action {
             'r' => Some(Self::Read),
             'd' => Some(Self::Done),
             'q' => Some(Self::Unsubscribe),
+            's' => Some(Self::SquashMerge),
             _ => None,
         }
     }
@@ -88,6 +99,7 @@ impl Action {
             Self::Read => 'r',
             Self::Done => 'd',
             Self::Unsubscribe => 'q',
+            Self::SquashMerge => 's',
         }
     }
 }
@@ -116,6 +128,7 @@ mod tests {
             ('r', Action::Read),
             ('d', Action::Done),
             ('q', Action::Unsubscribe),
+            ('s', Action::SquashMerge),
         ];
 
         for (ch, action) in pairs {
