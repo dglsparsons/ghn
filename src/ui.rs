@@ -13,8 +13,17 @@ use crate::{
     AppState,
 };
 
-const COMMAND_REFERENCE: &str =
-    "Commands: o open/read  y yank  r read  d done  q unsub  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft";
+const COMMANDS_FULL: &str = "Commands: o open/read  y yank  r read  d done  q unsub";
+const COMMANDS_COMPACT: &str = "Cmds: o open/read  y yank  r read  d done  q unsub";
+const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q";
+const COMMANDS_TINY: &str = "o y r d q";
+
+const TARGETS_FULL: &str =
+    "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft";
+const TARGETS_COMPACT: &str =
+    "Targets: 1-3/1 2 3, u unread, ? review, a appr, x chg, m merged, c closed, f draft";
+const TARGETS_SHORT: &str = "Tgt 1-3/1 2 3 u ? a x m c f";
+const TARGETS_TINY: &str = "1-3 u ? a x m c f";
 const MAX_KIND_WIDTH: usize = 14;
 const MAX_TIME_WIDTH: usize = 6;
 const MIN_KIND_WIDTH: usize = 3;
@@ -28,20 +37,47 @@ const REPO_META_GAP: usize = 2;
 const CI_REVIEW_GAP: usize = 1;
 const INDICATOR_KIND_GAP: usize = 1;
 
+#[derive(Clone, Copy)]
+struct LegendVariant {
+    commands: &'static str,
+    targets: &'static str,
+}
+
+const LEGEND_VARIANTS: [LegendVariant; 4] = [
+    LegendVariant {
+        commands: COMMANDS_FULL,
+        targets: TARGETS_FULL,
+    },
+    LegendVariant {
+        commands: COMMANDS_COMPACT,
+        targets: TARGETS_COMPACT,
+    },
+    LegendVariant {
+        commands: COMMANDS_SHORT,
+        targets: TARGETS_SHORT,
+    },
+    LegendVariant {
+        commands: COMMANDS_TINY,
+        targets: TARGETS_TINY,
+    },
+];
+
 pub fn draw(f: &mut Frame, app: &AppState) {
     let size = f.area();
+    let status_lines = build_status_lines(size.width, app.status.as_deref());
+    let status_height = status_lines.len().max(1) as u16;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
-            Constraint::Length(1),
+            Constraint::Length(status_height),
             Constraint::Length(2),
         ])
         .split(size);
 
     draw_list(f, chunks[0], app);
-    draw_status(f, chunks[1], app);
+    draw_status(f, chunks[1], status_lines);
     draw_command(f, chunks[2], app);
 }
 
@@ -73,18 +109,24 @@ fn draw_list(f: &mut Frame, area: Rect, app: &AppState) {
         .max()
         .unwrap_or(0);
     let max_line = max_title.max(max_repo);
-    let max_ci = app
+    let max_ci = if app
         .notifications
         .iter()
         .any(|notification| ci_indicator(notification).is_some())
-        .then_some(MAX_CI_WIDTH)
-        .unwrap_or(0);
-    let max_review = app
+    {
+        MAX_CI_WIDTH
+    } else {
+        0
+    };
+    let max_review = if app
         .notifications
         .iter()
         .any(|notification| effective_review_status(notification).is_some())
-        .then_some(MAX_REVIEW_WIDTH)
-        .unwrap_or(0);
+    {
+        MAX_REVIEW_WIDTH
+    } else {
+        0
+    };
     let widths = layout_widths(
         area.width,
         app.notifications.len(),
@@ -214,16 +256,41 @@ fn draw_command(f: &mut Frame, area: Rect, app: &AppState) {
     f.render_widget(&app.input, chunks[1]);
 }
 
-fn draw_status(f: &mut Frame, area: Rect, app: &AppState) {
-    let mut line = COMMAND_REFERENCE.to_string();
-    if let Some(status) = app.status.as_ref() {
-        if !status.is_empty() {
-            line.push_str("  |  ");
-            line.push_str(status);
+fn draw_status(f: &mut Frame, area: Rect, lines: Vec<String>) {
+    let lines: Vec<Line> = lines.into_iter().map(Line::from).collect();
+    let paragraph = Paragraph::new(lines).block(Block::default());
+    f.render_widget(paragraph, area);
+}
+
+fn build_status_lines(width: u16, status: Option<&str>) -> Vec<String> {
+    let width = (width as usize).max(1);
+    let mut lines = Vec::new();
+
+    let status = status.map(str::trim).filter(|text| !text.is_empty());
+    if let Some(status) = status {
+        lines.push(truncate_with_suffix(status, width));
+    }
+
+    lines.extend(select_legend_lines(width));
+    lines
+}
+
+fn select_legend_lines(width: usize) -> Vec<String> {
+    // Prefer the most descriptive legend that fits the width, even if it needs multiple lines.
+    for variant in LEGEND_VARIANTS {
+        let single = format!("{}  |  {}", variant.commands, variant.targets);
+        if single.chars().count() <= width {
+            return vec![single];
+        }
+        if variant.commands.chars().count() <= width && variant.targets.chars().count() <= width {
+            return vec![variant.commands.to_string(), variant.targets.to_string()];
         }
     }
-    let paragraph = Paragraph::new(line).block(Block::default());
-    f.render_widget(paragraph, area);
+
+    vec![
+        truncate_with_suffix(COMMANDS_TINY, width),
+        truncate_with_suffix(TARGETS_TINY, width),
+    ]
 }
 
 struct StatusLabel {
@@ -517,7 +584,7 @@ pub fn build_pending_map(
 #[cfg(test)]
 mod tests {
     use super::{
-        base_notification_style, build_pending_map, layout_widths, review_indicator,
+        base_notification_style, build_pending_map, build_status_lines, layout_widths, review_indicator,
         truncate_with_suffix, READ_NOTIFICATION_COLOR,
     };
     use crate::types::Action;
@@ -857,5 +924,34 @@ mod tests {
         };
 
         assert!(review_indicator(&notification).is_none());
+    }
+
+    #[test]
+    fn status_lines_fit_widths() {
+        for width in [20u16, 40, 80, 120] {
+            let lines = build_status_lines(width, None);
+            assert!(!lines.is_empty());
+            for line in lines {
+                assert!(line.chars().count() <= width as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn status_lines_append_status_when_space_allows() {
+        let status = "Executed 3 actions";
+        let lines = build_status_lines(400, Some(status));
+        assert!(lines.len() >= 2);
+        assert_eq!(lines[0], status);
+    }
+
+    #[test]
+    fn status_lines_truncate_status_when_too_long() {
+        let status = "Executed 123 actions with a very long error summary";
+        let width = 20u16;
+        let lines = build_status_lines(width, Some(status));
+        let first = lines.first().expect("status line");
+        assert!(first.chars().count() <= width as usize);
+        assert!(first.starts_with("Executed"));
     }
 }
