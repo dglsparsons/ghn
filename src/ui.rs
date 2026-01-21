@@ -297,8 +297,11 @@ fn effective_review_status(notification: &Notification) -> Option<ReviewStatus> 
     let status = notification.subject.review_status?;
     if status == ReviewStatus::ReviewRequired {
         if let Some(subject_status) = notification.subject.status {
-            if matches!(subject_status, SubjectStatus::Merged | SubjectStatus::Closed) {
-                // Closed/merged PRs shouldn't display a pending review indicator.
+            if matches!(
+                subject_status,
+                SubjectStatus::Merged | SubjectStatus::Closed | SubjectStatus::Draft
+            ) {
+                // Draft/closed/merged PRs shouldn't display a pending review indicator.
                 return None;
             }
         }
@@ -626,12 +629,12 @@ mod tests {
                 reason: "review_requested".to_string(),
                 updated_at: "2024-01-01T00:00:00Z".to_string(),
                 subject: Subject {
-                    title: "Approved".to_string(),
+                    title: "Draft PR".to_string(),
                     url: "https://github.com/acme/widgets/pull/3".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: None,
+                    status: Some(SubjectStatus::Draft),
                     ci_status: None,
-                    review_status: Some(ReviewStatus::Approved),
+                    review_status: Some(ReviewStatus::ReviewRequired),
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -647,8 +650,29 @@ mod tests {
                 reason: "review_requested".to_string(),
                 updated_at: "2024-01-01T00:00:00Z".to_string(),
                 subject: Subject {
-                    title: "Changes requested".to_string(),
+                    title: "Approved".to_string(),
                     url: "https://github.com/acme/widgets/pull/4".to_string(),
+                    kind: "PullRequest".to_string(),
+                    status: None,
+                    ci_status: None,
+                    review_status: Some(ReviewStatus::Approved),
+                },
+                repository: Repository {
+                    name: "widgets".to_string(),
+                    full_name: "acme/widgets".to_string(),
+                },
+                url: "https://github.com/acme/widgets/pull/4".to_string(),
+            },
+            Notification {
+                id: "thread-5".to_string(),
+                node_id: "node-5".to_string(),
+                subject_id: None,
+                unread: true,
+                reason: "review_requested".to_string(),
+                updated_at: "2024-01-01T00:00:00Z".to_string(),
+                subject: Subject {
+                    title: "Changes requested".to_string(),
+                    url: "https://github.com/acme/widgets/pull/5".to_string(),
                     kind: "PullRequest".to_string(),
                     status: None,
                     ci_status: None,
@@ -658,19 +682,20 @@ mod tests {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
                 },
-                url: "https://github.com/acme/widgets/pull/4".to_string(),
+                url: "https://github.com/acme/widgets/pull/5".to_string(),
             },
         ];
 
         let pending = build_pending_map("?o", &notifications);
         assert_eq!(pending.get(&1), Some(&vec![Action::Open]));
         assert!(!pending.contains_key(&2));
+        assert!(!pending.contains_key(&3));
 
         let pending = build_pending_map("ao", &notifications);
-        assert_eq!(pending.get(&3), Some(&vec![Action::Open]));
+        assert_eq!(pending.get(&4), Some(&vec![Action::Open]));
 
         let pending = build_pending_map("xo", &notifications);
-        assert_eq!(pending.get(&4), Some(&vec![Action::Open]));
+        assert_eq!(pending.get(&5), Some(&vec![Action::Open]));
     }
 
     #[test]
@@ -802,6 +827,33 @@ mod tests {
                 full_name: "acme/widgets".to_string(),
             },
             url: "https://github.com/acme/widgets/pull/4".to_string(),
+        };
+
+        assert!(review_indicator(&notification).is_none());
+    }
+
+    #[test]
+    fn review_indicator_suppresses_pending_when_draft() {
+        let notification = Notification {
+            id: "thread-5".to_string(),
+            node_id: "node-5".to_string(),
+            subject_id: None,
+            unread: true,
+            reason: "review_requested".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: Subject {
+                title: "Draft PR".to_string(),
+                url: "https://github.com/acme/widgets/pull/5".to_string(),
+                kind: "PullRequest".to_string(),
+                status: Some(SubjectStatus::Draft),
+                ci_status: None,
+                review_status: Some(ReviewStatus::ReviewRequired),
+            },
+            repository: Repository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+            },
+            url: "https://github.com/acme/widgets/pull/5".to_string(),
         };
 
         assert!(review_indicator(&notification).is_none());
