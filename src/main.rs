@@ -30,7 +30,9 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
     commands::is_target_char,
-    github::{fetch_notifications_and_my_prs, mark_as_done, mark_as_read, merge_pull_request, unsubscribe},
+    github::{
+        fetch_notifications_and_my_prs, mark_as_done, mark_as_read, merge_pull_request, unsubscribe,
+    },
     ignore::{append_ignored_pr, load_ignored_prs},
     types::{Action, MyPullRequest, Notification},
     util::{copy_to_clipboard, format_relative_time, gh_auth_token, open_in_browser},
@@ -119,7 +121,8 @@ impl AppState {
     }
 
     fn update_pending(&mut self) {
-        self.pending = ui::build_pending_map(&self.command_text(), &self.notifications, &self.my_prs);
+        self.pending =
+            ui::build_pending_map(&self.command_text(), &self.notifications, &self.my_prs);
     }
 
     fn clear_commands(&mut self) {
@@ -128,10 +131,7 @@ impl AppState {
     }
 
     fn command_text(&self) -> String {
-        self.input
-            .lines().first()
-            .cloned()
-            .unwrap_or_default()
+        self.input.lines().first().cloned().unwrap_or_default()
     }
 }
 
@@ -156,7 +156,11 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args, token: String) -> Result<()> {
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    args: Args,
+    token: String,
+) -> Result<()> {
     let client = Arc::new(reqwest::Client::new());
     let token = Arc::new(token);
 
@@ -186,7 +190,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: Args, 
     let mut tick = tokio::time::interval(Duration::from_millis(500));
 
     loop {
-        terminal.draw(|f| ui::draw(f, &app)).context("render failed")?;
+        terminal
+            .draw(|f| ui::draw(f, &app))
+            .context("render failed")?;
 
         tokio::select! {
             maybe_event = events.next() => {
@@ -325,8 +331,14 @@ fn submit_commands(
 
     // Run network mutations in the background so the UI can render the optimistic state immediately.
     tokio::spawn(async move {
-        let result =
-            execute_commands(&client, &token, &pending, &notifications_snapshot, &my_prs_snapshot).await;
+        let result = execute_commands(
+            &client,
+            &token,
+            &pending,
+            &notifications_snapshot,
+            &my_prs_snapshot,
+        )
+        .await;
         match result {
             Ok(summary) => {
                 let _ = app_event_tx.send(AppEvent::CommandResult(summary)).await;
@@ -376,12 +388,10 @@ fn handle_text_input(app: &mut AppState, key: crossterm::event::KeyEvent) {
 
     if let KeyCode::Char(ch) = key.code {
         if key.modifiers.is_empty()
-            && !(
-                ch.is_ascii_digit()
-                    || Action::from_char(ch).is_some()
-                    || is_target_char(ch)
-                    || matches!(ch, ' ' | ',' | '-')
-            )
+            && !(ch.is_ascii_digit()
+                || Action::from_char(ch).is_some()
+                || is_target_char(ch)
+                || matches!(ch, ' ' | ',' | '-'))
         {
             return;
         }
@@ -489,11 +499,7 @@ struct ExecSummary {
     api_failed: bool,
 }
 
-fn handle_command_result(
-    app: &mut AppState,
-    refresh_tx: &mpsc::Sender<()>,
-    result: ExecSummary,
-) {
+fn handle_command_result(app: &mut AppState, refresh_tx: &mpsc::Sender<()>, result: ExecSummary) {
     let (message, refresh, sticky) = command_status(&result);
     app.status = Some(message);
     app.status_sticky = sticky;
@@ -512,7 +518,11 @@ fn command_status(result: &ExecSummary) -> (String, bool, bool) {
         return (sample, result.api_failed, true);
     }
 
-    (format!("Executed {} actions", result.succeeded), false, false)
+    (
+        format!("Executed {} actions", result.succeeded),
+        false,
+        false,
+    )
 }
 
 async fn execute_commands(
@@ -682,19 +692,17 @@ async fn execute_action(
                 mark_as_done(client, token, &notification.node_id).await?;
             }
         }
-        Action::Unsubscribe => {
-            match entry {
-                EntrySnapshot::Notification(notification) => {
-                    if let Some(subject_id) = notification.subject_id.as_ref() {
-                        unsubscribe(client, token, subject_id).await?;
-                    }
-                    mark_as_done(client, token, &notification.node_id).await?;
+        Action::Unsubscribe => match entry {
+            EntrySnapshot::Notification(notification) => {
+                if let Some(subject_id) = notification.subject_id.as_ref() {
+                    unsubscribe(client, token, subject_id).await?;
                 }
-                EntrySnapshot::MyPullRequest(_) => {
-                    append_ignored_pr(url)?;
-                }
+                mark_as_done(client, token, &notification.node_id).await?;
             }
-        }
+            EntrySnapshot::MyPullRequest(_) => {
+                append_ignored_pr(url)?;
+            }
+        },
         Action::SquashMerge => {
             let pull_request_id = match entry {
                 EntrySnapshot::Notification(notification) => notification.subject_id.as_deref(),
@@ -824,10 +832,7 @@ mod tests {
             handle_text_input(&mut app, key_event(KeyCode::Char(ch), KeyModifiers::NONE));
         }
 
-        handle_text_input(
-            &mut app,
-            key_event(KeyCode::Backspace, KeyModifiers::SUPER),
-        );
+        handle_text_input(&mut app, key_event(KeyCode::Backspace, KeyModifiers::SUPER));
         assert_eq!(app.command_text(), "");
     }
 
@@ -977,7 +982,10 @@ mod tests {
 
         app.set_data(Vec::new(), vec![pr_ignored, pr_kept]);
         assert_eq!(app.my_prs.len(), 1);
-        assert_eq!(app.my_prs[0].url, "https://github.com/acme/widgets/pull/101");
+        assert_eq!(
+            app.my_prs[0].url,
+            "https://github.com/acme/widgets/pull/101"
+        );
     }
 
     #[test]

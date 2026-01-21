@@ -66,9 +66,8 @@ fn read_ignored_prs(path: &Path) -> Result<HashSet<String>> {
             return Ok(HashSet::new());
         }
         Err(err) => {
-            return Err(err).with_context(|| {
-                format!("failed to open ignore list: {}", path.display())
-            });
+            return Err(err)
+                .with_context(|| format!("failed to open ignore list: {}", path.display()));
         }
     };
 
@@ -89,9 +88,7 @@ fn read_ignored_prs(path: &Path) -> Result<HashSet<String>> {
 
 pub fn append_ignored_pr(url: &str) -> Result<bool> {
     // Serialize read/append to keep the file consistent when multiple actions run concurrently.
-    let _guard = ignore_lock()
-        .lock()
-        .expect("ignore list lock poisoned");
+    let _guard = ignore_lock().lock().expect("ignore list lock poisoned");
     let path = ignores_path()?;
     let existing = read_ignored_prs(&path)?;
 
@@ -101,7 +98,10 @@ pub fn append_ignored_pr(url: &str) -> Result<bool> {
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create ignore list directory: {}", parent.display())
+            format!(
+                "failed to create ignore list directory: {}",
+                parent.display()
+            )
         })?;
     }
 
@@ -111,9 +111,8 @@ pub fn append_ignored_pr(url: &str) -> Result<bool> {
         .open(&path)
         .with_context(|| format!("failed to open ignore list: {}", path.display()))?;
 
-    writeln!(file, "{}", url).with_context(|| {
-        format!("failed to write ignore list: {}", path.display())
-    })?;
+    writeln!(file, "{}", url)
+        .with_context(|| format!("failed to write ignore list: {}", path.display()))?;
 
     Ok(true)
 }
@@ -179,7 +178,10 @@ mod tests {
         assert!(ignores.contains(url));
 
         let content = fs::read_to_string(&path).unwrap();
-        let count = content.lines().filter(|line| !line.trim().is_empty()).count();
+        let count = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
         assert_eq!(count, 1);
     }
 

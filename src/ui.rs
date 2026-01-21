@@ -13,7 +13,8 @@ use crate::{
     AppState,
 };
 
-const COMMANDS_FULL: &str = "Commands: o open/read  y yank  r read  d done  q unsub/ignore  s squash";
+const COMMANDS_FULL: &str =
+    "Commands: o open/read  y yank  r read  d done  q unsub/ignore  s squash";
 const COMMANDS_COMPACT: &str = "Cmds: o open/read  y yank  r read  d done  q unsub/ign  s squash";
 const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q/s";
 const COMMANDS_TINY: &str = "o y r d q s";
@@ -255,8 +256,10 @@ fn draw_list_section<T: ListItemLike>(
 
             let index_cell = pad_left(&index.to_string(), widths.index);
             let status_prefix = status_prefix(subject);
-            let kind_cell =
-                pad_left(&truncate_with_suffix(&subject.kind, widths.kind), widths.kind);
+            let kind_cell = pad_left(
+                &truncate_with_suffix(&subject.kind, widths.kind),
+                widths.kind,
+            );
             let time_cell = pad_left(&truncate_with_suffix(time, widths.time), widths.time);
 
             let mut header_spans = vec![
@@ -299,8 +302,10 @@ fn draw_list_section<T: ListItemLike>(
             if widths.review > 0 {
                 let indicator = review_indicator(subject);
                 let review_cell = indicator.as_ref().map(|value| value.text).unwrap_or("");
-                let padded =
-                    pad_right(&truncate_with_suffix(review_cell, widths.review), widths.review);
+                let padded = pad_right(
+                    &truncate_with_suffix(review_cell, widths.review),
+                    widths.review,
+                );
                 if let Some(indicator) = indicator {
                     header_spans.push(Span::styled(padded, indicator.style));
                 } else {
@@ -532,8 +537,16 @@ fn layout_widths(
     let mut kind = max_kind.clamp(MIN_KIND_WIDTH, MAX_KIND_WIDTH);
     let mut ci = if max_ci > 0 { MAX_CI_WIDTH } else { 0 };
     let mut review = if max_review > 0 { MAX_REVIEW_WIDTH } else { 0 };
-    let mut ci_review_gap = if ci > 0 && review > 0 { CI_REVIEW_GAP } else { 0 };
-    let mut indicator_kind_gap = if ci > 0 || review > 0 { INDICATOR_KIND_GAP } else { 0 };
+    let mut ci_review_gap = if ci > 0 && review > 0 {
+        CI_REVIEW_GAP
+    } else {
+        0
+    };
+    let mut indicator_kind_gap = if ci > 0 || review > 0 {
+        INDICATOR_KIND_GAP
+    } else {
+        0
+    };
     let mut meta_width = kind + 1 + time + ci + review + ci_review_gap + indicator_kind_gap;
 
     if meta_width + repo_meta_gap > title && repo_meta_gap > 1 {
@@ -541,14 +554,18 @@ fn layout_widths(
     }
     if meta_width + repo_meta_gap > title {
         let max_kind_allowed = title
-            .saturating_sub(time + 1 + repo_meta_gap + ci + review + ci_review_gap + indicator_kind_gap)
+            .saturating_sub(
+                time + 1 + repo_meta_gap + ci + review + ci_review_gap + indicator_kind_gap,
+            )
             .max(1);
         kind = kind.min(max_kind_allowed);
         meta_width = kind + 1 + time + ci + review + ci_review_gap + indicator_kind_gap;
     }
     if meta_width + repo_meta_gap > title {
         let max_time_allowed = title
-            .saturating_sub(kind + 1 + repo_meta_gap + ci + review + ci_review_gap + indicator_kind_gap)
+            .saturating_sub(
+                kind + 1 + repo_meta_gap + ci + review + ci_review_gap + indicator_kind_gap,
+            )
             .max(1);
         time = time.min(max_time_allowed);
         meta_width = kind + 1 + time + ci + review + ci_review_gap + indicator_kind_gap;
@@ -620,7 +637,9 @@ fn truncate_with_suffix(value: &str, max: usize) -> String {
 
 fn unread_marker_style(unread: bool) -> Style {
     if unread {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(READ_NOTIFICATION_COLOR)
     }
@@ -691,7 +710,8 @@ pub fn build_pending_map(
     my_prs: &[MyPullRequest],
 ) -> HashMap<usize, Vec<Action>> {
     let targets = build_target_map(notifications, my_prs);
-    let parsed = crate::commands::parse_commands(input, notifications.len() + my_prs.len(), &targets);
+    let parsed =
+        crate::commands::parse_commands(input, notifications.len() + my_prs.len(), &targets);
 
     filter_pending_actions(parsed, notifications, my_prs)
 }
@@ -737,7 +757,10 @@ fn action_allowed(action: &Action, entry: &PendingEntry<'_>) -> bool {
         PendingEntry::Notification(notification) => {
             // Ignore merge unless it targets a PR with a known node id.
             if *action == Action::SquashMerge {
-                notification.subject.kind.eq_ignore_ascii_case("pullrequest")
+                notification
+                    .subject
+                    .kind
+                    .eq_ignore_ascii_case("pullrequest")
                     && notification.subject_id.is_some()
             } else {
                 true
@@ -760,7 +783,10 @@ mod tests {
         layout_widths, pending_style, review_indicator, select_legend_lines, status_prefix,
         truncate_with_suffix, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
     };
-    use crate::types::{Action, CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject, SubjectStatus};
+    use crate::types::{
+        Action, CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject,
+        SubjectStatus,
+    };
     use ratatui::style::{Color, Modifier, Style};
 
     #[test]
@@ -1074,7 +1100,10 @@ mod tests {
     fn truncate_with_suffix_respects_max() {
         assert_eq!(truncate_with_suffix("short", 10), "short");
         assert_eq!(truncate_with_suffix("1234567890", 2), "12");
-        assert_eq!(truncate_with_suffix("this is a long title", 10), "this is..");
+        assert_eq!(
+            truncate_with_suffix("this is a long title", 10),
+            "this is.."
+        );
     }
 
     #[test]
@@ -1266,9 +1295,7 @@ mod tests {
         assert_eq!(indicator.text, "✗");
         assert_eq!(
             indicator.style,
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         );
     }
 

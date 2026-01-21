@@ -325,11 +325,7 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
         updated_at: gql.last_updated_at,
         subject,
         repository: Repository {
-            name: repo_full_name
-                .split('/')
-                .nth(1)
-                .unwrap_or("")
-                .to_string(),
+            name: repo_full_name.split('/').nth(1).unwrap_or("").to_string(),
             full_name: repo_full_name,
         },
         url: gql.url,
@@ -448,10 +444,7 @@ pub async fn fetch_notifications(
         ));
     }
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "GitHub API error: {}",
-            response.status()
-        ));
+        return Err(anyhow!("GitHub API error: {}", response.status()));
     }
 
     let payload: GraphQlResponse<NotificationsData> = response.json().await?;
@@ -511,10 +504,7 @@ pub async fn fetch_my_pull_requests(
         ));
     }
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "GitHub API error: {}",
-            response.status()
-        ));
+        return Err(anyhow!("GitHub API error: {}", response.status()));
     }
 
     let payload: GraphQlResponse<SearchData> = response.json().await?;
@@ -526,10 +516,7 @@ pub async fn fetch_my_pull_requests(
         .data
         .map(|data| data.search.nodes)
         .unwrap_or_default();
-    let pull_requests = nodes
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let pull_requests = nodes.into_iter().flatten().collect::<Vec<_>>();
     let pull_requests = filter_archived_pull_requests(pull_requests)
         .into_iter()
         .map(transform_pull_request)
@@ -568,7 +555,11 @@ fn dedupe_pull_requests(
     let mut urls = std::collections::HashSet::new();
 
     for notification in notifications {
-        if !notification.subject.kind.eq_ignore_ascii_case("pullrequest") {
+        if !notification
+            .subject
+            .kind
+            .eq_ignore_ascii_case("pullrequest")
+        {
             continue;
         }
         if let Some(subject_id) = notification.subject_id.as_ref() {
@@ -583,7 +574,12 @@ fn dedupe_pull_requests(
         .collect()
 }
 
-async fn run_mutation(client: &Client, token: &str, query: &str, variables: serde_json::Value) -> Result<()> {
+async fn run_mutation(
+    client: &Client,
+    token: &str,
+    query: &str,
+    variables: serde_json::Value,
+) -> Result<()> {
     let response = client
         .post(GITHUB_GRAPHQL)
         .header("Authorization", format!("Bearer {}", token))
@@ -607,10 +603,7 @@ async fn run_mutation(client: &Client, token: &str, query: &str, variables: serd
         ));
     }
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "GitHub API error: {}",
-            response.status()
-        ));
+        return Err(anyhow!("GitHub API error: {}", response.status()));
     }
 
     let payload: GraphQlResponse<serde_json::Value> = response.json().await?;
@@ -660,9 +653,9 @@ pub async fn unsubscribe(client: &Client, token: &str, node_id: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        dedupe_pull_requests, filter_archived_pull_requests, parse_repo_from_url, parse_subject_type,
-        transform_notification, transform_pull_request, GraphQlNotification, GraphQlPullRequest,
-        GraphQlRepository, GraphQlSubject,
+        dedupe_pull_requests, filter_archived_pull_requests, parse_repo_from_url,
+        parse_subject_type, transform_notification, transform_pull_request, GraphQlNotification,
+        GraphQlPullRequest, GraphQlRepository, GraphQlSubject,
     };
     use crate::types::{
         CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject, SubjectStatus,
@@ -699,12 +692,30 @@ mod tests {
 
     #[test]
     fn parse_subject_type_variants() {
-        assert_eq!(parse_subject_type("https://github.com/acme/widgets/pull/1"), "PullRequest");
-        assert_eq!(parse_subject_type("https://github.com/acme/widgets/issues/2"), "Issue");
-        assert_eq!(parse_subject_type("https://github.com/acme/widgets/commit/abc"), "Commit");
-        assert_eq!(parse_subject_type("https://github.com/acme/widgets/releases/tag/v1"), "Release");
-        assert_eq!(parse_subject_type("https://github.com/acme/widgets/discussions/9"), "Discussion");
-        assert_eq!(parse_subject_type("https://github.com/acme/widgets/branches"), "Unknown");
+        assert_eq!(
+            parse_subject_type("https://github.com/acme/widgets/pull/1"),
+            "PullRequest"
+        );
+        assert_eq!(
+            parse_subject_type("https://github.com/acme/widgets/issues/2"),
+            "Issue"
+        );
+        assert_eq!(
+            parse_subject_type("https://github.com/acme/widgets/commit/abc"),
+            "Commit"
+        );
+        assert_eq!(
+            parse_subject_type("https://github.com/acme/widgets/releases/tag/v1"),
+            "Release"
+        );
+        assert_eq!(
+            parse_subject_type("https://github.com/acme/widgets/discussions/9"),
+            "Discussion"
+        );
+        assert_eq!(
+            parse_subject_type("https://github.com/acme/widgets/branches"),
+            "Unknown"
+        );
     }
 
     #[test]
@@ -744,7 +755,10 @@ mod tests {
         assert_eq!(notification.subject.kind, "PullRequest");
         assert_eq!(notification.subject.status, Some(SubjectStatus::Merged));
         assert_eq!(notification.subject.ci_status, Some(CiStatus::Success));
-        assert_eq!(notification.subject.review_status, Some(ReviewStatus::Approved));
+        assert_eq!(
+            notification.subject.review_status,
+            Some(ReviewStatus::Approved)
+        );
         assert_eq!(notification.repository.full_name, "acme/widgets");
         assert_eq!(notification.repository.name, "widgets");
         assert_eq!(notification.url, "https://github.com/acme/widgets/pull/42");

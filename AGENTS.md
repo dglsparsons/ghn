@@ -18,13 +18,14 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+## Format
+
+```bash
+cargo fmt --all
+```
+
 ## Run
 
 ```bash
 ./target/release/ghn
 ```
-
-## Requirements
-
-- Rust toolchain (`cargo`)
-- GitHub CLI (`gh`) authenticated or `GITHUB_TOKEN` set

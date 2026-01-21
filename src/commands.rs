@@ -29,7 +29,10 @@ fn longest_valid_prefix(digits: &str, notification_count: usize) -> Option<(usiz
 
     for (idx, ch) in digits.chars().enumerate() {
         let digit = ch.to_digit(10).unwrap_or(0) as usize;
-        value = match value.checked_mul(10).and_then(|current| current.checked_add(digit)) {
+        value = match value
+            .checked_mul(10)
+            .and_then(|current| current.checked_add(digit))
+        {
             Some(next) => next,
             None => break,
         };
@@ -53,7 +56,11 @@ fn push_index(indices: &mut Vec<usize>, index: usize, notification_count: usize)
 }
 
 fn push_range(indices: &mut Vec<usize>, start: usize, end: usize, notification_count: usize) {
-    let (low, high) = if start <= end { (start, end) } else { (end, start) };
+    let (low, high) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
     for index in low..=high {
         push_index(indices, index, notification_count);
     }

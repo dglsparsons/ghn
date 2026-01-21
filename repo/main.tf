@@ -44,3 +44,19 @@ resource "github_repository" "ghn" {
     "rust",
   ]
 }
+
+resource "github_actions_repository_permissions" "ghn" {
+  repository = github_repository.ghn.name
+
+  enabled         = true
+  allowed_actions = "selected"
+
+  allowed_actions_config {
+    github_owned_allowed = true
+    patterns_allowed = [
+      "actions/checkout@*",
+      "DeterminateSystems/nix-installer-action@*",
+      "DeterminateSystems/magic-nix-cache-action@*",
+    ]
+  }
+}

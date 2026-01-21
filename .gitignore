@@ -11,6 +11,10 @@ target/
 # TypeScript
 *.tsbuildinfo
 
+# Nix
+result
+result-*
+
 # Logs
 *.log
 npm-debug.log*
@@ -37,3 +41,4 @@ progress.txt
 
 .terraform/
 /repo/terraform.tfstate.backup
+*.info
