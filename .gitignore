@@ -34,3 +34,6 @@ Thumbs.db
 PLAN.md
 PLAN_BACKUP.md
 progress.txt
+
+.terraform/
+/repo/terraform.tfstate.backup
