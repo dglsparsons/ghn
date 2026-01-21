@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::types::Action;
 
 pub fn is_target_char(ch: char) -> bool {
-    matches!(ch, 'm' | 'c' | 'f')
+    matches!(ch, 'm' | 'c' | 'f' | '?' | 'a' | 'x' | 'u')
 }
 
 fn push_index(indices: &mut Vec<usize>, index: usize, notification_count: usize) {
@@ -144,7 +144,7 @@ mod tests {
         let result = parse_commands("7d", 10, &targets);
         assert_eq!(result.get(&7), Some(&vec![Action::Done]));
 
-        let result = parse_commands("2u", 10, &targets);
+        let result = parse_commands("2q", 10, &targets);
         assert_eq!(result.get(&2), Some(&vec![Action::Unsubscribe]));
     }
 
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn parses_ranges() {
         let targets = HashMap::new();
-        let result = parse_commands("1-3u", 10, &targets);
+        let result = parse_commands("1-3q", 10, &targets);
         assert_eq!(result.get(&1), Some(&vec![Action::Unsubscribe]));
         assert_eq!(result.get(&2), Some(&vec![Action::Unsubscribe]));
         assert_eq!(result.get(&3), Some(&vec![Action::Unsubscribe]));
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn parses_reverse_ranges() {
         let targets = HashMap::new();
-        let result = parse_commands("3-1u", 10, &targets);
+        let result = parse_commands("3-1q", 10, &targets);
         assert_eq!(result.get(&1), Some(&vec![Action::Unsubscribe]));
         assert_eq!(result.get(&2), Some(&vec![Action::Unsubscribe]));
         assert_eq!(result.get(&3), Some(&vec![Action::Unsubscribe]));
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn parses_lists_with_separators_and_multiple_actions() {
         let targets = HashMap::new();
-        let result = parse_commands("1, 2 3 u y", 10, &targets);
+        let result = parse_commands("1, 2 3 q y", 10, &targets);
         let expected = vec![Action::Unsubscribe, Action::Yank];
         assert_eq!(result.get(&1), Some(&expected));
         assert_eq!(result.get(&2), Some(&expected));
@@ -235,5 +235,14 @@ mod tests {
         let result = parse_commands("md", 10, &targets);
         assert_eq!(result.get(&2), Some(&vec![Action::Done]));
         assert_eq!(result.get(&4), Some(&vec![Action::Done]));
+    }
+
+    #[test]
+    fn parses_review_targets() {
+        let mut targets = HashMap::new();
+        targets.insert('?', vec![1, 3]);
+        let result = parse_commands("?o", 10, &targets);
+        assert_eq!(result.get(&1), Some(&vec![Action::Open]));
+        assert_eq!(result.get(&3), Some(&vec![Action::Open]));
     }
 }

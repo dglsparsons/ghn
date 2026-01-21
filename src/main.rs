@@ -568,6 +568,7 @@ mod tests {
                 kind: "PullRequest".to_string(),
                 status: None,
                 ci_status: None,
+                review_status: None,
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -620,17 +621,26 @@ mod tests {
     #[test]
     fn ignores_unrecognized_chars() {
         let mut app = AppState::new(true);
-        handle_text_input(&mut app, key_event(KeyCode::Char('x'), KeyModifiers::NONE));
+        handle_text_input(&mut app, key_event(KeyCode::Char('z'), KeyModifiers::NONE));
         assert_eq!(app.command_text(), "");
     }
 
     #[test]
     fn allows_range_and_separator_chars() {
         let mut app = AppState::new(true);
-        for ch in ['1', '-', '3', ',', '2', 'u'] {
+        for ch in ['1', '-', '3', ',', '2', 'q'] {
             handle_text_input(&mut app, key_event(KeyCode::Char(ch), KeyModifiers::NONE));
         }
-        assert_eq!(app.command_text(), "1-3,2u");
+        assert_eq!(app.command_text(), "1-3,2q");
+    }
+
+    #[test]
+    fn allows_review_and_unread_targets() {
+        let mut app = AppState::new(true);
+        for ch in ['u', '?'] {
+            handle_text_input(&mut app, key_event(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.command_text(), "u?");
     }
 
     #[test]

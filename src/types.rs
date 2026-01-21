@@ -20,6 +20,7 @@ pub struct Subject {
     pub kind: String,
     pub status: Option<SubjectStatus>,
     pub ci_status: Option<CiStatus>,
+    pub review_status: Option<ReviewStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,13 @@ pub enum CiStatus {
     Failure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewStatus {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     Open,
@@ -68,7 +76,7 @@ impl Action {
             'y' => Some(Self::Yank),
             'r' => Some(Self::Read),
             'd' => Some(Self::Done),
-            'u' => Some(Self::Unsubscribe),
+            'q' => Some(Self::Unsubscribe),
             _ => None,
         }
     }
@@ -79,7 +87,7 @@ impl Action {
             Self::Yank => 'y',
             Self::Read => 'r',
             Self::Done => 'd',
-            Self::Unsubscribe => 'u',
+            Self::Unsubscribe => 'q',
         }
     }
 }
@@ -107,7 +115,7 @@ mod tests {
             ('y', Action::Yank),
             ('r', Action::Read),
             ('d', Action::Done),
-            ('u', Action::Unsubscribe),
+            ('q', Action::Unsubscribe),
         ];
 
         for (ch, action) in pairs {
@@ -115,5 +123,6 @@ mod tests {
             assert_eq!(action.as_char(), ch);
         }
         assert_eq!(Action::from_char('x'), None);
+        assert_eq!(Action::from_char('u'), None);
     }
 }

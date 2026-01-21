@@ -32,22 +32,23 @@ ghn
 ### UI Overview
 
 ```
-1 * [Merged] octocat/Hello-World ✓ PullRequest 2m
+1 * [Merged] octocat/Hello-World ✓ A PullRequest 2m
     Fix bug in authentication flow
 
 2   octocat/Hello-World Issue 5m
     Add new feature
 
-3 * [Draft] someorg/repo ↻ PullRequest 10m
+3 * [Draft] someorg/repo ↻ ? PullRequest 10m
     Review requested: Update dependencies
-Commands: o open  y yank  r read  d done  u unsub  |  Targets: 1-3, 1 2 3, m merged, c closed, f draft  |  Executed 3 actions
+Commands: o open  y yank  r read  d done  q unsub  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
 > 1-3r
 ```
 
 ### Commands
 
 Commands target one or more numbers followed by actions. Indices can be single numbers, comma/space lists, or ranges
-like `1-3`. You can also target status groups: `m` (merged PRs), `c` (closed PRs/issues), and `f` (draft PRs).
+like `1-3`. You can also target status groups: `m` (merged PRs), `c` (closed PRs/issues), and `f` (draft PRs),
+as well as review states: `?` (pending review), `a` (approved), `x` (changes requested), plus `u` (unread).
 Queue multiple commands, then press `Enter` to execute.
 
 | Action | Key | Description |
@@ -56,7 +57,7 @@ Queue multiple commands, then press `Enter` to execute.
 | Yank | `y` | Copy URL to clipboard |
 | Read | `r` | Mark as read |
 | Done | `d` | Mark as done (removes from inbox) |
-| Unsubscribe | `u` | Unsubscribe from thread |
+| Unsubscribe | `q` | Unsubscribe from thread |
 
 **Examples:**
 - `1o` - Open notification #1 in browser (marks it as read)
@@ -67,6 +68,8 @@ Queue multiple commands, then press `Enter` to execute.
 - `md` - Mark all merged PR notifications as done
 - `cd` - Mark all closed PR/issue notifications as done
 - `fd` - Mark all draft PR notifications as done
+- `?o` - Open all PRs pending review
+- `uo` - Open all unread notifications
 
 ### Keyboard Shortcuts
 
@@ -74,7 +77,7 @@ Queue multiple commands, then press `Enter` to execute.
 |-----|--------|
 | `0-9` | Build number for command |
 | `-` / `,` / `Space` | Range or list separators |
-| `o/y/r/d/u` | Queue action for current number |
+| `o/y/r/d/q` | Queue action for current number |
 | `Enter` | Execute all queued commands |
 | `Esc` | Clear command buffer |
 | `Backspace` | Delete last character |
@@ -102,6 +105,7 @@ When you queue a command, the targeted notification highlights with a color indi
 | Unsubscribe | Red |
 
 PRs also show a CI indicator: `✓` success, `↻` running/pending, `✗` failed.
+Review indicators show status: `?` pending review, `A` approved, `X` changes requested.
 
 ## Configuration
 

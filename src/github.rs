@@ -4,7 +4,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::types::{
-    CiStatus, GraphQlError, GraphQlResponse, Notification, Repository, Subject, SubjectStatus,
+    CiStatus, GraphQlError, GraphQlResponse, Notification, Repository, ReviewStatus, Subject,
+    SubjectStatus,
 };
 
 const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
@@ -45,6 +46,7 @@ struct GraphQlSubject {
     id: Option<String>,
     state: Option<String>,
     is_draft: Option<bool>,
+    review_decision: Option<String>,
     commits: Option<GraphQlPullRequestCommits>,
 }
 
@@ -87,6 +89,7 @@ query GetNotifications($statuses: [NotificationStatus!]) {
             id
             state
             isDraft
+            reviewDecision
             commits(last: 1) {
               nodes {
                 commit {
@@ -191,18 +194,38 @@ fn subject_ci_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option<CiS
     }
 }
 
+fn subject_review_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option<ReviewStatus> {
+    let subject = subject?;
+    if !kind.eq_ignore_ascii_case("pullrequest") {
+        return None;
+    }
+
+    match subject.review_decision.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("APPROVED") => Some(ReviewStatus::Approved),
+        Some(value) if value.eq_ignore_ascii_case("CHANGES_REQUESTED") => {
+            Some(ReviewStatus::ChangesRequested)
+        }
+        Some(value) if value.eq_ignore_ascii_case("REVIEW_REQUIRED") => {
+            Some(ReviewStatus::ReviewRequired)
+        }
+        _ => None,
+    }
+}
+
 fn transform_notification(gql: GraphQlNotification) -> Notification {
     let repo_full_name = parse_repo_from_url(&gql.url);
     let kind = parse_subject_type(&gql.url);
     let optional_subject = gql.optional_subject;
     let status = subject_status(&kind, optional_subject.as_ref());
     let ci_status = subject_ci_status(&kind, optional_subject.as_ref());
+    let review_status = subject_review_status(&kind, optional_subject.as_ref());
     let subject = Subject {
         title: gql.title,
         url: gql.url.clone(),
         kind,
         status,
         ci_status,
+        review_status,
     };
 
     Notification {
@@ -381,7 +404,7 @@ pub async fn unsubscribe(client: &Client, token: &str, node_id: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{parse_repo_from_url, parse_subject_type, transform_notification, GraphQlNotification, GraphQlSubject};
-    use crate::types::{CiStatus, SubjectStatus};
+    use crate::types::{CiStatus, ReviewStatus, SubjectStatus};
 
     #[test]
     fn parse_repo_from_url_handles_standard() {
@@ -419,6 +442,7 @@ mod tests {
                 id: Some("subject-1".to_string()),
                 state: Some("MERGED".to_string()),
                 is_draft: Some(false),
+                review_decision: Some("APPROVED".to_string()),
                 commits: Some(super::GraphQlPullRequestCommits {
                     nodes: vec![super::GraphQlPullRequestCommit {
                         commit: Some(super::GraphQlCommit {
@@ -441,6 +465,7 @@ mod tests {
         assert_eq!(notification.subject.kind, "PullRequest");
         assert_eq!(notification.subject.status, Some(SubjectStatus::Merged));
         assert_eq!(notification.subject.ci_status, Some(CiStatus::Success));
+        assert_eq!(notification.subject.review_status, Some(ReviewStatus::Approved));
         assert_eq!(notification.repository.full_name, "acme/widgets");
         assert_eq!(notification.repository.name, "widgets");
         assert_eq!(notification.url, "https://github.com/acme/widgets/pull/42");
@@ -460,6 +485,7 @@ mod tests {
                 id: None,
                 state: None,
                 is_draft: None,
+                review_decision: None,
                 commits: None,
             }),
         };
@@ -482,6 +508,7 @@ mod tests {
                 id: Some("subject-3".to_string()),
                 state: Some("OPEN".to_string()),
                 is_draft: Some(true),
+                review_decision: Some("REVIEW_REQUIRED".to_string()),
                 commits: None,
             }),
         };
@@ -504,11 +531,38 @@ mod tests {
                 id: Some("subject-4".to_string()),
                 state: Some("CLOSED".to_string()),
                 is_draft: None,
+                review_decision: None,
                 commits: None,
             }),
         };
 
         let notification = transform_notification(gql);
         assert_eq!(notification.subject.status, Some(SubjectStatus::Closed));
+    }
+
+    #[test]
+    fn transform_notification_maps_review_status() {
+        let gql = GraphQlNotification {
+            id: "node-5".to_string(),
+            thread_id: "thread-5".to_string(),
+            title: "Needs changes".to_string(),
+            url: "https://github.com/acme/widgets/pull/9".to_string(),
+            is_unread: true,
+            last_updated_at: "2024-01-05T00:00:00Z".to_string(),
+            reason: None,
+            optional_subject: Some(GraphQlSubject {
+                id: Some("subject-5".to_string()),
+                state: Some("OPEN".to_string()),
+                is_draft: Some(false),
+                review_decision: Some("CHANGES_REQUESTED".to_string()),
+                commits: None,
+            }),
+        };
+
+        let notification = transform_notification(gql);
+        assert_eq!(
+            notification.subject.review_status,
+            Some(ReviewStatus::ChangesRequested)
+        );
     }
 }
