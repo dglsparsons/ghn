@@ -4,8 +4,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::types::{
-    CiStatus, GraphQlError, GraphQlResponse, MyPullRequest, Notification, Repository, ReviewStatus,
-    Subject, SubjectStatus,
+    CiStatus, GraphQlError, GraphQlResponse, MergeMethod, MergeSettings, MyPullRequest,
+    Notification, Repository, ReviewStatus, Subject, SubjectStatus,
 };
 
 const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
@@ -49,6 +49,7 @@ struct GraphQlSubject {
     is_draft: Option<bool>,
     review_decision: Option<String>,
     commits: Option<GraphQlPullRequestCommits>,
+    repository: Option<GraphQlRepository>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +79,11 @@ struct GraphQlRepository {
     name: String,
     name_with_owner: String,
     is_archived: bool,
+    merge_commit_allowed: Option<bool>,
+    squash_merge_allowed: Option<bool>,
+    rebase_merge_allowed: Option<bool>,
+    auto_merge_allowed: Option<bool>,
+    viewer_default_merge_method: Option<MergeMethod>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +135,16 @@ query GetNotifications($statuses: [NotificationStatus!]) {
             state
             isDraft
             reviewDecision
+            repository {
+              name
+              nameWithOwner
+              isArchived
+              mergeCommitAllowed
+              squashMergeAllowed
+              rebaseMergeAllowed
+              autoMergeAllowed
+              viewerDefaultMergeMethod
+            }
             commits(last: 1) {
               nodes {
                 commit {
@@ -163,6 +179,11 @@ query GetMyPullRequests($query: String!) {
           name
           nameWithOwner
           isArchived
+          mergeCommitAllowed
+          squashMergeAllowed
+          rebaseMergeAllowed
+          autoMergeAllowed
+          viewerDefaultMergeMethod
         }
         commits(last: 1) {
           nodes {
@@ -174,16 +195,6 @@ query GetMyPullRequests($query: String!) {
           }
         }
       }
-    }
-  }
-}
-"#;
-
-const MERGE_PULL_REQUEST_MUTATION: &str = r#"
-mutation MergePullRequest($input: MergePullRequestInput!) {
-  mergePullRequest(input: $input) {
-    pullRequest {
-      merged
     }
   }
 }
@@ -300,6 +311,16 @@ fn subject_review_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option
     map_review_status(subject.review_decision.as_deref())
 }
 
+fn merge_settings_from_repo(repo: &GraphQlRepository) -> MergeSettings {
+    MergeSettings {
+        default_method: repo.viewer_default_merge_method,
+        merge_commit_allowed: repo.merge_commit_allowed.unwrap_or(false),
+        squash_merge_allowed: repo.squash_merge_allowed.unwrap_or(false),
+        rebase_merge_allowed: repo.rebase_merge_allowed.unwrap_or(false),
+        auto_merge_allowed: repo.auto_merge_allowed.unwrap_or(false),
+    }
+}
+
 fn transform_notification(gql: GraphQlNotification) -> Notification {
     let repo_full_name = parse_repo_from_url(&gql.url);
     let kind = parse_subject_type(&gql.url);
@@ -316,17 +337,26 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
         review_status,
     };
 
+    let repo = optional_subject.as_ref().and_then(|subject| subject.repository.as_ref());
+    let repo_full_name = repo
+        .map(|repo| repo.name_with_owner.clone())
+        .unwrap_or(repo_full_name);
+    let repo_name = repo
+        .map(|repo| repo.name.clone())
+        .unwrap_or_else(|| repo_full_name.split('/').nth(1).unwrap_or("").to_string());
+
     Notification {
         id: gql.thread_id,
         node_id: gql.id,
-        subject_id: optional_subject.and_then(|s| s.id),
+        subject_id: optional_subject.as_ref().and_then(|subject| subject.id.clone()),
         unread: gql.is_unread,
         reason: gql.reason.unwrap_or_else(|| "subscribed".to_string()),
         updated_at: gql.last_updated_at,
         subject,
         repository: Repository {
-            name: repo_full_name.split('/').nth(1).unwrap_or("").to_string(),
+            name: repo_name,
             full_name: repo_full_name,
+            merge_settings: repo.map(merge_settings_from_repo),
         },
         url: gql.url,
     }
@@ -356,6 +386,7 @@ fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
     };
     let ci_status = pull_request_ci_status(&pr);
     let review_status = pull_request_review_status(&pr);
+    let merge_settings = Some(merge_settings_from_repo(&pr.repository));
     let subject = Subject {
         title: pr.title,
         url: pr.url.clone(),
@@ -372,6 +403,7 @@ fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
         repository: Repository {
             name: pr.repository.name,
             full_name: pr.repository.name_with_owner,
+            merge_settings,
         },
         url: pr.url,
     }
@@ -537,16 +569,6 @@ pub async fn fetch_notifications_and_my_prs(
     Ok((notifications.notifications, pull_requests))
 }
 
-pub async fn merge_pull_request(client: &Client, token: &str, pull_request_id: &str) -> Result<()> {
-    run_mutation(
-        client,
-        token,
-        MERGE_PULL_REQUEST_MUTATION,
-        json!({ "input": { "pullRequestId": pull_request_id, "mergeMethod": "SQUASH" } }),
-    )
-    .await
-}
-
 fn dedupe_pull_requests(
     pull_requests: Vec<MyPullRequest>,
     notifications: &[Notification],
@@ -673,6 +695,11 @@ mod tests {
                 name: "widgets".to_string(),
                 name_with_owner: "acme/widgets".to_string(),
                 is_archived,
+                merge_commit_allowed: None,
+                squash_merge_allowed: None,
+                rebase_merge_allowed: None,
+                auto_merge_allowed: None,
+                viewer_default_merge_method: None,
             },
             commits: None,
         }
@@ -742,6 +769,7 @@ mod tests {
                         }),
                     }],
                 }),
+                repository: None,
             }),
         };
 
@@ -780,6 +808,7 @@ mod tests {
                 is_draft: None,
                 review_decision: None,
                 commits: None,
+                repository: None,
             }),
         };
 
@@ -803,6 +832,7 @@ mod tests {
                 is_draft: Some(true),
                 review_decision: Some("REVIEW_REQUIRED".to_string()),
                 commits: None,
+                repository: None,
             }),
         };
 
@@ -826,6 +856,7 @@ mod tests {
                 is_draft: None,
                 review_decision: None,
                 commits: None,
+                repository: None,
             }),
         };
 
@@ -849,6 +880,7 @@ mod tests {
                 is_draft: Some(false),
                 review_decision: Some("CHANGES_REQUESTED".to_string()),
                 commits: None,
+                repository: None,
             }),
         };
 
@@ -872,6 +904,11 @@ mod tests {
                 name: "widgets".to_string(),
                 name_with_owner: "acme/widgets".to_string(),
                 is_archived: false,
+                merge_commit_allowed: None,
+                squash_merge_allowed: None,
+                rebase_merge_allowed: None,
+                auto_merge_allowed: None,
+                viewer_default_merge_method: None,
             },
             commits: Some(super::GraphQlPullRequestCommits {
                 nodes: vec![super::GraphQlPullRequestCommit {
@@ -914,6 +951,7 @@ mod tests {
             repository: Repository {
                 name: "widgets".to_string(),
                 full_name: "acme/widgets".to_string(),
+                merge_settings: None,
             },
             url: "https://github.com/acme/widgets/pull/1".to_string(),
         }];
@@ -933,6 +971,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
             },
@@ -950,6 +989,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/pull/2".to_string(),
             },
@@ -969,4 +1009,5 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "pr-1");
     }
+
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -14,10 +14,10 @@ use crate::{
 };
 
 const COMMANDS_FULL: &str =
-    "Commands: o open/read  y yank  r read  d done  q unsub/ignore  s squash";
-const COMMANDS_COMPACT: &str = "Cmds: o open/read  y yank  r read  d done  q unsub/ign  s squash";
-const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q/s";
-const COMMANDS_TINY: &str = "o y r d q s";
+    "Commands: o open/read  y yank  r read  d done  q unsub/ignore";
+const COMMANDS_COMPACT: &str = "Cmds: o open/read  y yank  r read  d done  q unsub/ign";
+const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q";
+const COMMANDS_TINY: &str = "o y r d q";
 
 const TARGETS_FULL: &str =
     "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft";
@@ -128,6 +128,7 @@ fn draw_lists(f: &mut Frame, area: Rect, app: &AppState) {
         &app.notifications,
         &app.relative_times,
         &app.pending,
+        &app.executing,
         0,
         total_count,
     );
@@ -138,6 +139,7 @@ fn draw_lists(f: &mut Frame, area: Rect, app: &AppState) {
         &app.my_prs,
         &app.my_pr_relative_times,
         &app.pending,
+        &app.executing,
         app.notifications.len(),
         total_count,
     );
@@ -185,6 +187,7 @@ fn draw_list_section<T: ListItemLike>(
     items: &[T],
     relative_times: &[String],
     pending: &HashMap<usize, Vec<Action>>,
+    executing: &HashSet<String>,
     index_offset: usize,
     total_count: usize,
 ) {
@@ -244,12 +247,13 @@ fn draw_list_section<T: ListItemLike>(
         .map(|(idx, item)| {
             let index = index_offset + idx + 1;
             let pending = pending.get(&index);
+            let subject = item.subject();
+            let executing = executing.contains(subject.url.as_str());
             let base_style = base_notification_style(item.unread());
             let style = base_style.patch(pending_style(pending));
 
-            let dot = if item.unread() { "*" } else { " " };
+            let marker = action_marker(item.unread(), executing);
             let time = relative_times.get(idx).map(String::as_str).unwrap_or("?");
-            let subject = item.subject();
 
             let indent = " ".repeat(widths.prefix);
             let title_width = widths.title;
@@ -265,7 +269,7 @@ fn draw_list_section<T: ListItemLike>(
             let mut header_spans = vec![
                 Span::styled(index_cell, Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" ".repeat(NUMBER_MARKER_GAP)),
-                Span::styled(dot, unread_marker_style(item.unread())),
+                Span::styled(marker.text, marker.style),
                 Span::raw(" ".repeat(MARKER_REPO_GAP)),
             ];
 
@@ -400,6 +404,11 @@ struct StatusLabel {
     style: Style,
 }
 
+struct Marker {
+    text: &'static str,
+    style: Style,
+}
+
 struct CiIndicator {
     text: &'static str,
     style: Style,
@@ -498,7 +507,23 @@ fn action_color(action: Action) -> Color {
         Action::Read => Color::DarkGray,
         Action::Done => Color::Green,
         Action::Unsubscribe => Color::Red,
-        Action::SquashMerge => Color::Cyan,
+    }
+}
+
+fn action_marker(unread: bool, executing: bool) -> Marker {
+    if executing {
+        return Marker {
+            text: "↻",
+            style: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        };
+    }
+
+    let text = if unread { "*" } else { " " };
+    Marker {
+        text,
+        style: unread_marker_style(unread),
     }
 }
 
@@ -725,7 +750,9 @@ fn filter_pending_actions(
 
     for (index, actions) in parsed {
         let entry = if index <= notifications.len() {
-            notifications.get(index - 1).map(PendingEntry::Notification)
+            notifications
+                .get(index - 1)
+                .map(|_| PendingEntry::Notification)
         } else {
             let idx = index.saturating_sub(notifications.len() + 1);
             my_prs.get(idx).map(|_| PendingEntry::MyPullRequest)
@@ -747,31 +774,17 @@ fn filter_pending_actions(
     filtered
 }
 
-enum PendingEntry<'a> {
-    Notification(&'a Notification),
+enum PendingEntry {
+    Notification,
     MyPullRequest,
 }
 
-fn action_allowed(action: &Action, entry: &PendingEntry<'_>) -> bool {
+fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
     match entry {
-        PendingEntry::Notification(notification) => {
-            // Ignore merge unless it targets a PR with a known node id.
-            if *action == Action::SquashMerge {
-                notification
-                    .subject
-                    .kind
-                    .eq_ignore_ascii_case("pullrequest")
-                    && notification.subject_id.is_some()
-            } else {
-                true
-            }
-        }
+        PendingEntry::Notification => true,
         // My PRs don't have notification semantics, so ignore read/done; q maps to ignore.
         PendingEntry::MyPullRequest => {
-            matches!(
-                action,
-                Action::Open | Action::Yank | Action::SquashMerge | Action::Unsubscribe
-            )
+            matches!(action, Action::Open | Action::Yank | Action::Unsubscribe)
         }
     }
 }
@@ -779,9 +792,9 @@ fn action_allowed(action: &Action, entry: &PendingEntry<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        base_notification_style, build_pending_map, build_status_lines, ci_indicator, kind_color,
-        layout_widths, pending_style, review_indicator, select_legend_lines, status_prefix,
-        truncate_with_suffix, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
+        action_marker, base_notification_style, build_pending_map, build_status_lines, ci_indicator,
+        kind_color, layout_widths, pending_style, review_indicator, select_legend_lines,
+        status_prefix, truncate_with_suffix, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
     };
     use crate::types::{
         Action, CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject,
@@ -811,6 +824,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
             },
@@ -832,6 +846,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/issues/2".to_string(),
             },
@@ -864,6 +879,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
             },
@@ -885,6 +901,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/pull/2".to_string(),
             },
@@ -906,6 +923,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/pull/3".to_string(),
             },
@@ -927,6 +945,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/pull/4".to_string(),
             },
@@ -948,6 +967,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/pull/5".to_string(),
             },
@@ -987,6 +1007,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
             },
@@ -1008,6 +1029,7 @@ mod tests {
                 repository: Repository {
                     name: "widgets".to_string(),
                     full_name: "acme/widgets".to_string(),
+                    merge_settings: None,
                 },
                 url: "https://github.com/acme/widgets/pull/2".to_string(),
             },
@@ -1038,6 +1060,7 @@ mod tests {
             repository: Repository {
                 name: "widgets".to_string(),
                 full_name: "acme/widgets".to_string(),
+                merge_settings: None,
             },
             url: "https://github.com/acme/widgets/pull/1".to_string(),
         }];
@@ -1056,6 +1079,7 @@ mod tests {
             repository: Repository {
                 name: "widgets".to_string(),
                 full_name: "acme/widgets".to_string(),
+                merge_settings: None,
             },
             url: "https://github.com/acme/widgets/pull/2".to_string(),
         }];
@@ -1063,12 +1087,12 @@ mod tests {
         let pending = build_pending_map("2dq", &notifications, &my_prs);
         assert_eq!(pending.get(&2), Some(&vec![Action::Unsubscribe]));
 
-        let pending = build_pending_map("2s", &notifications, &my_prs);
-        assert_eq!(pending.get(&2), Some(&vec![Action::SquashMerge]));
+        let pending = build_pending_map("2o", &notifications, &my_prs);
+        assert_eq!(pending.get(&2), Some(&vec![Action::Open]));
     }
 
     #[test]
-    fn build_pending_map_ignores_merge_on_non_pr_notification() {
+    fn build_pending_map_ignores_unknown_action_on_notification() {
         let my_prs = Vec::new();
         let notifications = vec![Notification {
             id: "thread-1".to_string(),
@@ -1088,6 +1112,7 @@ mod tests {
             repository: Repository {
                 name: "widgets".to_string(),
                 full_name: "acme/widgets".to_string(),
+                merge_settings: None,
             },
             url: "https://github.com/acme/widgets/issues/1".to_string(),
         }];
@@ -1146,6 +1171,7 @@ mod tests {
             repository: Repository {
                 name: "widgets".to_string(),
                 full_name: "acme/widgets".to_string(),
+                merge_settings: None,
             },
             url: "https://github.com/acme/widgets/pull/3".to_string(),
         };
@@ -1174,6 +1200,7 @@ mod tests {
             repository: Repository {
                 name: "widgets".to_string(),
                 full_name: "acme/widgets".to_string(),
+                merge_settings: None,
             },
             url: "https://github.com/acme/widgets/pull/4".to_string(),
         };
@@ -1201,6 +1228,7 @@ mod tests {
             repository: Repository {
                 name: "widgets".to_string(),
                 full_name: "acme/widgets".to_string(),
+                merge_settings: None,
             },
             url: "https://github.com/acme/widgets/pull/5".to_string(),
         };
@@ -1257,6 +1285,18 @@ mod tests {
         let actions = vec![Action::Read, Action::Unsubscribe];
         let style = pending_style(Some(&actions));
         assert_eq!(style, Style::default().fg(Color::Red));
+    }
+
+    #[test]
+    fn action_marker_shows_spinner_when_executing() {
+        let marker = action_marker(true, true);
+        assert_eq!(marker.text, "↻");
+        assert_eq!(
+            marker.style,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        );
     }
 
     #[test]

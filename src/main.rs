@@ -30,9 +30,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
     commands::is_target_char,
-    github::{
-        fetch_notifications_and_my_prs, mark_as_done, mark_as_read, merge_pull_request, unsubscribe,
-    },
+    github::{fetch_notifications_and_my_prs, mark_as_done, mark_as_read, unsubscribe},
     ignore::{append_ignored_pr, load_ignored_prs},
     types::{Action, MyPullRequest, Notification},
     util::{copy_to_clipboard, format_relative_time, gh_auth_token, open_in_browser},
@@ -62,6 +60,7 @@ pub struct AppState {
     pub my_prs: Vec<MyPullRequest>,
     pub input: TextArea<'static>,
     pub pending: HashMap<usize, Vec<Action>>,
+    pub executing: HashSet<String>,
     pub status: Option<String>,
     pub status_sticky: bool,
     pub loading: bool,
@@ -69,6 +68,7 @@ pub struct AppState {
     pub relative_times: Vec<String>,
     pub my_pr_relative_times: Vec<String>,
     pub ignored_prs: HashSet<String>,
+    notification_overrides: HashMap<String, NotificationOverride>,
 }
 
 impl AppState {
@@ -79,6 +79,7 @@ impl AppState {
             my_prs: Vec::new(),
             input,
             pending: HashMap::new(),
+            executing: HashSet::new(),
             status: None,
             status_sticky: false,
             loading: true,
@@ -86,6 +87,7 @@ impl AppState {
             relative_times: Vec::new(),
             my_pr_relative_times: Vec::new(),
             ignored_prs,
+            notification_overrides: HashMap::new(),
         }
     }
 
@@ -113,11 +115,62 @@ impl AppState {
         sort_by_updated_at(&mut notifications, |notification| &notification.updated_at);
         my_prs.retain(|pr| !self.ignored_prs.contains(&pr.url));
         sort_by_updated_at(&mut my_prs, |pr| &pr.updated_at);
+        let notifications = self.apply_notification_overrides(notifications);
         self.notifications = notifications;
         self.my_prs = my_prs;
         self.loading = false;
         self.refresh_relative_times();
         self.update_pending();
+    }
+
+    fn apply_notification_overrides(&mut self, notifications: Vec<Notification>) -> Vec<Notification> {
+        if self.notification_overrides.is_empty() {
+            return notifications;
+        }
+
+        let mut merged = Vec::with_capacity(notifications.len());
+        let mut clear_ids = Vec::new();
+
+        for mut notification in notifications {
+            let id = notification.id.clone();
+            let Some(override_state) = self.notification_overrides.get(&id) else {
+                merged.push(notification);
+                continue;
+            };
+
+            let updated_at = parse_updated_at(&notification.updated_at);
+            if updated_at > override_state.marked_at {
+                // New activity should always surface, even if we previously hid it.
+                clear_ids.push(id);
+                merged.push(notification);
+                continue;
+            }
+
+            match override_state.state {
+                NotificationOverrideState::Read => {
+                    let server_unread = notification.unread;
+                    if server_unread {
+                        notification.unread = false;
+                    }
+                    if !self.include_read {
+                        continue;
+                    }
+                    if !server_unread {
+                        clear_ids.push(id.clone());
+                    }
+                    merged.push(notification);
+                }
+                NotificationOverrideState::Suppress => {
+                    // Keep it hidden until the server reports newer activity.
+                }
+            }
+        }
+
+        for id in clear_ids {
+            self.notification_overrides.remove(&id);
+        }
+
+        merged
     }
 
     fn update_pending(&mut self) {
@@ -320,6 +373,7 @@ fn submit_commands(
     let notifications_snapshot = app.notifications.clone();
     let my_prs_snapshot = app.my_prs.clone();
     let action_total: usize = pending.values().map(Vec::len).sum();
+    app.executing.clear();
     apply_optimistic_update(app, &pending);
     app.status = Some(format!("Executing {} actions...", action_total));
     app.status_sticky = false;
@@ -416,6 +470,53 @@ fn parse_updated_at(value: &str) -> i64 {
         .unwrap_or(0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationOverrideState {
+    Read,
+    Suppress,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NotificationOverride {
+    state: NotificationOverrideState,
+    marked_at: i64,
+}
+
+fn record_override_state(
+    current: &mut Option<NotificationOverrideState>,
+    next: NotificationOverrideState,
+) {
+    let merged = match (*current, next) {
+        (Some(NotificationOverrideState::Suppress), _) => NotificationOverrideState::Suppress,
+        (_, NotificationOverrideState::Suppress) => NotificationOverrideState::Suppress,
+        _ => NotificationOverrideState::Read,
+    };
+    *current = Some(merged);
+}
+
+fn record_notification_override(
+    overrides: &mut HashMap<String, NotificationOverride>,
+    notification_id: &str,
+    state: NotificationOverrideState,
+) {
+    let now = chrono::Utc::now().timestamp();
+    overrides
+        .entry(notification_id.to_string())
+        .and_modify(|existing| {
+            let merged = match (existing.state, state) {
+                (NotificationOverrideState::Suppress, _)
+                | (_, NotificationOverrideState::Suppress) => NotificationOverrideState::Suppress,
+                _ => NotificationOverrideState::Read,
+            };
+            existing.state = merged;
+            existing.marked_at = now;
+        })
+        .or_insert(NotificationOverride {
+            state,
+            marked_at: now,
+        });
+}
+
 fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Action>>) {
     let notification_count = app.notifications.len();
     let mut remove_notifications: Vec<usize> = Vec::new();
@@ -428,29 +529,44 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
 
         if *index <= notification_count {
             let idx = index.saturating_sub(1);
-            let Some(notification) = app.notifications.get_mut(idx) else {
-                continue;
+            let mut remove = false;
+            let mut override_state = None;
+            let notification_id = {
+                let Some(notification) = app.notifications.get_mut(idx) else {
+                    continue;
+                };
+
+                let notification_id = notification.id.clone();
+                for action in actions {
+                    match action {
+                        Action::Open | Action::Read => {
+                            notification.unread = false;
+                            if !app.include_read {
+                                remove = true;
+                            }
+                            record_override_state(&mut override_state, NotificationOverrideState::Read);
+                        }
+                        Action::Done | Action::Unsubscribe => {
+                            notification.unread = false;
+                            remove = true;
+                            record_override_state(
+                                &mut override_state,
+                                NotificationOverrideState::Suppress,
+                            );
+                        }
+                        Action::Yank => {}
+                    }
+                }
+
+                if remove {
+                    remove_notifications.push(idx);
+                }
+
+                notification_id
             };
 
-            let mut remove = false;
-            for action in actions {
-                match action {
-                    Action::Open | Action::Read => {
-                        notification.unread = false;
-                        if !app.include_read {
-                            remove = true;
-                        }
-                    }
-                    Action::Done | Action::Unsubscribe | Action::SquashMerge => {
-                        notification.unread = false;
-                        remove = true;
-                    }
-                    Action::Yank => {}
-                }
-            }
-
-            if remove {
-                remove_notifications.push(idx);
+            if let Some(state) = override_state {
+                record_notification_override(&mut app.notification_overrides, &notification_id, state);
             }
         } else {
             let idx = index.saturating_sub(notification_count + 1);
@@ -463,7 +579,7 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
                     app.ignored_prs.insert(pr.url.clone());
                 }
             }
-            if ignore || actions.contains(&Action::SquashMerge) {
+            if ignore {
                 remove_my_prs.push(idx);
             }
         }
@@ -491,18 +607,24 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
     app.refresh_relative_times();
 }
 
+struct ActionOutcome {
+    refresh: bool,
+}
+
 #[derive(Debug)]
 struct ExecSummary {
     succeeded: usize,
     failed: usize,
     errors: Vec<String>,
     api_failed: bool,
+    refresh: bool,
 }
 
 fn handle_command_result(app: &mut AppState, refresh_tx: &mpsc::Sender<()>, result: ExecSummary) {
     let (message, refresh, sticky) = command_status(&result);
     app.status = Some(message);
     app.status_sticky = sticky;
+    app.executing.clear();
     if refresh {
         let _ = refresh_tx.try_send(());
     }
@@ -515,12 +637,12 @@ fn command_status(result: &ExecSummary) -> (String, bool, bool) {
             .first()
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        return (sample, result.api_failed, true);
+        return (sample, result.api_failed || result.refresh, true);
     }
 
     (
         format!("Executed {} actions", result.succeeded),
-        false,
+        result.refresh,
         false,
     )
 }
@@ -559,10 +681,16 @@ async fn execute_commands(
     let mut failed = 0;
     let mut errors = Vec::new();
     let mut api_failed = false;
+    let mut refresh = false;
 
     for task in tasks {
         match task.await {
-            Ok((_action, Ok(()))) => succeeded += 1,
+            Ok((_action, Ok(outcome))) => {
+                succeeded += 1;
+                if outcome.refresh {
+                    refresh = true;
+                }
+            }
             Ok((action, Err(err))) => {
                 failed += 1;
                 if is_api_action(action) {
@@ -583,6 +711,7 @@ async fn execute_commands(
         failed,
         errors,
         api_failed,
+        refresh,
     })
 }
 
@@ -661,7 +790,8 @@ async fn execute_action(
     action: Action,
     entry: &EntrySnapshot,
     url: &str,
-) -> Result<()> {
+) -> Result<ActionOutcome> {
+    let refresh = false;
     match action {
         Action::Open => {
             tokio::task::spawn_blocking({
@@ -702,29 +832,14 @@ async fn execute_action(
             EntrySnapshot::MyPullRequest(_) => {
                 append_ignored_pr(url)?;
             }
-        },
-        Action::SquashMerge => {
-            let pull_request_id = match entry {
-                EntrySnapshot::Notification(notification) => notification.subject_id.as_deref(),
-                EntrySnapshot::MyPullRequest(pr) => Some(pr.id.as_str()),
-            };
-            if let Some(pull_request_id) = pull_request_id {
-                merge_pull_request(client, token, pull_request_id).await?;
-                if let EntrySnapshot::Notification(notification) = entry {
-                    mark_as_done(client, token, &notification.node_id).await?;
-                }
-            }
         }
     }
 
-    Ok(())
+    Ok(ActionOutcome { refresh })
 }
 
 fn is_api_action(action: Action) -> bool {
-    matches!(
-        action,
-        Action::Open | Action::Read | Action::Done | Action::Unsubscribe | Action::SquashMerge
-    )
+    matches!(action, Action::Open | Action::Read | Action::Done | Action::Unsubscribe)
 }
 
 #[cfg(test)]
@@ -732,7 +847,7 @@ mod tests {
     use super::{
         apply_optimistic_update, clean_error_message, command_status, entry_for_index,
         handle_text_input, is_api_action, parse_updated_at, sort_by_updated_at, AppState,
-        EntrySnapshot, ExecSummary,
+        EntrySnapshot, ExecSummary, NotificationOverride, NotificationOverrideState,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -767,6 +882,7 @@ mod tests {
             repository: Repository {
                 name: "widgets".to_string(),
                 full_name: "acme/widgets".to_string(),
+                merge_settings: None,
             },
             url: "https://github.com/acme/widgets/pull/42".to_string(),
         }
@@ -794,6 +910,7 @@ mod tests {
             repository: Repository {
                 name: "widgets".to_string(),
                 full_name: "acme/widgets".to_string(),
+                merge_settings: None,
             },
             url: url.to_string(),
         }
@@ -868,11 +985,28 @@ mod tests {
             failed: 0,
             errors: Vec::new(),
             api_failed: false,
+            refresh: false,
         };
 
         let (message, refresh, sticky) = command_status(&result);
         assert_eq!(message, "Executed 3 actions");
         assert!(!refresh);
+        assert!(!sticky);
+    }
+
+    #[test]
+    fn command_status_refresh_on_success() {
+        let result = ExecSummary {
+            succeeded: 1,
+            failed: 0,
+            errors: Vec::new(),
+            api_failed: false,
+            refresh: true,
+        };
+
+        let (message, refresh, sticky) = command_status(&result);
+        assert_eq!(message, "Executed 1 actions");
+        assert!(refresh);
         assert!(!sticky);
     }
 
@@ -883,6 +1017,7 @@ mod tests {
             failed: 2,
             errors: vec!["boom".to_string()],
             api_failed: true,
+            refresh: false,
         };
 
         let (message, refresh, sticky) = command_status(&result);
@@ -916,26 +1051,41 @@ mod tests {
     }
 
     #[test]
+    fn open_records_read_override() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.notifications = vec![sample_notification(true)];
+        let id = app.notifications[0].id.clone();
+
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::Open]);
+
+        apply_optimistic_update(&mut app, &commands);
+        let override_entry = app.notification_overrides.get(&id).expect("override");
+        assert_eq!(override_entry.state, NotificationOverrideState::Read);
+    }
+
+    #[test]
+    fn done_records_suppress_override() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.notifications = vec![sample_notification(true)];
+        let id = app.notifications[0].id.clone();
+
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::Done]);
+
+        apply_optimistic_update(&mut app, &commands);
+        let override_entry = app.notification_overrides.get(&id).expect("override");
+        assert_eq!(override_entry.state, NotificationOverrideState::Suppress);
+    }
+
+    #[test]
     fn open_is_api_action() {
         assert!(is_api_action(Action::Open));
     }
 
     #[test]
-    fn squash_merge_is_api_action() {
-        assert!(is_api_action(Action::SquashMerge));
-    }
-
-    #[test]
-    fn squash_merge_removes_my_pr_optimistically() {
-        let mut app = AppState::new(true, HashSet::new());
-        app.notifications = vec![sample_notification(false)];
-        app.my_prs = vec![sample_my_pr()];
-
-        let mut commands = HashMap::new();
-        commands.insert(2, vec![Action::SquashMerge]);
-
-        apply_optimistic_update(&mut app, &commands);
-        assert!(app.my_prs.is_empty());
+    fn yank_is_not_api_action() {
+        assert!(!is_api_action(Action::Yank));
     }
 
     #[test]
@@ -986,6 +1136,73 @@ mod tests {
             app.my_prs[0].url,
             "https://github.com/acme/widgets/pull/101"
         );
+    }
+
+    #[test]
+    fn set_data_preserves_read_override_on_stale_fetch() {
+        let mut app = AppState::new(true, HashSet::new());
+        let notification = sample_notification(true);
+        let marked_at = parse_updated_at(&notification.updated_at) + 60;
+        let id = notification.id.clone();
+        app.notification_overrides.insert(
+            id.clone(),
+            NotificationOverride {
+                state: NotificationOverrideState::Read,
+                marked_at,
+            },
+        );
+
+        app.set_data(vec![notification], Vec::new());
+        assert_eq!(app.notifications.len(), 1);
+        assert!(!app.notifications[0].unread);
+        assert!(app.notification_overrides.contains_key(&id));
+    }
+
+    #[test]
+    fn set_data_clears_read_override_on_new_activity() {
+        let mut app = AppState::new(true, HashSet::new());
+        let mut notification = sample_notification(true);
+        let marked_at = parse_updated_at(&notification.updated_at);
+        notification.updated_at = "2024-01-02T00:00:00Z".to_string();
+        let id = notification.id.clone();
+        app.notification_overrides.insert(
+            id.clone(),
+            NotificationOverride {
+                state: NotificationOverrideState::Read,
+                marked_at,
+            },
+        );
+
+        app.set_data(vec![notification], Vec::new());
+        assert_eq!(app.notifications.len(), 1);
+        assert!(app.notifications[0].unread);
+        assert!(!app.notification_overrides.contains_key(&id));
+    }
+
+    #[test]
+    fn set_data_suppresses_done_until_new_activity() {
+        let mut app = AppState::new(true, HashSet::new());
+        let notification = sample_notification(true);
+        let marked_at = parse_updated_at(&notification.updated_at) + 60;
+        let id = notification.id.clone();
+        app.notification_overrides.insert(
+            id.clone(),
+            NotificationOverride {
+                state: NotificationOverrideState::Suppress,
+                marked_at,
+            },
+        );
+
+        app.set_data(vec![notification], Vec::new());
+        assert!(app.notifications.is_empty());
+        assert!(app.notification_overrides.contains_key(&id));
+
+        let mut updated = sample_notification(true);
+        updated.updated_at = "2024-01-03T00:00:00Z".to_string();
+        app.set_data(vec![updated.clone()], Vec::new());
+        assert_eq!(app.notifications.len(), 1);
+        assert!(app.notifications[0].unread);
+        assert!(!app.notification_overrides.contains_key(&updated.id));
     }
 
     #[test]

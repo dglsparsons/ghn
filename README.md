@@ -41,7 +41,7 @@ ghn
 
 3 * [Draft] someorg/repo ↻ ? PullRequest 10m
     Review requested: Update dependencies
-Commands: o open  y yank  r read  d done  q unsub/ignore  s squash  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
+Commands: o open  y yank  r read  d done  q unsub/ignore  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
 > 1-3r
 ```
 
@@ -66,7 +66,6 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 | Read | `r` | Mark as read |
 | Done | `d` | Mark as done (removes from inbox) |
 | Unsubscribe | `q` | Unsubscribe from thread; in My PRs, ignore PRs (saved to `~/.config/ghn/ignores.txt`) |
-| Squash merge | `s` | Squash-merge PR (marks notification done on success) |
 
 **Examples:**
 - `1o` - Open notification #1 in browser (marks it as read)
@@ -87,7 +86,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 |-----|--------|
 | `0-9` | Build number for command |
 | `-` / `,` / `Space` | Range or list separators |
-| `o/y/r/d/q/s` | Queue action for current number |
+| `o/y/r/d/q` | Queue action for current number |
 | `Enter` | Execute all queued commands |
 | `Esc` | Clear command buffer |
 | `Backspace` | Delete last character |
@@ -113,7 +112,6 @@ When you queue a command, the targeted notification highlights with a color indi
 | Read | Gray/Dim |
 | Done | Green |
 | Unsubscribe | Red |
-| Squash merge | Cyan |
 
 PRs also show a CI indicator: `✓` success, `↻` running/pending, `✗` failed.
 Review indicators show status: `?` pending review, `A` approved, `X` changes requested.
