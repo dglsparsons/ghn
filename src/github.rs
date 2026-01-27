@@ -235,26 +235,39 @@ fn parse_subject_type(url: &str) -> String {
     }
 }
 
-fn subject_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option<SubjectStatus> {
-    let subject = subject?;
+fn subject_statuses(kind: &str, subject: Option<&GraphQlSubject>) -> Vec<SubjectStatus> {
+    let Some(subject) = subject else {
+        return Vec::new();
+    };
+
+    let mut statuses = Vec::new();
     match kind.to_ascii_lowercase().as_str() {
         "pullrequest" => {
-            // Drafts still report OPEN state, so prioritize isDraft over state.
+            // Drafts still report OPEN state, so include draft before terminal states.
             if subject.is_draft.unwrap_or(false) {
-                return Some(SubjectStatus::Draft);
+                statuses.push(SubjectStatus::Draft);
             }
             match subject.state.as_deref() {
-                Some(state) if state.eq_ignore_ascii_case("MERGED") => Some(SubjectStatus::Merged),
-                Some(state) if state.eq_ignore_ascii_case("CLOSED") => Some(SubjectStatus::Closed),
-                _ => None,
+                Some(state) if state.eq_ignore_ascii_case("MERGED") => {
+                    statuses.push(SubjectStatus::Merged);
+                }
+                Some(state) if state.eq_ignore_ascii_case("CLOSED") => {
+                    statuses.push(SubjectStatus::Closed);
+                }
+                _ => {}
             }
         }
-        "issue" => match subject.state.as_deref() {
-            Some(state) if state.eq_ignore_ascii_case("CLOSED") => Some(SubjectStatus::Closed),
-            _ => None,
-        },
-        _ => None,
+        "issue" => {
+            if matches!(
+                subject.state.as_deref(),
+                Some(state) if state.eq_ignore_ascii_case("CLOSED")
+            ) {
+                statuses.push(SubjectStatus::Closed);
+            }
+        }
+        _ => {}
     }
+    statuses
 }
 
 fn map_ci_status(state: Option<&str>) -> Option<CiStatus> {
@@ -325,7 +338,7 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
     let repo_full_name = parse_repo_from_url(&gql.url);
     let kind = parse_subject_type(&gql.url);
     let optional_subject = gql.optional_subject;
-    let status = subject_status(&kind, optional_subject.as_ref());
+    let status = subject_statuses(&kind, optional_subject.as_ref());
     let ci_status = subject_ci_status(&kind, optional_subject.as_ref());
     let review_status = subject_review_status(&kind, optional_subject.as_ref());
     let subject = Subject {
@@ -380,9 +393,9 @@ fn pull_request_review_status(pr: &GraphQlPullRequest) -> Option<ReviewStatus> {
 
 fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
     let status = if pr.is_draft {
-        Some(SubjectStatus::Draft)
+        vec![SubjectStatus::Draft]
     } else {
-        None
+        Vec::new()
     };
     let ci_status = pull_request_ci_status(&pr);
     let review_status = pull_request_review_status(&pr);
@@ -781,7 +794,7 @@ mod tests {
         assert_eq!(notification.reason, "mention");
         assert_eq!(notification.subject.title, "Fix bug");
         assert_eq!(notification.subject.kind, "PullRequest");
-        assert_eq!(notification.subject.status, Some(SubjectStatus::Merged));
+        assert_eq!(notification.subject.status, vec![SubjectStatus::Merged]);
         assert_eq!(notification.subject.ci_status, Some(CiStatus::Success));
         assert_eq!(
             notification.subject.review_status,
@@ -837,7 +850,34 @@ mod tests {
         };
 
         let notification = transform_notification(gql);
-        assert_eq!(notification.subject.status, Some(SubjectStatus::Draft));
+        assert_eq!(notification.subject.status, vec![SubjectStatus::Draft]);
+    }
+
+    #[test]
+    fn transform_notification_maps_draft_and_closed_statuses() {
+        let gql = GraphQlNotification {
+            id: "node-3b".to_string(),
+            thread_id: "thread-3b".to_string(),
+            title: "Draft closed".to_string(),
+            url: "https://github.com/acme/widgets/pull/14".to_string(),
+            is_unread: true,
+            last_updated_at: "2024-01-03T00:00:00Z".to_string(),
+            reason: None,
+            optional_subject: Some(GraphQlSubject {
+                id: Some("subject-3b".to_string()),
+                state: Some("CLOSED".to_string()),
+                is_draft: Some(true),
+                review_decision: None,
+                commits: None,
+                repository: None,
+            }),
+        };
+
+        let notification = transform_notification(gql);
+        assert_eq!(
+            notification.subject.status,
+            vec![SubjectStatus::Draft, SubjectStatus::Closed]
+        );
     }
 
     #[test]
@@ -861,7 +901,7 @@ mod tests {
         };
 
         let notification = transform_notification(gql);
-        assert_eq!(notification.subject.status, Some(SubjectStatus::Closed));
+        assert_eq!(notification.subject.status, vec![SubjectStatus::Closed]);
     }
 
     #[test]
@@ -944,7 +984,7 @@ mod tests {
                 title: "My PR".to_string(),
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
                 kind: "PullRequest".to_string(),
-                status: None,
+                status: Vec::new(),
                 ci_status: None,
                 review_status: None,
             },
@@ -964,7 +1004,7 @@ mod tests {
                     title: "My PR".to_string(),
                     url: "https://github.com/acme/widgets/pull/1".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: None,
+                    status: Vec::new(),
                     ci_status: None,
                     review_status: None,
                 },
@@ -982,7 +1022,7 @@ mod tests {
                     title: "Another PR".to_string(),
                     url: "https://github.com/acme/widgets/pull/2".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: None,
+                    status: Vec::new(),
                     ci_status: None,
                     review_status: None,
                 },

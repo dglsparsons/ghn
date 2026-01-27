@@ -259,7 +259,7 @@ fn draw_list_section<T: ListItemLike>(
             let title_width = widths.title;
 
             let index_cell = pad_left(&index.to_string(), widths.index);
-            let status_prefix = status_prefix(subject);
+            let status_prefixes = status_prefixes(subject);
             let kind_cell = pad_left(
                 &truncate_with_suffix(&subject.kind, widths.kind),
                 widths.kind,
@@ -274,7 +274,10 @@ fn draw_list_section<T: ListItemLike>(
             ];
 
             let mut remaining = widths.repo;
-            if let Some(prefix) = status_prefix {
+            for prefix in status_prefixes {
+                if remaining == 0 {
+                    break;
+                }
                 let prefix_text = truncate_with_suffix(&prefix.text, remaining);
                 let prefix_len = prefix_text.chars().count();
                 remaining = remaining.saturating_sub(prefix_len);
@@ -419,21 +422,35 @@ struct ReviewIndicator {
     style: Style,
 }
 
-fn status_prefix_len(subject: &Subject) -> usize {
-    subject
-        .status
-        .map(|status| status.label().chars().count() + 3)
-        .unwrap_or(0)
+// Keep Draft first so draft+closed/merged states stay visible in the prefix.
+const STATUS_ORDER: [SubjectStatus; 3] = [
+    SubjectStatus::Draft,
+    SubjectStatus::Merged,
+    SubjectStatus::Closed,
+];
+
+fn ordered_statuses(subject: &Subject) -> impl Iterator<Item = SubjectStatus> + '_ {
+    STATUS_ORDER
+        .iter()
+        .copied()
+        .filter(|status| subject.status.contains(status))
 }
 
-fn status_prefix(subject: &Subject) -> Option<StatusLabel> {
-    let status = subject.status?;
-    Some(StatusLabel {
-        text: format!("[{}] ", status.label()),
-        style: Style::default()
-            .fg(status_color(status))
-            .add_modifier(Modifier::BOLD),
-    })
+fn status_prefix_len(subject: &Subject) -> usize {
+    ordered_statuses(subject)
+        .map(|status| status.label().chars().count() + 3)
+        .sum()
+}
+
+fn status_prefixes(subject: &Subject) -> Vec<StatusLabel> {
+    ordered_statuses(subject)
+        .map(|status| StatusLabel {
+            text: format!("[{}] ", status.label()),
+            style: Style::default()
+                .fg(status_color(status))
+                .add_modifier(Modifier::BOLD),
+        })
+        .collect()
 }
 
 fn status_color(status: SubjectStatus) -> Color {
@@ -473,14 +490,14 @@ fn review_indicator(subject: &Subject) -> Option<ReviewIndicator> {
 fn effective_review_status(subject: &Subject) -> Option<ReviewStatus> {
     let status = subject.review_status?;
     if status == ReviewStatus::ReviewRequired {
-        if let Some(subject_status) = subject.status {
-            if matches!(
+        if subject.status.iter().any(|subject_status| {
+            matches!(
                 subject_status,
                 SubjectStatus::Merged | SubjectStatus::Closed | SubjectStatus::Draft
-            ) {
-                // Draft/closed/merged PRs shouldn't display a pending review indicator.
-                return None;
-            }
+            )
+        }) {
+            // Draft/closed/merged PRs shouldn't display a pending review indicator.
+            return None;
         }
     }
     Some(status)
@@ -711,7 +728,7 @@ fn build_target_map(
 }
 
 fn push_status_targets(targets: &mut HashMap<char, Vec<usize>>, index: usize, subject: &Subject) {
-    if let Some(status) = subject.status {
+    for status in ordered_statuses(subject) {
         let key = match status {
             SubjectStatus::Merged => 'm',
             SubjectStatus::Closed => 'c',
@@ -794,7 +811,7 @@ mod tests {
     use super::{
         action_marker, base_notification_style, build_pending_map, build_status_lines, ci_indicator,
         kind_color, layout_widths, pending_style, review_indicator, select_legend_lines,
-        status_prefix, truncate_with_suffix, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
+        status_prefixes, truncate_with_suffix, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
     };
     use crate::types::{
         Action, CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject,
@@ -817,7 +834,7 @@ mod tests {
                     title: "Fix bug".to_string(),
                     url: "https://github.com/acme/widgets/pull/1".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: None,
+                    status: Vec::new(),
                     ci_status: None,
                     review_status: None,
                 },
@@ -839,7 +856,7 @@ mod tests {
                     title: "Fix docs".to_string(),
                     url: "https://github.com/acme/widgets/issues/2".to_string(),
                     kind: "Issue".to_string(),
-                    status: Some(SubjectStatus::Closed),
+                    status: vec![SubjectStatus::Closed],
                     ci_status: None,
                     review_status: None,
                 },
@@ -872,7 +889,7 @@ mod tests {
                     title: "Pending review".to_string(),
                     url: "https://github.com/acme/widgets/pull/1".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: None,
+                    status: Vec::new(),
                     ci_status: None,
                     review_status: Some(ReviewStatus::ReviewRequired),
                 },
@@ -894,7 +911,7 @@ mod tests {
                     title: "Merged PR".to_string(),
                     url: "https://github.com/acme/widgets/pull/2".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: Some(SubjectStatus::Merged),
+                    status: vec![SubjectStatus::Merged],
                     ci_status: None,
                     review_status: Some(ReviewStatus::ReviewRequired),
                 },
@@ -916,7 +933,7 @@ mod tests {
                     title: "Draft PR".to_string(),
                     url: "https://github.com/acme/widgets/pull/3".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: Some(SubjectStatus::Draft),
+                    status: vec![SubjectStatus::Draft],
                     ci_status: None,
                     review_status: Some(ReviewStatus::ReviewRequired),
                 },
@@ -938,7 +955,7 @@ mod tests {
                     title: "Approved".to_string(),
                     url: "https://github.com/acme/widgets/pull/4".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: None,
+                    status: Vec::new(),
                     ci_status: None,
                     review_status: Some(ReviewStatus::Approved),
                 },
@@ -960,7 +977,7 @@ mod tests {
                     title: "Changes requested".to_string(),
                     url: "https://github.com/acme/widgets/pull/5".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: None,
+                    status: Vec::new(),
                     ci_status: None,
                     review_status: Some(ReviewStatus::ChangesRequested),
                 },
@@ -986,6 +1003,39 @@ mod tests {
     }
 
     #[test]
+    fn build_pending_map_targets_multiple_statuses() {
+        let my_prs = Vec::new();
+        let notifications = vec![Notification {
+            id: "thread-1".to_string(),
+            node_id: "node-1".to_string(),
+            subject_id: None,
+            unread: true,
+            reason: "mention".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: Subject {
+                title: "Draft closed".to_string(),
+                url: "https://github.com/acme/widgets/pull/1".to_string(),
+                kind: "PullRequest".to_string(),
+                status: vec![SubjectStatus::Draft, SubjectStatus::Closed],
+                ci_status: None,
+                review_status: None,
+            },
+            repository: Repository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+                merge_settings: None,
+            },
+            url: "https://github.com/acme/widgets/pull/1".to_string(),
+        }];
+
+        let pending = build_pending_map("fo", &notifications, &my_prs);
+        assert_eq!(pending.get(&1), Some(&vec![Action::Open]));
+
+        let pending = build_pending_map("co", &notifications, &my_prs);
+        assert_eq!(pending.get(&1), Some(&vec![Action::Open]));
+    }
+
+    #[test]
     fn build_pending_map_targets_unread() {
         let my_prs = Vec::new();
         let notifications = vec![
@@ -1000,7 +1050,7 @@ mod tests {
                     title: "Unread".to_string(),
                     url: "https://github.com/acme/widgets/pull/1".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: None,
+                    status: Vec::new(),
                     ci_status: None,
                     review_status: None,
                 },
@@ -1022,7 +1072,7 @@ mod tests {
                     title: "Read".to_string(),
                     url: "https://github.com/acme/widgets/pull/2".to_string(),
                     kind: "PullRequest".to_string(),
-                    status: None,
+                    status: Vec::new(),
                     ci_status: None,
                     review_status: None,
                 },
@@ -1053,7 +1103,7 @@ mod tests {
                 title: "PR notification".to_string(),
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
                 kind: "PullRequest".to_string(),
-                status: None,
+                status: Vec::new(),
                 ci_status: None,
                 review_status: None,
             },
@@ -1072,7 +1122,7 @@ mod tests {
                 title: "My PR".to_string(),
                 url: "https://github.com/acme/widgets/pull/2".to_string(),
                 kind: "PullRequest".to_string(),
-                status: None,
+                status: Vec::new(),
                 ci_status: None,
                 review_status: None,
             },
@@ -1105,7 +1155,7 @@ mod tests {
                 title: "Issue".to_string(),
                 url: "https://github.com/acme/widgets/issues/1".to_string(),
                 kind: "Issue".to_string(),
-                status: None,
+                status: Vec::new(),
                 ci_status: None,
                 review_status: None,
             },
@@ -1164,7 +1214,7 @@ mod tests {
                 title: "Review me".to_string(),
                 url: "https://github.com/acme/widgets/pull/3".to_string(),
                 kind: "PullRequest".to_string(),
-                status: None,
+                status: Vec::new(),
                 ci_status: None,
                 review_status: Some(ReviewStatus::ReviewRequired),
             },
@@ -1193,7 +1243,7 @@ mod tests {
                 title: "Closed PR".to_string(),
                 url: "https://github.com/acme/widgets/pull/4".to_string(),
                 kind: "PullRequest".to_string(),
-                status: Some(SubjectStatus::Closed),
+                status: vec![SubjectStatus::Closed],
                 ci_status: None,
                 review_status: Some(ReviewStatus::ReviewRequired),
             },
@@ -1221,7 +1271,7 @@ mod tests {
                 title: "Draft PR".to_string(),
                 url: "https://github.com/acme/widgets/pull/5".to_string(),
                 kind: "PullRequest".to_string(),
-                status: Some(SubjectStatus::Draft),
+                status: vec![SubjectStatus::Draft],
                 ci_status: None,
                 review_status: Some(ReviewStatus::ReviewRequired),
             },
@@ -1305,19 +1355,37 @@ mod tests {
             title: "Draft PR".to_string(),
             url: "https://github.com/acme/widgets/pull/1".to_string(),
             kind: "PullRequest".to_string(),
-            status: Some(SubjectStatus::Draft),
+            status: vec![SubjectStatus::Draft],
             ci_status: None,
             review_status: None,
         };
 
-        let label = status_prefix(&subject).expect("status prefix");
-        assert_eq!(label.text, "[Draft] ");
+        let labels = status_prefixes(&subject);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].text, "[Draft] ");
         assert_eq!(
-            label.style,
+            labels[0].style,
             Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD)
         );
+    }
+
+    #[test]
+    fn status_prefix_renders_multiple_labels_in_order() {
+        let subject = Subject {
+            title: "Draft closed PR".to_string(),
+            url: "https://github.com/acme/widgets/pull/2".to_string(),
+            kind: "PullRequest".to_string(),
+            status: vec![SubjectStatus::Closed, SubjectStatus::Draft],
+            ci_status: None,
+            review_status: None,
+        };
+
+        let labels = status_prefixes(&subject);
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].text, "[Draft] ");
+        assert_eq!(labels[1].text, "[Closed] ");
     }
 
     #[test]
@@ -1326,7 +1394,7 @@ mod tests {
             title: "PR".to_string(),
             url: "https://github.com/acme/widgets/pull/2".to_string(),
             kind: "PullRequest".to_string(),
-            status: None,
+            status: Vec::new(),
             ci_status: Some(CiStatus::Failure),
             review_status: None,
         };
