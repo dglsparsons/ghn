@@ -135,6 +135,7 @@ pub enum Action {
     Read,
     Done,
     Unsubscribe,
+    Review,
 }
 
 impl Action {
@@ -145,6 +146,7 @@ impl Action {
             'r' => Some(Self::Read),
             'd' => Some(Self::Done),
             'q' => Some(Self::Unsubscribe),
+            'p' => Some(Self::Review),
             _ => None,
         }
     }
@@ -156,6 +158,7 @@ impl Action {
             Self::Read => 'r',
             Self::Done => 'd',
             Self::Unsubscribe => 'q',
+            Self::Review => 'p',
         }
     }
 }
@@ -184,6 +187,7 @@ mod tests {
             ('r', Action::Read),
             ('d', Action::Done),
             ('q', Action::Unsubscribe),
+            ('p', Action::Review),
         ];
 
         for (ch, action) in pairs {

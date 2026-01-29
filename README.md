@@ -41,7 +41,7 @@ ghn
 
 3 * [Draft] someorg/repo ↻ ? PullRequest 10m
     Review requested: Update dependencies
-Commands: o open  y yank  r read  d done  q unsub/ignore  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
+Commands: o open  y yank  r read  d done  q unsub/ignore  p review  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
 > 1-3r
 ```
 
@@ -66,6 +66,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 | Read | `r` | Mark as read |
 | Done | `d` | Mark as done (removes from inbox) |
 | Unsubscribe | `q` | Unsubscribe from thread; in My PRs, ignore PRs (saved to `~/.config/ghn/ignores.txt`) |
+| ReviewPR | `p` | Open nvim in `~/Developer/<owner>/<repo>` with `ReviewPR <url> --analyze` |
 
 **Examples:**
 - `1o` - Open notification #1 in browser (marks it as read)
@@ -73,6 +74,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 - `1,2,3r` - Same as above, using a list separator
 - `5y` - Copy URL of notification #5
 - `1r` - Mark #1 as read without opening
+- `1p` - Open PR #1 in nvim using ReviewPR
 - `23r` - With 10 items, marks #2 and #3; with 30 items, marks #23
 - `md` - Mark all merged PR notifications as done
 - `cd` - Mark all closed PR/issue notifications as done
@@ -86,7 +88,8 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 |-----|--------|
 | `0-9` | Build number for command |
 | `-` / `,` / `Space` | Range or list separators |
-| `o/y/r/d/q` | Queue action for current number |
+| `o/y/r/d/q/p` | Queue action for current number |
+| `p` | Review PR in nvim |
 | `Enter` | Execute all queued commands |
 | `Esc` | Clear command buffer |
 | `Backspace` | Delete last character |

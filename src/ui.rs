@@ -14,10 +14,10 @@ use crate::{
 };
 
 const COMMANDS_FULL: &str =
-    "Commands: o open/read  y yank  r read  d done  q unsub/ignore";
-const COMMANDS_COMPACT: &str = "Cmds: o open/read  y yank  r read  d done  q unsub/ign";
-const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q";
-const COMMANDS_TINY: &str = "o y r d q";
+    "Commands: o open/read  y yank  r read  d done  q unsub/ignore  p review";
+const COMMANDS_COMPACT: &str = "Cmds: o open/read  y yank  r read  d done  q unsub/ign  p review";
+const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q/p";
+const COMMANDS_TINY: &str = "o y r d q p";
 
 const TARGETS_FULL: &str =
     "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft";
@@ -524,6 +524,7 @@ fn action_color(action: Action) -> Color {
         Action::Read => Color::DarkGray,
         Action::Done => Color::Green,
         Action::Unsubscribe => Color::Red,
+        Action::Review => Color::Cyan,
     }
 }
 
@@ -801,7 +802,10 @@ fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
         PendingEntry::Notification => true,
         // My PRs don't have notification semantics, so ignore read/done; q maps to ignore.
         PendingEntry::MyPullRequest => {
-            matches!(action, Action::Open | Action::Yank | Action::Unsubscribe)
+            matches!(
+                action,
+                Action::Open | Action::Yank | Action::Unsubscribe | Action::Review
+            )
         }
     }
 }
@@ -872,6 +876,32 @@ mod tests {
         let map = build_pending_map("1o2r", &notifications, &my_prs);
         assert_eq!(map.get(&1), Some(&vec![Action::Open]));
         assert_eq!(map.get(&2), Some(&vec![Action::Read]));
+    }
+
+    #[test]
+    fn build_pending_map_allows_review_for_my_prs() {
+        let notifications = Vec::new();
+        let my_prs = vec![MyPullRequest {
+            id: "pr-1".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: Subject {
+                title: "My PR".to_string(),
+                url: "https://github.com/acme/widgets/pull/99".to_string(),
+                kind: "PullRequest".to_string(),
+                status: Vec::new(),
+                ci_status: None,
+                review_status: None,
+            },
+            repository: Repository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+                merge_settings: None,
+            },
+            url: "https://github.com/acme/widgets/pull/99".to_string(),
+        }];
+
+        let map = build_pending_map("1p", &notifications, &my_prs);
+        assert_eq!(map.get(&1), Some(&vec![Action::Review]));
     }
 
     #[test]

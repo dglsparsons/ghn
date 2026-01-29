@@ -245,6 +245,9 @@ mod tests {
 
         let result = parse_commands("2q", 10, &targets);
         assert_eq!(result.get(&2), Some(&vec![Action::Unsubscribe]));
+
+        let result = parse_commands("4p", 10, &targets);
+        assert_eq!(result.get(&4), Some(&vec![Action::Review]));
     }
 
     #[test]

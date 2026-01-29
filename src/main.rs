@@ -8,11 +8,13 @@ mod util;
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Stdout},
+    path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use crossterm::{
     event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
@@ -21,6 +23,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
+    layout::{Position, Rect},
     style::{Color, Style},
     Terminal,
 };
@@ -53,6 +56,13 @@ enum AppEvent {
     },
     Error(String),
     CommandResult(ExecSummary),
+    Review(ReviewRequest),
+}
+
+#[derive(Debug, Clone)]
+struct ReviewRequest {
+    repo_full_name: String,
+    pr_url: String,
 }
 
 pub struct AppState {
@@ -271,6 +281,21 @@ async fn run_app(
                     AppEvent::CommandResult(result) => {
                         handle_command_result(&mut app, &refresh_tx, result);
                     }
+                    AppEvent::Review(request) => {
+                        let result = run_review_in_nvim(terminal, &request);
+                        events = EventStream::new();
+                        reset_terminal_buffers(terminal);
+                        match result {
+                            Ok(()) => {
+                                app.status = Some("ReviewPR finished".to_string());
+                                app.status_sticky = false;
+                            }
+                            Err(err) => {
+                                app.status = Some(err.to_string());
+                                app.status_sticky = true;
+                            }
+                        }
+                    }
                 }
             }
             _ = tick.tick() => {
@@ -370,6 +395,31 @@ fn submit_commands(
         return Ok(());
     }
 
+    let (review_request, pending) =
+        match split_review_action(&pending, &app.notifications, &app.my_prs) {
+            Ok(value) => value,
+            Err(err) => {
+                app.status = Some(err.to_string());
+                app.status_sticky = true;
+                app.clear_commands();
+                return Ok(());
+            }
+        };
+
+    if let Some(request) = review_request {
+        let app_event_tx = app_event_tx.clone();
+        tokio::spawn(async move {
+            let _ = app_event_tx.send(AppEvent::Review(request)).await;
+        });
+    }
+
+    if pending.is_empty() {
+        app.status = Some("Opening ReviewPR in nvim...".to_string());
+        app.status_sticky = false;
+        app.clear_commands();
+        return Ok(());
+    }
+
     let notifications_snapshot = app.notifications.clone();
     let my_prs_snapshot = app.my_prs.clone();
     let action_total: usize = pending.values().map(Vec::len).sum();
@@ -404,6 +454,52 @@ fn submit_commands(
     });
 
     Ok(())
+}
+
+fn split_review_action(
+    commands: &HashMap<usize, Vec<Action>>,
+    notifications: &[Notification],
+    my_prs: &[MyPullRequest],
+) -> Result<(Option<ReviewRequest>, HashMap<usize, Vec<Action>>)> {
+    let mut review_index = None;
+
+    for (index, actions) in commands {
+        if actions.iter().any(|action| matches!(action, Action::Review)) {
+            if review_index.is_some() {
+                return Err(anyhow!("ReviewPR expects a single target"));
+            }
+            review_index = Some(*index);
+        }
+    }
+
+    let review_request = if let Some(index) = review_index {
+        let entry = entry_for_index(index, notifications, my_prs)
+            .ok_or_else(|| anyhow!("ReviewPR target is out of range"))?;
+        let url = entry.url();
+        if !url.contains("/pull/") {
+            return Err(anyhow!("ReviewPR only supports pull request URLs"));
+        }
+        Some(ReviewRequest {
+            repo_full_name: entry.repo_full_name().to_string(),
+            pr_url: url.to_string(),
+        })
+    } else {
+        None
+    };
+
+    let mut filtered = HashMap::new();
+    for (index, actions) in commands {
+        let remaining: Vec<Action> = actions
+            .iter()
+            .copied()
+            .filter(|action| *action != Action::Review)
+            .collect();
+        if !remaining.is_empty() {
+            filtered.insert(*index, remaining);
+        }
+    }
+
+    Ok((review_request, filtered))
 }
 
 fn handle_text_input(app: &mut AppState, key: crossterm::event::KeyEvent) {
@@ -554,7 +650,7 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
                                 NotificationOverrideState::Suppress,
                             );
                         }
-                        Action::Yank => {}
+                        Action::Yank | Action::Review => {}
                     }
                 }
 
@@ -762,6 +858,13 @@ impl EntrySnapshot {
             EntrySnapshot::MyPullRequest(pr) => &pr.subject.url,
         }
     }
+
+    fn repo_full_name(&self) -> &str {
+        match self {
+            EntrySnapshot::Notification(notification) => &notification.repository.full_name,
+            EntrySnapshot::MyPullRequest(pr) => &pr.repository.full_name,
+        }
+    }
 }
 
 fn entry_for_index(
@@ -781,6 +884,125 @@ fn entry_for_index(
     } else {
         let idx = index - notifications.len() - 1;
         my_prs.get(idx).cloned().map(EntrySnapshot::MyPullRequest)
+    }
+}
+
+fn home_dir() -> Result<PathBuf> {
+    if let Ok(value) = std::env::var("HOME") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
+    if let Ok(value) = std::env::var("USERPROFILE") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
+    Err(anyhow!("HOME/USERPROFILE is not set"))
+}
+
+fn repo_dir_for_full_name(base: &Path, full_name: &str) -> Result<PathBuf> {
+    let mut parts = full_name.split('/');
+    let owner = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let repo = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if owner.is_none() || repo.is_none() || parts.next().is_some() {
+        return Err(anyhow!("invalid repository name: {}", full_name));
+    }
+
+    Ok(base.join(owner.unwrap()).join(repo.unwrap()))
+}
+
+struct TuiGuard<'a> {
+    terminal: &'a mut Terminal<CrosstermBackend<Stdout>>,
+    restored: bool,
+}
+
+impl<'a> TuiGuard<'a> {
+    fn suspend(terminal: &'a mut Terminal<CrosstermBackend<Stdout>>) -> Result<Self> {
+        disable_raw_mode().context("failed to disable raw mode")?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)
+            .context("failed to leave alternate screen")?;
+        terminal.show_cursor().ok();
+
+        Ok(Self {
+            terminal,
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+
+        execute!(self.terminal.backend_mut(), EnterAlternateScreen)
+            .context("failed to enter alternate screen")?;
+        enable_raw_mode().context("failed to enable raw mode")?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TuiGuard<'_> {
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
+        let _ = enable_raw_mode();
+    }
+}
+
+fn run_review_in_nvim(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    request: &ReviewRequest,
+) -> Result<()> {
+    if !request.pr_url.contains("/pull/") {
+        return Err(anyhow!("ReviewPR only supports pull request URLs"));
+    }
+
+    let base = home_dir()?.join("Developer");
+    let repo_dir = repo_dir_for_full_name(&base, &request.repo_full_name)?;
+    if !repo_dir.is_dir() {
+        return Err(anyhow!(
+            "repository directory not found: {}",
+            repo_dir.display()
+        ));
+    }
+
+    let mut guard = TuiGuard::suspend(terminal)?;
+    let status = Command::new("nvim")
+        .current_dir(&repo_dir)
+        .arg("-c")
+        .arg(format!("ReviewPR {} --analyze", request.pr_url))
+        .status()
+        .context("failed to launch nvim")?;
+    guard.restore()?;
+
+    if !status.success() {
+        return Err(anyhow!("nvim exited with status {}", status));
+    }
+
+    Ok(())
+}
+
+fn reset_terminal_buffers(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+    if let Ok(size) = terminal.size() {
+        let area = Rect::from((Position::ORIGIN, size));
+        let _ = terminal.resize(area);
+    } else {
+        let _ = terminal.clear();
     }
 }
 
@@ -833,6 +1055,11 @@ async fn execute_action(
                 append_ignored_pr(url)?;
             }
         }
+        Action::Review => {
+            return Err(anyhow!(
+                "ReviewPR should be triggered via the 'p' action in the UI"
+            ));
+        }
     }
 
     Ok(ActionOutcome { refresh })
@@ -846,11 +1073,13 @@ fn is_api_action(action: Action) -> bool {
 mod tests {
     use super::{
         apply_optimistic_update, clean_error_message, command_status, entry_for_index,
-        handle_text_input, is_api_action, parse_updated_at, sort_by_updated_at, AppState,
-        EntrySnapshot, ExecSummary, NotificationOverride, NotificationOverrideState,
+        handle_text_input, is_api_action, parse_updated_at, repo_dir_for_full_name,
+        sort_by_updated_at, AppState, EntrySnapshot, ExecSummary, NotificationOverride,
+        NotificationOverrideState,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
 
     use crate::types::{Action, MyPullRequest, Notification, Repository, Subject};
 
@@ -1086,6 +1315,25 @@ mod tests {
     #[test]
     fn yank_is_not_api_action() {
         assert!(!is_api_action(Action::Yank));
+    }
+
+    #[test]
+    fn review_is_not_api_action() {
+        assert!(!is_api_action(Action::Review));
+    }
+
+    #[test]
+    fn repo_dir_for_full_name_builds_path() {
+        let base = PathBuf::from("/tmp/base");
+        let path = repo_dir_for_full_name(&base, "acme/widgets").unwrap();
+        assert_eq!(path, base.join("acme").join("widgets"));
+    }
+
+    #[test]
+    fn repo_dir_for_full_name_rejects_invalid() {
+        let base = PathBuf::from("/tmp/base");
+        assert!(repo_dir_for_full_name(&base, "acme").is_err());
+        assert!(repo_dir_for_full_name(&base, "acme/widgets/extra").is_err());
     }
 
     #[test]
