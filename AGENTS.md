@@ -8,6 +8,8 @@ cargo build --release
 
 ## Test
 
+When tests are appropriate, run them yourself and report the results rather than suggesting the user run them.
+
 ```bash
 cargo test
 ```

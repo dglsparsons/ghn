@@ -1001,9 +1001,8 @@ fn reset_terminal_buffers(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
     if let Ok(size) = terminal.size() {
         let area = Rect::from((Position::ORIGIN, size));
         let _ = terminal.resize(area);
-    } else {
-        let _ = terminal.clear();
     }
+    let _ = terminal.clear();
 }
 
 async fn execute_action(
