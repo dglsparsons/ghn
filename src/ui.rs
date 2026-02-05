@@ -14,11 +14,11 @@ use crate::{
 };
 
 const COMMANDS_FULL: &str =
-    "Commands: o open/read  y yank  r read  d done  q unsub/ignore  p review  b branch  U undo";
+    "Commands: o open/read  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review  b branch  U undo";
 const COMMANDS_COMPACT: &str =
-    "Cmds: o open/read  y yank  r read  d done  q unsub/ign  p review  b branch  U undo";
-const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q/p/b/U";
-const COMMANDS_TINY: &str = "o y r d q p b U";
+    "Cmds: o open/read  y pretty  Y yank  r read  d done  q unsub/ign  p review  b branch  U undo";
+const COMMANDS_SHORT: &str = "Cmds o/y/Y/r/d/q/p/b/U";
+const COMMANDS_TINY: &str = "o y Y r d q p b U";
 
 const TARGETS_FULL: &str =
     "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft";
@@ -522,6 +522,7 @@ fn action_color(action: Action) -> Color {
     match action {
         Action::Open => Color::Blue,
         Action::Yank => Color::Yellow,
+        Action::PrettyYank => Color::Yellow,
         Action::Read => Color::DarkGray,
         Action::Done => Color::Green,
         Action::Unsubscribe => Color::Red,
@@ -807,7 +808,7 @@ enum PendingEntry {
 fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
     match entry {
         PendingEntry::Notification { is_pull_request } => {
-            if matches!(action, Action::Branch) {
+            if matches!(action, Action::Branch | Action::PrettyYank) {
                 *is_pull_request
             } else {
                 true
@@ -816,7 +817,12 @@ fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
         // My PRs don't have notification semantics, so ignore read/done; q maps to ignore.
         PendingEntry::MyPullRequest => matches!(
             action,
-            Action::Open | Action::Yank | Action::Unsubscribe | Action::Review | Action::Branch
+            Action::Open
+                | Action::Yank
+                | Action::PrettyYank
+                | Action::Unsubscribe
+                | Action::Review
+                | Action::Branch
         ),
     }
 }

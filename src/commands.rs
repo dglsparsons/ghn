@@ -235,7 +235,10 @@ mod tests {
         assert_eq!(result.get(&1), Some(&vec![Action::Open]));
 
         let result = parse_commands("3y", 10, &targets);
-        assert_eq!(result.get(&3), Some(&vec![Action::Yank]));
+        assert_eq!(result.get(&3), Some(&vec![Action::PrettyYank]));
+
+        let result = parse_commands("8Y", 10, &targets);
+        assert_eq!(result.get(&8), Some(&vec![Action::Yank]));
 
         let result = parse_commands("5r", 10, &targets);
         assert_eq!(result.get(&5), Some(&vec![Action::Read]));
@@ -330,7 +333,7 @@ mod tests {
     fn parses_lists_with_separators_and_multiple_actions() {
         let targets = HashMap::new();
         let result = parse_commands("1, 2 3 q y", 10, &targets);
-        let expected = vec![Action::Unsubscribe, Action::Yank];
+        let expected = vec![Action::Unsubscribe, Action::PrettyYank];
         assert_eq!(result.get(&1), Some(&expected));
         assert_eq!(result.get(&2), Some(&expected));
         assert_eq!(result.get(&3), Some(&expected));
@@ -342,7 +345,7 @@ mod tests {
         let result = parse_commands("1o1r1y", 10, &targets);
         assert_eq!(
             result.get(&1),
-            Some(&vec![Action::Open, Action::Read, Action::Yank])
+            Some(&vec![Action::Open, Action::Read, Action::PrettyYank])
         );
     }
 
@@ -372,7 +375,7 @@ mod tests {
                 Action::Open,
                 Action::Open,
                 Action::Open,
-                Action::Yank,
+                Action::PrettyYank,
                 Action::Done
             ])
         );

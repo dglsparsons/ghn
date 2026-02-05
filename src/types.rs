@@ -133,6 +133,7 @@ pub enum ReviewStatus {
 pub enum Action {
     Open,
     Yank,
+    PrettyYank,
     Read,
     Done,
     Unsubscribe,
@@ -144,7 +145,8 @@ impl Action {
     pub fn from_char(ch: char) -> Option<Self> {
         match ch {
             'o' => Some(Self::Open),
-            'y' => Some(Self::Yank),
+            'y' => Some(Self::PrettyYank),
+            'Y' => Some(Self::Yank),
             'r' => Some(Self::Read),
             'd' => Some(Self::Done),
             'q' => Some(Self::Unsubscribe),
@@ -157,7 +159,8 @@ impl Action {
     pub fn as_char(self) -> char {
         match self {
             Self::Open => 'o',
-            Self::Yank => 'y',
+            Self::Yank => 'Y',
+            Self::PrettyYank => 'y',
             Self::Read => 'r',
             Self::Done => 'd',
             Self::Unsubscribe => 'q',
@@ -187,7 +190,8 @@ mod tests {
     fn action_char_roundtrip() {
         let pairs = [
             ('o', Action::Open),
-            ('y', Action::Yank),
+            ('y', Action::PrettyYank),
+            ('Y', Action::Yank),
             ('r', Action::Read),
             ('d', Action::Done),
             ('q', Action::Unsubscribe),

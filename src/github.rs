@@ -104,6 +104,40 @@ struct GraphQlPullRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlPrettyPullRequest {
+    title: String,
+    url: String,
+    additions: i64,
+    deletions: i64,
+    head_repository: Option<GraphQlPrettyRepository>,
+    head_repository_owner: Option<GraphQlPrettyRepositoryOwner>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlPrettyRepository {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlPrettyRepositoryOwner {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrettyPullRequestRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<GraphQlPrettyPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrettyPullRequestData {
+    repository: Option<PrettyPullRequestRepository>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SearchData {
     search: GraphQlSearchConnection,
 }
@@ -117,6 +151,23 @@ struct GraphQlSearchConnection {
 pub struct NotificationsPayload {
     pub notifications: Vec<Notification>,
     pub viewer_login: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullRequestKey {
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrettyPullRequest {
+    pub url: String,
+    pub title: String,
+    pub additions: i64,
+    pub deletions: i64,
+    pub head_repo_owner: String,
+    pub head_repo_name: String,
 }
 
 const NOTIFICATIONS_QUERY: &str = r#"
@@ -206,6 +257,21 @@ query GetMyPullRequests($query: String!) {
 }
 "#;
 
+const PRETTY_PULL_REQUEST_QUERY: &str = r#"
+query PrettyPullRequest($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      title
+      url
+      additions
+      deletions
+      headRepository { name }
+      headRepositoryOwner { login }
+    }
+  }
+}
+"#;
+
 fn parse_repo_from_url(url: &str) -> String {
     let parts: Vec<&str> = url.split('/').collect();
     let mut idx = None;
@@ -223,6 +289,32 @@ fn parse_repo_from_url(url: &str) -> String {
     }
 
     "unknown/unknown".to_string()
+}
+
+pub fn parse_pull_request_key(url: &str) -> Option<PullRequestKey> {
+    let parts: Vec<&str> = url.split('/').collect();
+    for (idx, part) in parts.iter().enumerate() {
+        if *part != "pull" {
+            continue;
+        }
+        if idx < 2 || idx + 1 >= parts.len() {
+            return None;
+        }
+        let owner = parts[idx - 2].trim();
+        let repo = parts[idx - 1].trim();
+        let number = parts[idx + 1].trim();
+        if owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        let number = number.parse::<i64>().ok()?;
+        return Some(PullRequestKey {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+        });
+    }
+
+    None
 }
 
 fn parse_subject_type(url: &str) -> String {
@@ -617,6 +709,73 @@ pub async fn fetch_my_pull_requests(
     Ok(pull_requests)
 }
 
+pub async fn fetch_pretty_pull_request(
+    client: &Client,
+    token: &str,
+    key: &PullRequestKey,
+) -> Result<PrettyPullRequest> {
+    let response = client
+        .post(GITHUB_GRAPHQL)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "ghn")
+        .json(&json!({
+            "query": PRETTY_PULL_REQUEST_QUERY,
+            "variables": {
+                "owner": key.owner,
+                "name": key.repo,
+                "number": key.number,
+            }
+        }))
+        .send()
+        .await
+        .context("failed to fetch pull request details")?;
+
+    if response.status() == 429 {
+        return Err(anyhow!("GitHub rate limited. Retrying later."));
+    }
+    if response.status() == 401 || response.status() == 403 {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "GitHub authentication failed ({}). {}",
+            status,
+            body.trim()
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(anyhow!("GitHub API error: {}", response.status()));
+    }
+
+    let payload: GraphQlResponse<PrettyPullRequestData> = response.json().await?;
+    if let Some(errors) = payload.errors {
+        handle_graphql_errors(&errors)?;
+    }
+
+    let pr = payload
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repo| repo.pull_request)
+        .ok_or_else(|| anyhow!("pull request not found"))?;
+
+    let (head_repo_owner, head_repo_name) = match (
+        pr.head_repository_owner.as_ref(),
+        pr.head_repository.as_ref(),
+    ) {
+        (Some(owner), Some(repo)) => (owner.login.clone(), repo.name.clone()),
+        _ => (key.owner.clone(), key.repo.clone()),
+    };
+
+    Ok(PrettyPullRequest {
+        url: pr.url,
+        title: pr.title,
+        additions: pr.additions,
+        deletions: pr.deletions,
+        head_repo_owner,
+        head_repo_name,
+    })
+}
+
 pub async fn fetch_notifications_and_my_prs(
     client: &Client,
     token: &str,
@@ -782,9 +941,10 @@ pub async fn subscribe_to_thread(client: &Client, token: &str, thread_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        dedupe_pull_requests, filter_archived_pull_requests, normalize_pr_url, parse_repo_from_url,
-        parse_subject_type, transform_notification, transform_pull_request, GraphQlNotification,
-        GraphQlPullRequest, GraphQlRepository, GraphQlSubject,
+        dedupe_pull_requests, filter_archived_pull_requests, normalize_pr_url,
+        parse_pull_request_key, parse_repo_from_url, parse_subject_type, transform_notification,
+        transform_pull_request, GraphQlNotification, GraphQlPullRequest, GraphQlRepository,
+        GraphQlSubject,
     };
     use crate::types::{
         CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject, SubjectStatus,
@@ -823,6 +983,21 @@ mod tests {
     fn parse_repo_from_url_handles_unknown() {
         let url = "https://example.com/other";
         assert_eq!(parse_repo_from_url(url), "unknown/unknown");
+    }
+
+    #[test]
+    fn parse_pull_request_key_handles_standard() {
+        let url = "https://github.com/acme/widgets/pull/42";
+        let key = parse_pull_request_key(url).expect("key");
+        assert_eq!(key.owner, "acme");
+        assert_eq!(key.repo, "widgets");
+        assert_eq!(key.number, 42);
+    }
+
+    #[test]
+    fn parse_pull_request_key_rejects_non_pr() {
+        let url = "https://github.com/acme/widgets/issues/42";
+        assert!(parse_pull_request_key(url).is_none());
     }
 
     #[test]

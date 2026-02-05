@@ -41,7 +41,7 @@ ghn
 
 3 * [Draft] someorg/repo ↻ ? PullRequest 10m
     Review requested: Update dependencies
-Commands: o open  y yank  r read  d done  q unsub/ignore  p review  b branch  U undo  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
+Commands: o open  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review  b branch  U undo  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
 > 1-3r
 ```
 
@@ -55,7 +55,7 @@ Commands target one or more numbers followed by actions. Indices can be single n
 like `1-3`. You can also target status groups: `m` (merged PRs), `c` (closed PRs/issues), and `f` (draft PRs),
 as well as review states: `?` (pending review), `a` (approved), `x` (changes requested), plus `u` (unread).
 Queue multiple commands, then press `Enter` to execute. Press `U` then `Enter` to undo the last executed batch.
-When multiple items are yanked in a single batch, their URLs are copied together with a blank line between each.
+When multiple items are yanked in a single batch, their output is copied together with a blank line between each.
 Consecutive digits are parsed greedily using the longest valid prefix for the current list size. If the full number
 is valid, it wins; otherwise it splits (e.g., with 50 items `123456r` -> `12 34 5 6`, with 9 items `10r` -> `1`).
 This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `3`).
@@ -63,7 +63,8 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 | Action | Key | Description |
 |--------|-----|-------------|
 | Open | `o` | Open notification in browser (marks as read) |
-| Yank | `y` | Copy URL to clipboard |
+| Pretty yank | `y` | Copy PR summary to clipboard (PRs only) |
+| Yank | `Y` | Copy URL to clipboard |
 | Read | `r` | Mark as read |
 | Done | `d` | Mark as done (removes from inbox) |
 | Unsubscribe | `q` | Unsubscribe from thread; in My PRs, ignore PRs (saved to `~/.config/ghn/ignores.txt`) |
@@ -75,7 +76,8 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 - `1o` - Open notification #1 in browser (marks it as read)
 - `1-3r` - Mark notifications 1, 2, and 3 as read
 - `1,2,3r` - Same as above, using a list separator
-- `5y` - Copy URL of notification #5
+- `5y` - Copy PR summary for notification #5
+- `5Y` - Copy URL of notification #5
 - `1r` - Mark #1 as read without opening
 - `1p` - Open PR #1 in nvim using ReviewPR
 - `1b` - Copy branch name for PR #1
@@ -92,7 +94,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 |-----|--------|
 | `0-9` | Build number for command |
 | `-` / `,` / `Space` | Range or list separators |
-| `o/y/r/d/q/p/b` | Queue action for current number |
+| `o/y/Y/r/d/q/p/b` | Queue action for current number |
 | `p` | Review PR in nvim |
 | `Enter` | Execute all queued commands |
 | `U` | Undo last executed batch (press `U` then `Enter`) |

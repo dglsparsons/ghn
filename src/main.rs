@@ -34,8 +34,9 @@ use tui_textarea::{CursorMove, TextArea};
 use crate::{
     commands::is_target_char,
     github::{
-        fetch_notifications_and_my_prs, mark_as_done, mark_as_read, mark_as_unread,
-        subscribe_to_thread, unsubscribe,
+        fetch_notifications_and_my_prs, fetch_pretty_pull_request, mark_as_done, mark_as_read,
+        mark_as_unread, parse_pull_request_key, subscribe_to_thread, unsubscribe,
+        PrettyPullRequest,
     },
     ignore::{append_ignored_pr, load_ignored_prs, remove_ignored_pr},
     types::{Action, MyPullRequest, Notification},
@@ -303,7 +304,6 @@ async fn run_app(
                     AppEvent::Review(request) => {
                         let result = run_review_in_nvim(terminal, &request);
                         events = EventStream::new();
-                        reset_terminal_buffers(terminal);
                         match result {
                             Ok(()) => {
                                 app.status = Some("ReviewPR finished".to_string());
@@ -314,6 +314,7 @@ async fn run_app(
                                 app.status_sticky = true;
                             }
                         }
+                        force_redraw(terminal, &app)?;
                     }
                 }
             }
@@ -767,7 +768,7 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
                                 NotificationOverrideState::Suppress,
                             );
                         }
-                        Action::Yank | Action::Review | Action::Branch => {}
+                        Action::Yank | Action::PrettyYank | Action::Review | Action::Branch => {}
                     }
                 }
 
@@ -940,6 +941,8 @@ async fn execute_commands(
 ) -> Result<ExecSummary> {
     let mut tasks = Vec::new();
     let (yank_urls, yank_count) = collect_yank_targets(commands, notifications, my_prs);
+    let (pretty_yank_targets, pretty_yank_count) =
+        collect_pretty_yank_targets(commands, notifications, my_prs);
 
     for (index, actions) in commands {
         let entry = match entry_for_index(*index, notifications, my_prs) {
@@ -950,7 +953,7 @@ async fn execute_commands(
         let url = entry.url().to_string();
         for action in actions {
             let action = *action;
-            if action == Action::Yank {
+            if matches!(action, Action::Yank | Action::PrettyYank) {
                 continue;
             }
             let entry = entry.clone();
@@ -984,6 +987,29 @@ async fn execute_commands(
             Err(err) => {
                 failed += yank_count;
                 errors.push(err.to_string());
+            }
+        }
+    }
+
+    if pretty_yank_count > 0 {
+        let text = build_pretty_yank_text(client, token, &pretty_yank_targets).await;
+        match text {
+            Ok(text) => match tokio::task::spawn_blocking(move || copy_to_clipboard(&text)).await {
+                Ok(Ok(())) => {
+                    succeeded += pretty_yank_count;
+                }
+                Ok(Err(err)) => {
+                    failed += pretty_yank_count;
+                    errors.push(summarize_error(&err));
+                }
+                Err(err) => {
+                    failed += pretty_yank_count;
+                    errors.push(err.to_string());
+                }
+            },
+            Err(err) => {
+                failed += pretty_yank_count;
+                errors.push(summarize_error(&err));
             }
         }
     }
@@ -1055,6 +1081,81 @@ fn collect_yank_targets(
     (urls, total)
 }
 
+struct PrettyYankTarget {
+    count: usize,
+    entry: EntrySnapshot,
+}
+
+fn collect_pretty_yank_targets(
+    commands: &HashMap<usize, Vec<Action>>,
+    notifications: &[Notification],
+    my_prs: &[MyPullRequest],
+) -> (Vec<PrettyYankTarget>, usize) {
+    let mut entries = Vec::new();
+
+    for (index, actions) in commands {
+        let count = actions
+            .iter()
+            .filter(|action| **action == Action::PrettyYank)
+            .count();
+        if count == 0 {
+            continue;
+        }
+        let Some(entry) = entry_for_index(*index, notifications, my_prs) else {
+            continue;
+        };
+        entries.push((*index, count, entry));
+    }
+
+    entries.sort_by_key(|(index, _, _)| *index);
+
+    let mut targets = Vec::new();
+    let mut total = 0;
+    for (_, count, entry) in entries {
+        total += count;
+        targets.push(PrettyYankTarget { count, entry });
+    }
+
+    (targets, total)
+}
+
+async fn build_pretty_yank_text(
+    client: &reqwest::Client,
+    token: &str,
+    targets: &[PrettyYankTarget],
+) -> Result<String> {
+    let mut cache: HashMap<String, String> = HashMap::new();
+    let mut lines = Vec::new();
+
+    for target in targets {
+        let url = target.entry.url();
+        let formatted = if let Some(value) = cache.get(url) {
+            value.clone()
+        } else {
+            let key = parse_pull_request_key(url)
+                .ok_or_else(|| anyhow!("Pretty yank expects a pull request URL: {}", url))?;
+            let pr = fetch_pretty_pull_request(client, token, &key)
+                .await
+                .with_context(|| format!("Failed to fetch pull request details for {}", url))?;
+            let value = format_pretty_pull_request(&pr);
+            cache.insert(url.to_string(), value.clone());
+            value
+        };
+        for _ in 0..target.count {
+            lines.push(formatted.clone());
+        }
+    }
+
+    Ok(lines.join("\n\n"))
+}
+
+fn format_pretty_pull_request(pr: &PrettyPullRequest) -> String {
+    format!(
+        ":pr: [{}/{}] [{}]({}) +{}/\u{2212}{}",
+        pr.head_repo_owner, pr.head_repo_name, pr.title, pr.url, pr.additions, pr.deletions
+    )
+}
+
 async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) -> UndoSummary {
     enum UndoWork {
         MarkUnread { node_id: String },
@@ -1088,7 +1189,11 @@ async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) 
                             mark_unread = true;
                             resubscribe = true;
                         }
-                        Action::Open | Action::Yank | Action::Review | Action::Branch => {}
+                        Action::Open
+                        | Action::Yank
+                        | Action::PrettyYank
+                        | Action::Review
+                        | Action::Branch => {}
                     }
                 }
 
@@ -1365,6 +1470,15 @@ fn reset_terminal_buffers(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
     let _ = terminal.clear();
 }
 
+fn force_redraw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &AppState) -> Result<()> {
+    // External programs can invalidate the terminal contents without updating our buffers.
+    reset_terminal_buffers(terminal);
+    terminal
+        .draw(|f| ui::draw(f, app))
+        .context("render failed")?;
+    Ok(())
+}
+
 async fn execute_action(
     client: &reqwest::Client,
     token: &str,
@@ -1392,6 +1506,11 @@ async fn execute_action(
                 move || copy_to_clipboard(&url)
             })
             .await??;
+        }
+        Action::PrettyYank => {
+            return Err(anyhow!(
+                "Pretty yank should be triggered via the 'Y' action in the UI"
+            ));
         }
         Action::Read => {
             if let EntrySnapshot::Notification(notification) = entry {
@@ -1445,9 +1564,11 @@ fn is_api_action(action: Action) -> bool {
 mod tests {
     use super::{
         apply_optimistic_update, apply_undo_optimistic_update, clean_error_message,
-        collect_yank_targets, command_status, entry_for_index, handle_text_input, is_api_action,
-        parse_updated_at, repo_dir_for_full_name, sort_by_updated_at, undo_status, AppState,
-        EntrySnapshot, ExecSummary, NotificationOverride, NotificationOverrideState, UndoSummary,
+        collect_pretty_yank_targets, collect_yank_targets, command_status, entry_for_index,
+        format_pretty_pull_request, handle_text_input, is_api_action, parse_updated_at,
+        repo_dir_for_full_name, sort_by_updated_at, undo_status, AppState, EntrySnapshot,
+        ExecSummary, NotificationOverride, NotificationOverrideState, PrettyPullRequest,
+        UndoSummary,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -1758,6 +1879,11 @@ mod tests {
     }
 
     #[test]
+    fn pretty_yank_is_not_api_action() {
+        assert!(!is_api_action(Action::PrettyYank));
+    }
+
+    #[test]
     fn review_is_not_api_action() {
         assert!(!is_api_action(Action::Review));
     }
@@ -1798,6 +1924,64 @@ mod tests {
                 "https://github.com/acme/widgets/pull/3".to_string(),
                 "https://github.com/acme/widgets/pull/3".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn collect_pretty_yank_targets_orders_and_repeats() {
+        let mut first = sample_notification(true);
+        first.subject.url = "https://github.com/acme/widgets/pull/1".to_string();
+        first.url = first.subject.url.clone();
+
+        let mut second = sample_notification(true);
+        second.subject.url = "https://github.com/acme/widgets/pull/2".to_string();
+        second.url = second.subject.url.clone();
+
+        let notifications = vec![first, second];
+        let my_prs = vec![sample_my_pr_with_url(
+            "https://github.com/acme/widgets/pull/3",
+            "2024-01-01T00:00:00Z",
+        )];
+
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::PrettyYank]);
+        commands.insert(2, vec![Action::Open, Action::PrettyYank]);
+        commands.insert(3, vec![Action::PrettyYank, Action::PrettyYank]);
+
+        let (targets, count) = collect_pretty_yank_targets(&commands, &notifications, &my_prs);
+        assert_eq!(count, 4);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].count, 1);
+        assert_eq!(
+            targets[0].entry.url(),
+            "https://github.com/acme/widgets/pull/1"
+        );
+        assert_eq!(targets[1].count, 1);
+        assert_eq!(
+            targets[1].entry.url(),
+            "https://github.com/acme/widgets/pull/2"
+        );
+        assert_eq!(targets[2].count, 2);
+        assert_eq!(
+            targets[2].entry.url(),
+            "https://github.com/acme/widgets/pull/3"
+        );
+    }
+
+    #[test]
+    fn format_pretty_pull_request_matches_alias_style() {
+        let pr = PrettyPullRequest {
+            url: "https://github.com/acme/widgets/pull/42".to_string(),
+            title: "Add feature".to_string(),
+            additions: 10,
+            deletions: 2,
+            head_repo_owner: "octocat".to_string(),
+            head_repo_name: "widgets".to_string(),
+        };
+
+        assert_eq!(
+            format_pretty_pull_request(&pr),
+            ":pr: [octocat/widgets] [Add feature](https://github.com/acme/widgets/pull/42) +10/\u{2212}2"
         );
     }
 
