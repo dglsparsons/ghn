@@ -41,7 +41,7 @@ ghn
 
 3 * [Draft] someorg/repo ↻ ? PullRequest 10m
     Review requested: Update dependencies
-Commands: o open  y yank  r read  d done  q unsub/ignore  p review  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
+Commands: o open  y yank  r read  d done  q unsub/ignore  p review  b branch  U undo  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
 > 1-3r
 ```
 
@@ -54,7 +54,8 @@ Use `q` on a My PR to add it to the ignore list.
 Commands target one or more numbers followed by actions. Indices can be single numbers, comma/space lists, or ranges
 like `1-3`. You can also target status groups: `m` (merged PRs), `c` (closed PRs/issues), and `f` (draft PRs),
 as well as review states: `?` (pending review), `a` (approved), `x` (changes requested), plus `u` (unread).
-Queue multiple commands, then press `Enter` to execute.
+Queue multiple commands, then press `Enter` to execute. Press `U` then `Enter` to undo the last executed batch.
+When multiple items are yanked in a single batch, their URLs are copied together with a blank line between each.
 Consecutive digits are parsed greedily using the longest valid prefix for the current list size. If the full number
 is valid, it wins; otherwise it splits (e.g., with 50 items `123456r` -> `12 34 5 6`, with 9 items `10r` -> `1`).
 This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `3`).
@@ -67,6 +68,8 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 | Done | `d` | Mark as done (removes from inbox) |
 | Unsubscribe | `q` | Unsubscribe from thread; in My PRs, ignore PRs (saved to `~/.config/ghn/ignores.txt`) |
 | ReviewPR | `p` | Open nvim in `~/Developer/<owner>/<repo>` with `ReviewPR <url> --analyze` |
+| Branch | `b` | Copy branch name (pull requests only) |
+| Undo | `U` | Undo last executed batch (press `U` then `Enter`) |
 
 **Examples:**
 - `1o` - Open notification #1 in browser (marks it as read)
@@ -75,6 +78,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 - `5y` - Copy URL of notification #5
 - `1r` - Mark #1 as read without opening
 - `1p` - Open PR #1 in nvim using ReviewPR
+- `1b` - Copy branch name for PR #1
 - `23r` - With 10 items, marks #2 and #3; with 30 items, marks #23
 - `md` - Mark all merged PR notifications as done
 - `cd` - Mark all closed PR/issue notifications as done
@@ -88,9 +92,10 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 |-----|--------|
 | `0-9` | Build number for command |
 | `-` / `,` / `Space` | Range or list separators |
-| `o/y/r/d/q/p` | Queue action for current number |
+| `o/y/r/d/q/p/b` | Queue action for current number |
 | `p` | Review PR in nvim |
 | `Enter` | Execute all queued commands |
+| `U` | Undo last executed batch (press `U` then `Enter`) |
 | `Esc` | Clear command buffer |
 | `Backspace` | Delete last character |
 | `Ctrl+A` | Move cursor to start of input |
@@ -115,6 +120,7 @@ When you queue a command, the targeted notification highlights with a color indi
 | Read | Gray/Dim |
 | Done | Green |
 | Unsubscribe | Red |
+| Branch | Light Blue |
 
 PRs also show a CI indicator: `✓` success, `↻` running/pending, `✗` failed.
 Review indicators show status: `?` pending review, `A` approved, `X` changes requested.

@@ -248,6 +248,9 @@ mod tests {
 
         let result = parse_commands("4p", 10, &targets);
         assert_eq!(result.get(&4), Some(&vec![Action::Review]));
+
+        let result = parse_commands("6b", 10, &targets);
+        assert_eq!(result.get(&6), Some(&vec![Action::Branch]));
     }
 
     #[test]

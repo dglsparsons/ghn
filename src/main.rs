@@ -33,8 +33,11 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
     commands::is_target_char,
-    github::{fetch_notifications_and_my_prs, mark_as_done, mark_as_read, unsubscribe},
-    ignore::{append_ignored_pr, load_ignored_prs},
+    github::{
+        fetch_notifications_and_my_prs, mark_as_done, mark_as_read, mark_as_unread,
+        subscribe_to_thread, unsubscribe,
+    },
+    ignore::{append_ignored_pr, load_ignored_prs, remove_ignored_pr},
     types::{Action, MyPullRequest, Notification},
     util::{copy_to_clipboard, format_relative_time, gh_auth_token, open_in_browser},
 };
@@ -56,6 +59,7 @@ enum AppEvent {
     },
     Error(String),
     CommandResult(ExecSummary),
+    UndoResult(UndoSummary),
     Review(ReviewRequest),
 }
 
@@ -79,6 +83,9 @@ pub struct AppState {
     pub my_pr_relative_times: Vec<String>,
     pub ignored_prs: HashSet<String>,
     notification_overrides: HashMap<String, NotificationOverride>,
+    last_undo: Option<UndoBatch>,
+    undo_in_flight: bool,
+    command_in_flight: bool,
 }
 
 impl AppState {
@@ -98,6 +105,9 @@ impl AppState {
             my_pr_relative_times: Vec::new(),
             ignored_prs,
             notification_overrides: HashMap::new(),
+            last_undo: None,
+            undo_in_flight: false,
+            command_in_flight: false,
         }
     }
 
@@ -133,7 +143,10 @@ impl AppState {
         self.update_pending();
     }
 
-    fn apply_notification_overrides(&mut self, notifications: Vec<Notification>) -> Vec<Notification> {
+    fn apply_notification_overrides(
+        &mut self,
+        notifications: Vec<Notification>,
+    ) -> Vec<Notification> {
         if self.notification_overrides.is_empty() {
             return notifications;
         }
@@ -277,9 +290,15 @@ async fn run_app(
                         app.status = Some(clean_error_message(&message));
                         app.status_sticky = true;
                         app.loading = false;
+                        if app.command_in_flight {
+                            app.command_in_flight = false;
+                        }
                     }
                     AppEvent::CommandResult(result) => {
                         handle_command_result(&mut app, &refresh_tx, result);
+                    }
+                    AppEvent::UndoResult(result) => {
+                        handle_undo_result(&mut app, &refresh_tx, result);
                     }
                     AppEvent::Review(request) => {
                         let result = run_review_in_nvim(terminal, &request);
@@ -387,6 +406,11 @@ fn submit_commands(
     client: &reqwest::Client,
     token: &str,
 ) -> Result<()> {
+    let command_text = app.command_text();
+    if is_undo_command(&command_text) {
+        return submit_undo(app, app_event_tx, client, token);
+    }
+
     let pending = ui::build_pending_map(&app.command_text(), &app.notifications, &app.my_prs);
     if pending.is_empty() {
         app.status = Some("No commands to run".to_string());
@@ -420,6 +444,11 @@ fn submit_commands(
         return Ok(());
     }
 
+    app.last_undo = Some(UndoBatch {
+        commands: pending.clone(),
+        snapshot: snapshot_state(app),
+    });
+
     let notifications_snapshot = app.notifications.clone();
     let my_prs_snapshot = app.my_prs.clone();
     let action_total: usize = pending.values().map(Vec::len).sum();
@@ -427,6 +456,7 @@ fn submit_commands(
     apply_optimistic_update(app, &pending);
     app.status = Some(format!("Executing {} actions...", action_total));
     app.status_sticky = false;
+    app.command_in_flight = true;
     app.clear_commands();
 
     let client = client.clone();
@@ -456,6 +486,52 @@ fn submit_commands(
     Ok(())
 }
 
+fn submit_undo(
+    app: &mut AppState,
+    app_event_tx: &mpsc::Sender<AppEvent>,
+    client: &reqwest::Client,
+    token: &str,
+) -> Result<()> {
+    if app.undo_in_flight {
+        app.status = Some("Undo already running".to_string());
+        app.status_sticky = false;
+        app.clear_commands();
+        return Ok(());
+    }
+
+    if app.command_in_flight {
+        app.status = Some("Wait for actions to finish before undoing".to_string());
+        app.status_sticky = false;
+        app.clear_commands();
+        return Ok(());
+    }
+
+    let Some(batch) = app.last_undo.clone() else {
+        app.status = Some("Nothing to undo".to_string());
+        app.status_sticky = false;
+        app.clear_commands();
+        return Ok(());
+    };
+
+    restore_snapshot(app, &batch.snapshot);
+    apply_undo_optimistic_update(app, &batch.commands);
+    app.status = Some("Undoing last actions...".to_string());
+    app.status_sticky = false;
+    app.undo_in_flight = true;
+    app.clear_commands();
+
+    let client = client.clone();
+    let token = token.to_string();
+    let app_event_tx = app_event_tx.clone();
+
+    tokio::spawn(async move {
+        let summary = execute_undo(&client, &token, &batch).await;
+        let _ = app_event_tx.send(AppEvent::UndoResult(summary)).await;
+    });
+
+    Ok(())
+}
+
 fn split_review_action(
     commands: &HashMap<usize, Vec<Action>>,
     notifications: &[Notification],
@@ -464,7 +540,10 @@ fn split_review_action(
     let mut review_index = None;
 
     for (index, actions) in commands {
-        if actions.iter().any(|action| matches!(action, Action::Review)) {
+        if actions
+            .iter()
+            .any(|action| matches!(action, Action::Review))
+        {
             if review_index.is_some() {
                 return Err(anyhow!("ReviewPR expects a single target"));
             }
@@ -541,7 +620,7 @@ fn handle_text_input(app: &mut AppState, key: crossterm::event::KeyEvent) {
             && !(ch.is_ascii_digit()
                 || Action::from_char(ch).is_some()
                 || is_target_char(ch)
-                || matches!(ch, ' ' | ',' | '-'))
+                || matches!(ch, ' ' | ',' | '-' | 'U'))
         {
             return;
         }
@@ -550,6 +629,10 @@ fn handle_text_input(app: &mut AppState, key: crossterm::event::KeyEvent) {
     if app.input.input(key) {
         app.update_pending();
     }
+}
+
+fn is_undo_command(input: &str) -> bool {
+    input.trim() == "U"
 }
 
 fn sort_by_updated_at<T>(items: &mut [T], updated_at: impl Fn(&T) -> &str) {
@@ -576,6 +659,20 @@ enum NotificationOverrideState {
 struct NotificationOverride {
     state: NotificationOverrideState,
     marked_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct UndoSnapshot {
+    notifications: Vec<Notification>,
+    my_prs: Vec<MyPullRequest>,
+    ignored_prs: HashSet<String>,
+    notification_overrides: HashMap<String, NotificationOverride>,
+}
+
+#[derive(Debug, Clone)]
+struct UndoBatch {
+    commands: HashMap<usize, Vec<Action>>,
+    snapshot: UndoSnapshot,
 }
 
 fn record_override_state(
@@ -613,6 +710,23 @@ fn record_notification_override(
         });
 }
 
+fn snapshot_state(app: &AppState) -> UndoSnapshot {
+    UndoSnapshot {
+        notifications: app.notifications.clone(),
+        my_prs: app.my_prs.clone(),
+        ignored_prs: app.ignored_prs.clone(),
+        notification_overrides: app.notification_overrides.clone(),
+    }
+}
+
+fn restore_snapshot(app: &mut AppState, snapshot: &UndoSnapshot) {
+    app.notifications = snapshot.notifications.clone();
+    app.my_prs = snapshot.my_prs.clone();
+    app.ignored_prs = snapshot.ignored_prs.clone();
+    app.notification_overrides = snapshot.notification_overrides.clone();
+    app.refresh_relative_times();
+}
+
 fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Action>>) {
     let notification_count = app.notifications.len();
     let mut remove_notifications: Vec<usize> = Vec::new();
@@ -640,7 +754,10 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
                             if !app.include_read {
                                 remove = true;
                             }
-                            record_override_state(&mut override_state, NotificationOverrideState::Read);
+                            record_override_state(
+                                &mut override_state,
+                                NotificationOverrideState::Read,
+                            );
                         }
                         Action::Done | Action::Unsubscribe => {
                             notification.unread = false;
@@ -650,7 +767,7 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
                                 NotificationOverrideState::Suppress,
                             );
                         }
-                        Action::Yank | Action::Review => {}
+                        Action::Yank | Action::Review | Action::Branch => {}
                     }
                 }
 
@@ -662,7 +779,11 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
             };
 
             if let Some(state) = override_state {
-                record_notification_override(&mut app.notification_overrides, &notification_id, state);
+                record_notification_override(
+                    &mut app.notification_overrides,
+                    &notification_id,
+                    state,
+                );
             }
         } else {
             let idx = index.saturating_sub(notification_count + 1);
@@ -703,6 +824,29 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
     app.refresh_relative_times();
 }
 
+fn apply_undo_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Action>>) {
+    let notification_count = app.notifications.len();
+
+    for (index, actions) in commands {
+        if *index == 0 || *index > notification_count {
+            continue;
+        }
+
+        let restore_unread = actions
+            .iter()
+            .any(|action| matches!(action, Action::Read | Action::Done | Action::Unsubscribe));
+        if !restore_unread {
+            continue;
+        }
+
+        if let Some(notification) = app.notifications.get_mut(index.saturating_sub(1)) {
+            notification.unread = true;
+        }
+    }
+
+    app.refresh_relative_times();
+}
+
 struct ActionOutcome {
     refresh: bool,
 }
@@ -716,13 +860,36 @@ struct ExecSummary {
     refresh: bool,
 }
 
+#[derive(Debug)]
+struct UndoSummary {
+    succeeded: usize,
+    failed: usize,
+    errors: Vec<String>,
+    refresh: bool,
+    attempted: bool,
+}
+
 fn handle_command_result(app: &mut AppState, refresh_tx: &mpsc::Sender<()>, result: ExecSummary) {
     let (message, refresh, sticky) = command_status(&result);
     app.status = Some(message);
     app.status_sticky = sticky;
     app.executing.clear();
+    app.command_in_flight = false;
     if refresh {
         let _ = refresh_tx.try_send(());
+    }
+}
+
+fn handle_undo_result(app: &mut AppState, refresh_tx: &mpsc::Sender<()>, result: UndoSummary) {
+    let (message, refresh, sticky) = undo_status(&result);
+    app.status = Some(message);
+    app.status_sticky = sticky;
+    app.undo_in_flight = false;
+    if refresh {
+        let _ = refresh_tx.try_send(());
+    }
+    if !result.attempted || result.failed == 0 {
+        app.last_undo = None;
     }
 }
 
@@ -743,6 +910,27 @@ fn command_status(result: &ExecSummary) -> (String, bool, bool) {
     )
 }
 
+fn undo_status(result: &UndoSummary) -> (String, bool, bool) {
+    if !result.attempted {
+        return ("Nothing to undo".to_string(), false, false);
+    }
+
+    if result.failed > 0 {
+        let sample = result
+            .errors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        return (sample, result.refresh, true);
+    }
+
+    (
+        format!("Undid {} actions", result.succeeded),
+        result.refresh,
+        false,
+    )
+}
+
 async fn execute_commands(
     client: &reqwest::Client,
     token: &str,
@@ -751,6 +939,7 @@ async fn execute_commands(
     my_prs: &[MyPullRequest],
 ) -> Result<ExecSummary> {
     let mut tasks = Vec::new();
+    let (yank_urls, yank_count) = collect_yank_targets(commands, notifications, my_prs);
 
     for (index, actions) in commands {
         let entry = match entry_for_index(*index, notifications, my_prs) {
@@ -761,6 +950,9 @@ async fn execute_commands(
         let url = entry.url().to_string();
         for action in actions {
             let action = *action;
+            if action == Action::Yank {
+                continue;
+            }
             let entry = entry.clone();
             let client = client.clone();
             let token = token.to_string();
@@ -778,6 +970,23 @@ async fn execute_commands(
     let mut errors = Vec::new();
     let mut api_failed = false;
     let mut refresh = false;
+
+    if yank_count > 0 {
+        let text = yank_urls.join("\n\n");
+        match tokio::task::spawn_blocking(move || copy_to_clipboard(&text)).await {
+            Ok(Ok(())) => {
+                succeeded += yank_count;
+            }
+            Ok(Err(err)) => {
+                failed += yank_count;
+                errors.push(summarize_error(&err));
+            }
+            Err(err) => {
+                failed += yank_count;
+                errors.push(err.to_string());
+            }
+        }
+    }
 
     for task in tasks {
         match task.await {
@@ -809,6 +1018,150 @@ async fn execute_commands(
         api_failed,
         refresh,
     })
+}
+
+fn collect_yank_targets(
+    commands: &HashMap<usize, Vec<Action>>,
+    notifications: &[Notification],
+    my_prs: &[MyPullRequest],
+) -> (Vec<String>, usize) {
+    let mut entries = Vec::new();
+
+    for (index, actions) in commands {
+        let count = actions
+            .iter()
+            .filter(|action| **action == Action::Yank)
+            .count();
+        if count == 0 {
+            continue;
+        }
+        let Some(entry) = entry_for_index(*index, notifications, my_prs) else {
+            continue;
+        };
+        entries.push((*index, count, entry.url().to_string()));
+    }
+
+    entries.sort_by_key(|(index, _, _)| *index);
+
+    let mut urls = Vec::new();
+    let mut total = 0;
+    for (_, count, url) in entries {
+        total += count;
+        for _ in 0..count {
+            urls.push(url.clone());
+        }
+    }
+
+    (urls, total)
+}
+
+async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) -> UndoSummary {
+    enum UndoWork {
+        MarkUnread { node_id: String },
+        Resubscribe { thread_id: String },
+        Unignore { url: String },
+    }
+
+    let mut tasks = Vec::new();
+    let mut refresh = false;
+
+    for (index, actions) in &batch.commands {
+        let entry = match entry_for_index(
+            *index,
+            &batch.snapshot.notifications,
+            &batch.snapshot.my_prs,
+        ) {
+            Some(entry) => entry,
+            None => continue,
+        };
+
+        match entry {
+            EntrySnapshot::Notification(notification) => {
+                let mut mark_unread = false;
+                let mut resubscribe = false;
+                for action in actions {
+                    match action {
+                        Action::Read | Action::Done => {
+                            mark_unread = true;
+                        }
+                        Action::Unsubscribe => {
+                            mark_unread = true;
+                            resubscribe = true;
+                        }
+                        Action::Open | Action::Yank | Action::Review | Action::Branch => {}
+                    }
+                }
+
+                if mark_unread {
+                    refresh = true;
+                    tasks.push(UndoWork::MarkUnread {
+                        node_id: notification.node_id.clone(),
+                    });
+                }
+                if resubscribe {
+                    refresh = true;
+                    tasks.push(UndoWork::Resubscribe {
+                        thread_id: notification.id.clone(),
+                    });
+                }
+            }
+            EntrySnapshot::MyPullRequest(pr) => {
+                if actions.iter().any(|action| *action == Action::Unsubscribe) {
+                    tasks.push(UndoWork::Unignore {
+                        url: pr.url.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    let attempted = !tasks.is_empty();
+    let mut futures = Vec::new();
+
+    for task in tasks {
+        let client = client.clone();
+        let token = token.to_string();
+        let future = match task {
+            UndoWork::MarkUnread { node_id } => {
+                tokio::spawn(async move { mark_as_unread(&client, &token, &node_id).await })
+            }
+            UndoWork::Resubscribe { thread_id } => {
+                tokio::spawn(async move { subscribe_to_thread(&client, &token, &thread_id).await })
+            }
+            UndoWork::Unignore { url } => {
+                tokio::spawn(async move { remove_ignored_pr(&url).map(|_| ()) })
+            }
+        };
+        futures.push(future);
+    }
+
+    let mut succeeded = 0;
+    let mut failed = 0;
+    let mut errors = Vec::new();
+
+    for future in futures {
+        match future.await {
+            Ok(Ok(())) => {
+                succeeded += 1;
+            }
+            Ok(Err(err)) => {
+                failed += 1;
+                errors.push(summarize_error(&err));
+            }
+            Err(err) => {
+                failed += 1;
+                errors.push(err.to_string());
+            }
+        }
+    }
+
+    UndoSummary {
+        succeeded,
+        failed,
+        errors,
+        refresh,
+        attempted,
+    }
 }
 
 fn summarize_error(err: &anyhow::Error) -> String {
@@ -856,6 +1209,13 @@ impl EntrySnapshot {
         match self {
             EntrySnapshot::Notification(notification) => &notification.subject.url,
             EntrySnapshot::MyPullRequest(pr) => &pr.subject.url,
+        }
+    }
+
+    fn branch_name(&self) -> Option<&str> {
+        match self {
+            EntrySnapshot::Notification(notification) => notification.subject.head_ref.as_deref(),
+            EntrySnapshot::MyPullRequest(pr) => pr.subject.head_ref.as_deref(),
         }
     }
 
@@ -1053,6 +1413,16 @@ async fn execute_action(
             EntrySnapshot::MyPullRequest(_) => {
                 append_ignored_pr(url)?;
             }
+        },
+        Action::Branch => {
+            let branch = entry
+                .branch_name()
+                .ok_or_else(|| anyhow!("Branch name unavailable"))?;
+            tokio::task::spawn_blocking({
+                let branch = branch.to_string();
+                move || copy_to_clipboard(&branch)
+            })
+            .await??;
         }
         Action::Review => {
             return Err(anyhow!(
@@ -1065,16 +1435,19 @@ async fn execute_action(
 }
 
 fn is_api_action(action: Action) -> bool {
-    matches!(action, Action::Open | Action::Read | Action::Done | Action::Unsubscribe)
+    matches!(
+        action,
+        Action::Open | Action::Read | Action::Done | Action::Unsubscribe
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_optimistic_update, clean_error_message, command_status, entry_for_index,
-        handle_text_input, is_api_action, parse_updated_at, repo_dir_for_full_name,
-        sort_by_updated_at, AppState, EntrySnapshot, ExecSummary, NotificationOverride,
-        NotificationOverrideState,
+        apply_optimistic_update, apply_undo_optimistic_update, clean_error_message,
+        collect_yank_targets, command_status, entry_for_index, handle_text_input, is_api_action,
+        parse_updated_at, repo_dir_for_full_name, sort_by_updated_at, undo_status, AppState,
+        EntrySnapshot, ExecSummary, NotificationOverride, NotificationOverrideState, UndoSummary,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -1106,6 +1479,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
+                head_ref: Some("feature/branch".to_string()),
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -1134,6 +1508,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
+                head_ref: Some("feature/branch".to_string()),
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -1207,6 +1582,13 @@ mod tests {
     }
 
     #[test]
+    fn allows_undo_command_input() {
+        let mut app = AppState::new(true, HashSet::new());
+        handle_text_input(&mut app, key_event(KeyCode::Char('U'), KeyModifiers::NONE));
+        assert_eq!(app.command_text(), "U");
+    }
+
+    #[test]
     fn command_status_success_message() {
         let result = ExecSummary {
             succeeded: 3,
@@ -1251,6 +1633,53 @@ mod tests {
         let (message, refresh, sticky) = command_status(&result);
         assert_eq!(message, "boom");
         assert!(refresh);
+        assert!(sticky);
+    }
+
+    #[test]
+    fn undo_status_success_message() {
+        let result = UndoSummary {
+            succeeded: 2,
+            failed: 0,
+            errors: Vec::new(),
+            refresh: true,
+            attempted: true,
+        };
+
+        let (message, refresh, sticky) = undo_status(&result);
+        assert_eq!(message, "Undid 2 actions");
+        assert!(refresh);
+        assert!(!sticky);
+    }
+
+    #[test]
+    fn undo_status_handles_empty() {
+        let result = UndoSummary {
+            succeeded: 0,
+            failed: 0,
+            errors: Vec::new(),
+            refresh: false,
+            attempted: false,
+        };
+
+        let (message, refresh, sticky) = undo_status(&result);
+        assert_eq!(message, "Nothing to undo");
+        assert!(!refresh);
+        assert!(!sticky);
+    }
+
+    #[test]
+    fn undo_status_failure_is_sticky() {
+        let result = UndoSummary {
+            succeeded: 1,
+            failed: 1,
+            errors: vec!["nope".to_string()],
+            refresh: false,
+            attempted: true,
+        };
+
+        let (message, _refresh, sticky) = undo_status(&result);
+        assert_eq!(message, "nope");
         assert!(sticky);
     }
 
@@ -1307,6 +1736,18 @@ mod tests {
     }
 
     #[test]
+    fn undo_marks_notifications_unread() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.notifications = vec![sample_notification(false)];
+
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::Read]);
+
+        apply_undo_optimistic_update(&mut app, &commands);
+        assert!(app.notifications[0].unread);
+    }
+
+    #[test]
     fn open_is_api_action() {
         assert!(is_api_action(Action::Open));
     }
@@ -1319,6 +1760,45 @@ mod tests {
     #[test]
     fn review_is_not_api_action() {
         assert!(!is_api_action(Action::Review));
+    }
+
+    #[test]
+    fn branch_is_not_api_action() {
+        assert!(!is_api_action(Action::Branch));
+    }
+
+    #[test]
+    fn collect_yank_targets_orders_and_repeats() {
+        let mut first = sample_notification(true);
+        first.subject.url = "https://github.com/acme/widgets/pull/1".to_string();
+        first.url = first.subject.url.clone();
+
+        let mut second = sample_notification(true);
+        second.subject.url = "https://github.com/acme/widgets/issues/2".to_string();
+        second.url = second.subject.url.clone();
+
+        let notifications = vec![first, second];
+        let my_prs = vec![sample_my_pr_with_url(
+            "https://github.com/acme/widgets/pull/3",
+            "2024-01-01T00:00:00Z",
+        )];
+
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::Yank]);
+        commands.insert(2, vec![Action::Open, Action::Yank]);
+        commands.insert(3, vec![Action::Yank, Action::Yank]);
+
+        let (urls, count) = collect_yank_targets(&commands, &notifications, &my_prs);
+        assert_eq!(count, 4);
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/acme/widgets/pull/1".to_string(),
+                "https://github.com/acme/widgets/issues/2".to_string(),
+                "https://github.com/acme/widgets/pull/3".to_string(),
+                "https://github.com/acme/widgets/pull/3".to_string(),
+            ]
+        );
     }
 
     #[test]

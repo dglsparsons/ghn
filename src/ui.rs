@@ -14,10 +14,11 @@ use crate::{
 };
 
 const COMMANDS_FULL: &str =
-    "Commands: o open/read  y yank  r read  d done  q unsub/ignore  p review";
-const COMMANDS_COMPACT: &str = "Cmds: o open/read  y yank  r read  d done  q unsub/ign  p review";
-const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q/p";
-const COMMANDS_TINY: &str = "o y r d q p";
+    "Commands: o open/read  y yank  r read  d done  q unsub/ignore  p review  b branch  U undo";
+const COMMANDS_COMPACT: &str =
+    "Cmds: o open/read  y yank  r read  d done  q unsub/ign  p review  b branch  U undo";
+const COMMANDS_SHORT: &str = "Cmds o/y/r/d/q/p/b/U";
+const COMMANDS_TINY: &str = "o y r d q p b U";
 
 const TARGETS_FULL: &str =
     "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft";
@@ -525,6 +526,7 @@ fn action_color(action: Action) -> Color {
         Action::Done => Color::Green,
         Action::Unsubscribe => Color::Red,
         Action::Review => Color::Cyan,
+        Action::Branch => Color::LightBlue,
     }
 }
 
@@ -770,7 +772,12 @@ fn filter_pending_actions(
         let entry = if index <= notifications.len() {
             notifications
                 .get(index - 1)
-                .map(|_| PendingEntry::Notification)
+                .map(|notification| PendingEntry::Notification {
+                    is_pull_request: notification
+                        .subject
+                        .kind
+                        .eq_ignore_ascii_case("pullrequest"),
+                })
         } else {
             let idx = index.saturating_sub(notifications.len() + 1);
             my_prs.get(idx).map(|_| PendingEntry::MyPullRequest)
@@ -793,29 +800,34 @@ fn filter_pending_actions(
 }
 
 enum PendingEntry {
-    Notification,
+    Notification { is_pull_request: bool },
     MyPullRequest,
 }
 
 fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
     match entry {
-        PendingEntry::Notification => true,
-        // My PRs don't have notification semantics, so ignore read/done; q maps to ignore.
-        PendingEntry::MyPullRequest => {
-            matches!(
-                action,
-                Action::Open | Action::Yank | Action::Unsubscribe | Action::Review
-            )
+        PendingEntry::Notification { is_pull_request } => {
+            if matches!(action, Action::Branch) {
+                *is_pull_request
+            } else {
+                true
+            }
         }
+        // My PRs don't have notification semantics, so ignore read/done; q maps to ignore.
+        PendingEntry::MyPullRequest => matches!(
+            action,
+            Action::Open | Action::Yank | Action::Unsubscribe | Action::Review | Action::Branch
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        action_marker, base_notification_style, build_pending_map, build_status_lines, ci_indicator,
-        kind_color, layout_widths, pending_style, review_indicator, select_legend_lines,
-        status_prefixes, truncate_with_suffix, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
+        action_marker, base_notification_style, build_pending_map, build_status_lines,
+        ci_indicator, kind_color, layout_widths, pending_style, review_indicator,
+        select_legend_lines, status_prefixes, truncate_with_suffix, COMMANDS_FULL,
+        READ_NOTIFICATION_COLOR, TARGETS_FULL,
     };
     use crate::types::{
         Action, CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject,
@@ -841,6 +853,7 @@ mod tests {
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -863,6 +876,7 @@ mod tests {
                     status: vec![SubjectStatus::Closed],
                     ci_status: None,
                     review_status: None,
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -891,6 +905,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
+                head_ref: None,
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -922,6 +937,7 @@ mod tests {
                     status: Vec::new(),
                     ci_status: None,
                     review_status: Some(ReviewStatus::ReviewRequired),
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -944,6 +960,7 @@ mod tests {
                     status: vec![SubjectStatus::Merged],
                     ci_status: None,
                     review_status: Some(ReviewStatus::ReviewRequired),
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -966,6 +983,7 @@ mod tests {
                     status: vec![SubjectStatus::Draft],
                     ci_status: None,
                     review_status: Some(ReviewStatus::ReviewRequired),
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -988,6 +1006,7 @@ mod tests {
                     status: Vec::new(),
                     ci_status: None,
                     review_status: Some(ReviewStatus::Approved),
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -1010,6 +1029,7 @@ mod tests {
                     status: Vec::new(),
                     ci_status: None,
                     review_status: Some(ReviewStatus::ChangesRequested),
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -1033,6 +1053,68 @@ mod tests {
     }
 
     #[test]
+    fn build_pending_map_filters_branch_for_non_pr() {
+        let my_prs = Vec::new();
+        let notifications = vec![Notification {
+            id: "thread-1".to_string(),
+            node_id: "node-1".to_string(),
+            subject_id: None,
+            unread: true,
+            reason: "mention".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: Subject {
+                title: "Issue".to_string(),
+                url: "https://github.com/acme/widgets/issues/1".to_string(),
+                kind: "Issue".to_string(),
+                status: Vec::new(),
+                ci_status: None,
+                review_status: None,
+                head_ref: None,
+            },
+            repository: Repository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+                merge_settings: None,
+            },
+            url: "https://github.com/acme/widgets/issues/1".to_string(),
+        }];
+
+        let pending = build_pending_map("1b", &notifications, &my_prs);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn build_pending_map_allows_branch_for_pr() {
+        let my_prs = Vec::new();
+        let notifications = vec![Notification {
+            id: "thread-1".to_string(),
+            node_id: "node-1".to_string(),
+            subject_id: Some("pr-1".to_string()),
+            unread: true,
+            reason: "mention".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: Subject {
+                title: "PR".to_string(),
+                url: "https://github.com/acme/widgets/pull/1".to_string(),
+                kind: "PullRequest".to_string(),
+                status: Vec::new(),
+                ci_status: None,
+                review_status: None,
+                head_ref: Some("feature/branch".to_string()),
+            },
+            repository: Repository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+                merge_settings: None,
+            },
+            url: "https://github.com/acme/widgets/pull/1".to_string(),
+        }];
+
+        let pending = build_pending_map("1b", &notifications, &my_prs);
+        assert_eq!(pending.get(&1), Some(&vec![Action::Branch]));
+    }
+
+    #[test]
     fn build_pending_map_targets_multiple_statuses() {
         let my_prs = Vec::new();
         let notifications = vec![Notification {
@@ -1049,6 +1131,7 @@ mod tests {
                 status: vec![SubjectStatus::Draft, SubjectStatus::Closed],
                 ci_status: None,
                 review_status: None,
+                head_ref: None,
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -1083,6 +1166,7 @@ mod tests {
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -1105,6 +1189,7 @@ mod tests {
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -1136,6 +1221,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
+                head_ref: None,
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -1155,6 +1241,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
+                head_ref: None,
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -1188,6 +1275,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
+                head_ref: None,
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -1247,6 +1335,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: Some(ReviewStatus::ReviewRequired),
+                head_ref: None,
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -1276,6 +1365,7 @@ mod tests {
                 status: vec![SubjectStatus::Closed],
                 ci_status: None,
                 review_status: Some(ReviewStatus::ReviewRequired),
+                head_ref: None,
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -1304,6 +1394,7 @@ mod tests {
                 status: vec![SubjectStatus::Draft],
                 ci_status: None,
                 review_status: Some(ReviewStatus::ReviewRequired),
+                head_ref: None,
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -1388,6 +1479,7 @@ mod tests {
             status: vec![SubjectStatus::Draft],
             ci_status: None,
             review_status: None,
+            head_ref: None,
         };
 
         let labels = status_prefixes(&subject);
@@ -1410,6 +1502,7 @@ mod tests {
             status: vec![SubjectStatus::Closed, SubjectStatus::Draft],
             ci_status: None,
             review_status: None,
+            head_ref: None,
         };
 
         let labels = status_prefixes(&subject);
@@ -1427,6 +1520,7 @@ mod tests {
             status: Vec::new(),
             ci_status: Some(CiStatus::Failure),
             review_status: None,
+            head_ref: None,
         };
 
         let indicator = ci_indicator(&subject).expect("ci indicator");

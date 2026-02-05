@@ -30,6 +30,7 @@ pub struct Subject {
     pub status: Vec<SubjectStatus>,
     pub ci_status: Option<CiStatus>,
     pub review_status: Option<ReviewStatus>,
+    pub head_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -136,6 +137,7 @@ pub enum Action {
     Done,
     Unsubscribe,
     Review,
+    Branch,
 }
 
 impl Action {
@@ -147,6 +149,7 @@ impl Action {
             'd' => Some(Self::Done),
             'q' => Some(Self::Unsubscribe),
             'p' => Some(Self::Review),
+            'b' => Some(Self::Branch),
             _ => None,
         }
     }
@@ -159,6 +162,7 @@ impl Action {
             Self::Done => 'd',
             Self::Unsubscribe => 'q',
             Self::Review => 'p',
+            Self::Branch => 'b',
         }
     }
 }
@@ -188,6 +192,7 @@ mod tests {
             ('d', Action::Done),
             ('q', Action::Unsubscribe),
             ('p', Action::Review),
+            ('b', Action::Branch),
         ];
 
         for (ch, action) in pairs {

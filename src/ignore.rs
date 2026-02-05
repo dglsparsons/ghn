@@ -117,9 +117,62 @@ pub fn append_ignored_pr(url: &str) -> Result<bool> {
     Ok(true)
 }
 
+pub fn remove_ignored_pr(url: &str) -> Result<bool> {
+    // Serialize read/write to keep the file consistent when multiple actions run concurrently.
+    let _guard = ignore_lock().lock().expect("ignore list lock poisoned");
+    let path = ignores_path()?;
+
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to open ignore list: {}", path.display()));
+        }
+    };
+
+    let reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut removed = false;
+
+    for line in reader.lines() {
+        let line = line.context("failed to read ignore list")?;
+        if line.trim() == url {
+            removed = true;
+            continue;
+        }
+        lines.push(line);
+    }
+
+    if !removed {
+        return Ok(false);
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create ignore list directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut file = File::create(&path)
+        .with_context(|| format!("failed to open ignore list: {}", path.display()))?;
+
+    for line in lines {
+        writeln!(file, "{}", line)
+            .with_context(|| format!("failed to write ignore list: {}", path.display()))?;
+    }
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{append_ignored_pr, ignores_path, load_ignored_prs};
+    use super::{append_ignored_pr, ignores_path, load_ignored_prs, remove_ignored_pr};
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
@@ -221,5 +274,44 @@ mod tests {
         assert_eq!(ignores.len(), 2);
         assert!(ignores.contains("https://github.com/acme/widgets/pull/1"));
         assert!(ignores.contains("https://github.com/acme/widgets/pull/2"));
+    }
+
+    #[test]
+    fn remove_ignored_pr_removes_only_target() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = TempConfigEnv::new();
+
+        let path = ignores_path().unwrap();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let contents = [
+            "# keep comment",
+            "https://github.com/acme/widgets/pull/1",
+            "",
+            "https://github.com/acme/widgets/pull/2",
+        ]
+        .join("\n");
+        fs::write(&path, contents).unwrap();
+
+        assert!(remove_ignored_pr("https://github.com/acme/widgets/pull/1").unwrap());
+
+        let updated = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = updated.lines().collect();
+        assert!(lines.contains(&"# keep comment"));
+        assert!(lines.contains(&"https://github.com/acme/widgets/pull/2"));
+        assert!(!lines.contains(&"https://github.com/acme/widgets/pull/1"));
+    }
+
+    #[test]
+    fn remove_ignored_pr_returns_false_when_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = TempConfigEnv::new();
+
+        let path = ignores_path().unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert!(!remove_ignored_pr("https://github.com/acme/widgets/pull/1").unwrap());
     }
 }

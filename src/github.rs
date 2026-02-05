@@ -9,6 +9,8 @@ use crate::types::{
 };
 
 const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
+const GITHUB_API: &str = "https://api.github.com";
+const GITHUB_API_VERSION: &str = "2022-11-28";
 
 #[derive(Debug, Deserialize)]
 struct NotificationsData {
@@ -48,6 +50,7 @@ struct GraphQlSubject {
     state: Option<String>,
     is_draft: Option<bool>,
     review_decision: Option<String>,
+    head_ref_name: Option<String>,
     commits: Option<GraphQlPullRequestCommits>,
     repository: Option<GraphQlRepository>,
 }
@@ -95,6 +98,7 @@ struct GraphQlPullRequest {
     updated_at: String,
     is_draft: bool,
     review_decision: Option<String>,
+    head_ref_name: String,
     repository: GraphQlRepository,
     commits: Option<GraphQlPullRequestCommits>,
 }
@@ -135,6 +139,7 @@ query GetNotifications($statuses: [NotificationStatus!]) {
             state
             isDraft
             reviewDecision
+            headRefName
             repository {
               name
               nameWithOwner
@@ -175,6 +180,7 @@ query GetMyPullRequests($query: String!) {
         updatedAt
         isDraft
         reviewDecision
+        headRefName
         repository {
           name
           nameWithOwner
@@ -233,6 +239,36 @@ fn parse_subject_type(url: &str) -> String {
     } else {
         "Unknown".to_string()
     }
+}
+
+fn normalize_pr_url(url: &str) -> String {
+    if !url.contains("/pull/") {
+        return url.to_string();
+    }
+
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+
+    if let Some(idx) = without_query.find("/pull/") {
+        let after = &without_query[idx + "/pull/".len()..];
+        let mut digits_len = 0;
+        for ch in after.chars() {
+            if ch.is_ascii_digit() {
+                digits_len += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        if digits_len > 0 {
+            return without_query[..idx + "/pull/".len() + digits_len].to_string();
+        }
+    }
+
+    without_query.to_string()
 }
 
 fn subject_statuses(kind: &str, subject: Option<&GraphQlSubject>) -> Vec<SubjectStatus> {
@@ -335,22 +371,29 @@ fn merge_settings_from_repo(repo: &GraphQlRepository) -> MergeSettings {
 }
 
 fn transform_notification(gql: GraphQlNotification) -> Notification {
-    let repo_full_name = parse_repo_from_url(&gql.url);
-    let kind = parse_subject_type(&gql.url);
+    let normalized_url = normalize_pr_url(&gql.url);
+    let repo_full_name = parse_repo_from_url(&normalized_url);
+    let kind = parse_subject_type(&normalized_url);
     let optional_subject = gql.optional_subject;
     let status = subject_statuses(&kind, optional_subject.as_ref());
     let ci_status = subject_ci_status(&kind, optional_subject.as_ref());
     let review_status = subject_review_status(&kind, optional_subject.as_ref());
+    let head_ref = optional_subject
+        .as_ref()
+        .and_then(|subject| subject.head_ref_name.clone());
     let subject = Subject {
         title: gql.title,
-        url: gql.url.clone(),
+        url: normalized_url.clone(),
         kind,
         status,
         ci_status,
         review_status,
+        head_ref,
     };
 
-    let repo = optional_subject.as_ref().and_then(|subject| subject.repository.as_ref());
+    let repo = optional_subject
+        .as_ref()
+        .and_then(|subject| subject.repository.as_ref());
     let repo_full_name = repo
         .map(|repo| repo.name_with_owner.clone())
         .unwrap_or(repo_full_name);
@@ -361,7 +404,9 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
     Notification {
         id: gql.thread_id,
         node_id: gql.id,
-        subject_id: optional_subject.as_ref().and_then(|subject| subject.id.clone()),
+        subject_id: optional_subject
+            .as_ref()
+            .and_then(|subject| subject.id.clone()),
         unread: gql.is_unread,
         reason: gql.reason.unwrap_or_else(|| "subscribed".to_string()),
         updated_at: gql.last_updated_at,
@@ -371,7 +416,7 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
             full_name: repo_full_name,
             merge_settings: repo.map(merge_settings_from_repo),
         },
-        url: gql.url,
+        url: normalized_url,
     }
 }
 
@@ -400,13 +445,15 @@ fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
     let ci_status = pull_request_ci_status(&pr);
     let review_status = pull_request_review_status(&pr);
     let merge_settings = Some(merge_settings_from_repo(&pr.repository));
+    let normalized_url = normalize_pr_url(&pr.url);
     let subject = Subject {
         title: pr.title,
-        url: pr.url.clone(),
+        url: normalized_url.clone(),
         kind: "PullRequest".to_string(),
         status,
         ci_status,
         review_status,
+        head_ref: Some(pr.head_ref_name),
     };
 
     MyPullRequest {
@@ -418,7 +465,7 @@ fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
             full_name: pr.repository.name_with_owner,
             merge_settings,
         },
-        url: pr.url,
+        url: normalized_url,
     }
 }
 
@@ -661,6 +708,18 @@ pub async fn mark_as_read(client: &Client, token: &str, node_id: &str) -> Result
     .await
 }
 
+pub async fn mark_as_unread(client: &Client, token: &str, node_id: &str) -> Result<()> {
+    run_mutation(
+        client,
+        token,
+        r#"mutation MarkAsUnread($id: ID!) {
+          markNotificationAsUnread(input: { id: $id }) { success }
+        }"#,
+        json!({ "id": node_id }),
+    )
+    .await
+}
+
 pub async fn mark_as_done(client: &Client, token: &str, node_id: &str) -> Result<()> {
     run_mutation(
         client,
@@ -685,10 +744,45 @@ pub async fn unsubscribe(client: &Client, token: &str, node_id: &str) -> Result<
     .await
 }
 
+pub async fn subscribe_to_thread(client: &Client, token: &str, thread_id: &str) -> Result<()> {
+    let url = format!(
+        "{}/notifications/threads/{}/subscription",
+        GITHUB_API, thread_id
+    );
+    let response = client
+        .put(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+        .header("User-Agent", "ghn")
+        .json(&json!({ "ignored": false }))
+        .send()
+        .await
+        .context("failed to update thread subscription")?;
+
+    if response.status() == 429 {
+        return Err(anyhow!("GitHub rate limited. Retrying later."));
+    }
+    if response.status() == 401 || response.status() == 403 {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "GitHub authentication failed ({}). {}",
+            status,
+            body.trim()
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(anyhow!("GitHub API error: {}", response.status()));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        dedupe_pull_requests, filter_archived_pull_requests, parse_repo_from_url,
+        dedupe_pull_requests, filter_archived_pull_requests, normalize_pr_url, parse_repo_from_url,
         parse_subject_type, transform_notification, transform_pull_request, GraphQlNotification,
         GraphQlPullRequest, GraphQlRepository, GraphQlSubject,
     };
@@ -704,6 +798,7 @@ mod tests {
             updated_at: "2024-01-06T00:00:00Z".to_string(),
             is_draft: false,
             review_decision: None,
+            head_ref_name: format!("feature/{id}"),
             repository: GraphQlRepository {
                 name: "widgets".to_string(),
                 name_with_owner: "acme/widgets".to_string(),
@@ -759,6 +854,16 @@ mod tests {
     }
 
     #[test]
+    fn normalize_pr_url_strips_fragments_and_paths() {
+        let url =
+            "https://github.com/acme/widgets/pull/42/commits/abc123?ref=notifications#issuecomment";
+        assert_eq!(
+            normalize_pr_url(url),
+            "https://github.com/acme/widgets/pull/42"
+        );
+    }
+
+    #[test]
     fn transform_notification_maps_fields() {
         let gql = GraphQlNotification {
             id: "node-1".to_string(),
@@ -773,6 +878,7 @@ mod tests {
                 state: Some("MERGED".to_string()),
                 is_draft: Some(false),
                 review_decision: Some("APPROVED".to_string()),
+                head_ref_name: Some("feature/branch".to_string()),
                 commits: Some(super::GraphQlPullRequestCommits {
                     nodes: vec![super::GraphQlPullRequestCommit {
                         commit: Some(super::GraphQlCommit {
@@ -800,6 +906,10 @@ mod tests {
             notification.subject.review_status,
             Some(ReviewStatus::Approved)
         );
+        assert_eq!(
+            notification.subject.head_ref.as_deref(),
+            Some("feature/branch")
+        );
         assert_eq!(notification.repository.full_name, "acme/widgets");
         assert_eq!(notification.repository.name, "widgets");
         assert_eq!(notification.url, "https://github.com/acme/widgets/pull/42");
@@ -820,6 +930,7 @@ mod tests {
                 state: None,
                 is_draft: None,
                 review_decision: None,
+                head_ref_name: None,
                 commits: None,
                 repository: None,
             }),
@@ -844,6 +955,7 @@ mod tests {
                 state: Some("OPEN".to_string()),
                 is_draft: Some(true),
                 review_decision: Some("REVIEW_REQUIRED".to_string()),
+                head_ref_name: Some("draft/branch".to_string()),
                 commits: None,
                 repository: None,
             }),
@@ -868,6 +980,7 @@ mod tests {
                 state: Some("CLOSED".to_string()),
                 is_draft: Some(true),
                 review_decision: None,
+                head_ref_name: Some("draft/closed".to_string()),
                 commits: None,
                 repository: None,
             }),
@@ -895,6 +1008,7 @@ mod tests {
                 state: Some("CLOSED".to_string()),
                 is_draft: None,
                 review_decision: None,
+                head_ref_name: None,
                 commits: None,
                 repository: None,
             }),
@@ -919,6 +1033,7 @@ mod tests {
                 state: Some("OPEN".to_string()),
                 is_draft: Some(false),
                 review_decision: Some("CHANGES_REQUESTED".to_string()),
+                head_ref_name: Some("review/branch".to_string()),
                 commits: None,
                 repository: None,
             }),
@@ -940,6 +1055,7 @@ mod tests {
             updated_at: "2024-01-06T00:00:00Z".to_string(),
             is_draft: false,
             review_decision: Some("APPROVED".to_string()),
+            head_ref_name: "feature/one".to_string(),
             repository: GraphQlRepository {
                 name: "widgets".to_string(),
                 name_with_owner: "acme/widgets".to_string(),
@@ -967,6 +1083,7 @@ mod tests {
         assert_eq!(pr.subject.kind, "PullRequest");
         assert_eq!(pr.subject.ci_status, Some(CiStatus::Success));
         assert_eq!(pr.subject.review_status, Some(ReviewStatus::Approved));
+        assert_eq!(pr.subject.head_ref.as_deref(), Some("feature/one"));
         assert_eq!(pr.repository.full_name, "acme/widgets");
         assert_eq!(pr.repository.name, "widgets");
     }
@@ -987,6 +1104,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
+                head_ref: None,
             },
             repository: Repository {
                 name: "widgets".to_string(),
@@ -1007,6 +1125,7 @@ mod tests {
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -1025,6 +1144,7 @@ mod tests {
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
+                    head_ref: None,
                 },
                 repository: Repository {
                     name: "widgets".to_string(),
@@ -1049,5 +1169,4 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "pr-1");
     }
-
 }
