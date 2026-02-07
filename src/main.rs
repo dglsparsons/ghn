@@ -263,7 +263,7 @@ async fn run_app(
         app.status = Some(format!("Failed to load ignore list: {}", err));
         app.status_sticky = true;
     }
-    let mut events = EventStream::new();
+    let mut events = Some(EventStream::new());
     let mut tick = tokio::time::interval(Duration::from_millis(500));
 
     loop {
@@ -272,7 +272,10 @@ async fn run_app(
             .context("render failed")?;
 
         tokio::select! {
-            maybe_event = events.next() => {
+            maybe_event = events
+                .as_mut()
+                .expect("event stream should always be initialized")
+                .next() => {
                 if let Some(Ok(event)) = maybe_event {
                     if handle_input(event, &mut app, &refresh_tx, &event_tx, &client, &token)? {
                         break;
@@ -303,7 +306,6 @@ async fn run_app(
                     }
                     AppEvent::Review(request) => {
                         let result = run_review_in_nvim(terminal, &request);
-                        events = EventStream::new();
                         match result {
                             Ok(()) => {
                                 app.status = Some("ReviewPR finished".to_string());
@@ -315,6 +317,11 @@ async fn run_app(
                             }
                         }
                         force_redraw(terminal, &app)?;
+                        // Drop the old stream before creating the replacement. Recreating first can
+                        // block on crossterm's global event-reader lock while the old stream still
+                        // holds it in a blocking poll.
+                        events.take();
+                        events = Some(EventStream::new());
                     }
                 }
             }
