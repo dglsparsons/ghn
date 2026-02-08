@@ -14,11 +14,11 @@ use crate::{
 };
 
 const COMMANDS_FULL: &str =
-    "Commands: o open/read  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review  b branch  U undo";
+    "Commands: o open/read  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review+analyze  P review  b branch  U undo";
 const COMMANDS_COMPACT: &str =
-    "Cmds: o open/read  y pretty  Y yank  r read  d done  q unsub/ign  p review  b branch  U undo";
-const COMMANDS_SHORT: &str = "Cmds o/y/Y/r/d/q/p/b/U";
-const COMMANDS_TINY: &str = "o y Y r d q p b U";
+    "Cmds: o open/read  y pretty  Y yank  r read  d done  q unsub/ign  p rev+anlz  P review  b branch  U undo";
+const COMMANDS_SHORT: &str = "Cmds o/y/Y/r/d/q/p/P/b/U";
+const COMMANDS_TINY: &str = "o y Y r d q p P b U";
 
 const TARGETS_FULL: &str =
     "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft";
@@ -527,6 +527,7 @@ fn action_color(action: Action) -> Color {
         Action::Done => Color::Green,
         Action::Unsubscribe => Color::Red,
         Action::Review => Color::Cyan,
+        Action::ReviewNoAnalyze => Color::Cyan,
         Action::Branch => Color::LightBlue,
     }
 }
@@ -822,6 +823,7 @@ fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
                 | Action::PrettyYank
                 | Action::Unsubscribe
                 | Action::Review
+                | Action::ReviewNoAnalyze
                 | Action::Branch
         ),
     }
@@ -923,6 +925,9 @@ mod tests {
 
         let map = build_pending_map("1p", &notifications, &my_prs);
         assert_eq!(map.get(&1), Some(&vec![Action::Review]));
+
+        let map = build_pending_map("1P", &notifications, &my_prs);
+        assert_eq!(map.get(&1), Some(&vec![Action::ReviewNoAnalyze]));
     }
 
     #[test]

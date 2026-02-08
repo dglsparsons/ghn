@@ -138,6 +138,7 @@ pub enum Action {
     Done,
     Unsubscribe,
     Review,
+    ReviewNoAnalyze,
     Branch,
 }
 
@@ -151,6 +152,7 @@ impl Action {
             'd' => Some(Self::Done),
             'q' => Some(Self::Unsubscribe),
             'p' => Some(Self::Review),
+            'P' => Some(Self::ReviewNoAnalyze),
             'b' => Some(Self::Branch),
             _ => None,
         }
@@ -165,6 +167,7 @@ impl Action {
             Self::Done => 'd',
             Self::Unsubscribe => 'q',
             Self::Review => 'p',
+            Self::ReviewNoAnalyze => 'P',
             Self::Branch => 'b',
         }
     }
@@ -196,6 +199,7 @@ mod tests {
             ('d', Action::Done),
             ('q', Action::Unsubscribe),
             ('p', Action::Review),
+            ('P', Action::ReviewNoAnalyze),
             ('b', Action::Branch),
         ];
 

@@ -41,7 +41,7 @@ ghn
 
 3 * [Draft] someorg/repo ↻ ? PullRequest 10m
     Review requested: Update dependencies
-Commands: o open  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review  b branch  U undo  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
+Commands: o open  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review+analyze  P review  b branch  U undo  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, m merged, c closed, f draft  |  Executed 3 actions
 > 1-3r
 ```
 
@@ -68,7 +68,8 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 | Read | `r` | Mark as read |
 | Done | `d` | Mark as done (removes from inbox) |
 | Unsubscribe | `q` | Unsubscribe from thread; in My PRs, ignore PRs (saved to `~/.config/ghn/ignores.txt`) |
-| ReviewPR | `p` | Open nvim in `~/Developer/<owner>/<repo>` with `ReviewPR <url> --analyze` |
+| ReviewPR (analyze) | `p` | Open nvim in `~/Developer/<owner>/<repo>` with `ReviewPR <url> --analyze` |
+| ReviewPR | `P` | Open nvim in `~/Developer/<owner>/<repo>` with `ReviewPR <url>` |
 | Branch | `b` | Copy branch name (pull requests only) |
 | Undo | `U` | Undo last executed batch (press `U` then `Enter`) |
 
@@ -79,7 +80,8 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 - `5y` - Copy PR summary for notification #5
 - `5Y` - Copy URL of notification #5
 - `1r` - Mark #1 as read without opening
-- `1p` - Open PR #1 in nvim using ReviewPR
+- `1p` - Open PR #1 in nvim using ReviewPR with `--analyze`
+- `1P` - Open PR #1 in nvim using ReviewPR without `--analyze`
 - `1b` - Copy branch name for PR #1
 - `23r` - With 10 items, marks #2 and #3; with 30 items, marks #23
 - `md` - Mark all merged PR notifications as done
@@ -94,8 +96,9 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 |-----|--------|
 | `0-9` | Build number for command |
 | `-` / `,` / `Space` | Range or list separators |
-| `o/y/Y/r/d/q/p/b` | Queue action for current number |
-| `p` | Review PR in nvim |
+| `o/y/Y/r/d/q/p/P/b` | Queue action for current number |
+| `p` | Review PR in nvim with `--analyze` |
+| `P` | Review PR in nvim without `--analyze` |
 | `Enter` | Execute all queued commands |
 | `U` | Undo last executed batch (press `U` then `Enter`) |
 | `Esc` | Clear command buffer |

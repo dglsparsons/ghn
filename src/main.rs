@@ -68,6 +68,7 @@ enum AppEvent {
 struct ReviewRequest {
     repo_full_name: String,
     pr_url: String,
+    analyze: bool,
 }
 
 pub struct AppState {
@@ -545,21 +546,30 @@ fn split_review_action(
     notifications: &[Notification],
     my_prs: &[MyPullRequest],
 ) -> Result<(Option<ReviewRequest>, HashMap<usize, Vec<Action>>)> {
-    let mut review_index = None;
+    let mut review_target: Option<(usize, bool)> = None;
 
     for (index, actions) in commands {
-        if actions
+        let review_mode = actions
             .iter()
-            .any(|action| matches!(action, Action::Review))
-        {
-            if review_index.is_some() {
-                return Err(anyhow!("ReviewPR expects a single target"));
+            .filter_map(|action| match action {
+                Action::Review => Some(true),
+                Action::ReviewNoAnalyze => Some(false),
+                _ => None,
+            })
+            .last();
+
+        if let Some(analyze) = review_mode {
+            if let Some((existing_index, _)) = review_target {
+                if existing_index != *index {
+                    return Err(anyhow!("ReviewPR expects a single target"));
+                }
             }
-            review_index = Some(*index);
+
+            review_target = Some((*index, analyze));
         }
     }
 
-    let review_request = if let Some(index) = review_index {
+    let review_request = if let Some((index, analyze)) = review_target {
         let entry = entry_for_index(index, notifications, my_prs)
             .ok_or_else(|| anyhow!("ReviewPR target is out of range"))?;
         let url = entry.url();
@@ -569,6 +579,7 @@ fn split_review_action(
         Some(ReviewRequest {
             repo_full_name: entry.repo_full_name().to_string(),
             pr_url: url.to_string(),
+            analyze,
         })
     } else {
         None
@@ -579,7 +590,7 @@ fn split_review_action(
         let remaining: Vec<Action> = actions
             .iter()
             .copied()
-            .filter(|action| *action != Action::Review)
+            .filter(|action| !matches!(action, Action::Review | Action::ReviewNoAnalyze))
             .collect();
         if !remaining.is_empty() {
             filtered.insert(*index, remaining);
@@ -775,7 +786,11 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
                                 NotificationOverrideState::Suppress,
                             );
                         }
-                        Action::Yank | Action::PrettyYank | Action::Review | Action::Branch => {}
+                        Action::Yank
+                        | Action::PrettyYank
+                        | Action::Review
+                        | Action::ReviewNoAnalyze
+                        | Action::Branch => {}
                     }
                 }
 
@@ -1200,6 +1215,7 @@ async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) 
                         | Action::Yank
                         | Action::PrettyYank
                         | Action::Review
+                        | Action::ReviewNoAnalyze
                         | Action::Branch => {}
                     }
                 }
@@ -1436,6 +1452,14 @@ impl Drop for TuiGuard<'_> {
     }
 }
 
+fn reviewpr_command(request: &ReviewRequest) -> String {
+    let mut command = format!("ReviewPR {}", request.pr_url);
+    if request.analyze {
+        command.push_str(" --analyze");
+    }
+    command
+}
+
 fn run_review_in_nvim(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     request: &ReviewRequest,
@@ -1457,7 +1481,7 @@ fn run_review_in_nvim(
     let status = Command::new("nvim")
         .current_dir(&repo_dir)
         .arg("-c")
-        .arg(format!("ReviewPR {} --analyze", request.pr_url))
+        .arg(reviewpr_command(request))
         .status()
         .context("failed to launch nvim")?;
     guard.restore()?;
@@ -1550,9 +1574,9 @@ async fn execute_action(
             })
             .await??;
         }
-        Action::Review => {
+        Action::Review | Action::ReviewNoAnalyze => {
             return Err(anyhow!(
-                "ReviewPR should be triggered via the 'p' action in the UI"
+                "ReviewPR should be triggered via the 'p' or 'P' action in the UI"
             ));
         }
     }
@@ -1573,9 +1597,9 @@ mod tests {
         apply_optimistic_update, apply_undo_optimistic_update, clean_error_message,
         collect_pretty_yank_targets, collect_yank_targets, command_status, entry_for_index,
         format_pretty_pull_request, handle_text_input, is_api_action, parse_updated_at,
-        repo_dir_for_full_name, sort_by_updated_at, undo_status, AppState, EntrySnapshot,
-        ExecSummary, NotificationOverride, NotificationOverrideState, PrettyPullRequest,
-        UndoSummary,
+        repo_dir_for_full_name, reviewpr_command, sort_by_updated_at, split_review_action,
+        undo_status, AppState, EntrySnapshot, ExecSummary, NotificationOverride,
+        NotificationOverrideState, PrettyPullRequest, ReviewRequest, UndoSummary,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -1710,10 +1734,90 @@ mod tests {
     }
 
     #[test]
+    fn allows_review_without_analyze_input() {
+        let mut app = AppState::new(true, HashSet::new());
+        handle_text_input(&mut app, key_event(KeyCode::Char('P'), KeyModifiers::NONE));
+        assert_eq!(app.command_text(), "P");
+    }
+
+    #[test]
     fn allows_undo_command_input() {
         let mut app = AppState::new(true, HashSet::new());
         handle_text_input(&mut app, key_event(KeyCode::Char('U'), KeyModifiers::NONE));
         assert_eq!(app.command_text(), "U");
+    }
+
+    #[test]
+    fn split_review_action_enables_analyze_for_lowercase_review() {
+        let notifications = vec![sample_notification(true)];
+        let my_prs = Vec::new();
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::Review]);
+
+        let (request, filtered) =
+            split_review_action(&commands, &notifications, &my_prs).expect("split review action");
+        let request = request.expect("review request");
+
+        assert_eq!(request.repo_full_name, "acme/widgets");
+        assert_eq!(request.pr_url, "https://github.com/acme/widgets/pull/42");
+        assert!(request.analyze);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn split_review_action_disables_analyze_for_uppercase_review() {
+        let notifications = vec![sample_notification(true)];
+        let my_prs = Vec::new();
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::ReviewNoAnalyze, Action::Open]);
+
+        let (request, filtered) =
+            split_review_action(&commands, &notifications, &my_prs).expect("split review action");
+        let request = request.expect("review request");
+
+        assert!(!request.analyze);
+        assert_eq!(filtered.get(&1), Some(&vec![Action::Open]));
+    }
+
+    #[test]
+    fn split_review_action_uses_last_review_mode_on_same_target() {
+        let notifications = vec![sample_notification(true)];
+        let my_prs = Vec::new();
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::Review, Action::ReviewNoAnalyze]);
+
+        let (request, _filtered) =
+            split_review_action(&commands, &notifications, &my_prs).expect("split review action");
+        let request = request.expect("review request");
+        assert!(!request.analyze);
+    }
+
+    #[test]
+    fn reviewpr_command_includes_analyze_when_requested() {
+        let request = ReviewRequest {
+            repo_full_name: "acme/widgets".to_string(),
+            pr_url: "https://github.com/acme/widgets/pull/42".to_string(),
+            analyze: true,
+        };
+
+        assert_eq!(
+            reviewpr_command(&request),
+            "ReviewPR https://github.com/acme/widgets/pull/42 --analyze"
+        );
+    }
+
+    #[test]
+    fn reviewpr_command_omits_analyze_when_not_requested() {
+        let request = ReviewRequest {
+            repo_full_name: "acme/widgets".to_string(),
+            pr_url: "https://github.com/acme/widgets/pull/42".to_string(),
+            analyze: false,
+        };
+
+        assert_eq!(
+            reviewpr_command(&request),
+            "ReviewPR https://github.com/acme/widgets/pull/42"
+        );
     }
 
     #[test]
@@ -1893,6 +1997,11 @@ mod tests {
     #[test]
     fn review_is_not_api_action() {
         assert!(!is_api_action(Action::Review));
+    }
+
+    #[test]
+    fn review_without_analyze_is_not_api_action() {
+        assert!(!is_api_action(Action::ReviewNoAnalyze));
     }
 
     #[test]
