@@ -61,7 +61,7 @@ enum AppEvent {
     Error(String),
     CommandResult(ExecSummary),
     UndoResult(UndoSummary),
-    Review(ReviewRequest),
+    Review(Vec<ReviewRequest>),
 }
 
 #[derive(Debug, Clone)]
@@ -305,17 +305,33 @@ async fn run_app(
                     AppEvent::UndoResult(result) => {
                         handle_undo_result(&mut app, &refresh_tx, result);
                     }
-                    AppEvent::Review(request) => {
-                        let result = run_review_in_nvim(terminal, &request);
-                        match result {
-                            Ok(()) => {
-                                app.status = Some("ReviewPR finished".to_string());
-                                app.status_sticky = false;
+                    AppEvent::Review(requests) => {
+                        let total = requests.len();
+                        let mut completed = 0usize;
+                        let mut failed = false;
+
+                        for request in requests {
+                            let result = run_review_in_nvim(terminal, &request);
+                            match result {
+                                Ok(()) => {
+                                    completed += 1;
+                                }
+                                Err(err) => {
+                                    app.status = Some(err.to_string());
+                                    app.status_sticky = true;
+                                    failed = true;
+                                    break;
+                                }
                             }
-                            Err(err) => {
-                                app.status = Some(err.to_string());
-                                app.status_sticky = true;
-                            }
+                        }
+
+                        if !failed {
+                            app.status = if total == 1 {
+                                Some("ReviewPR finished".to_string())
+                            } else {
+                                Some(format!("ReviewPR finished for {completed} targets"))
+                            };
+                            app.status_sticky = false;
                         }
                         force_redraw(terminal, &app)?;
                         // Drop the old stream before creating the replacement. Recreating first can
@@ -428,7 +444,7 @@ fn submit_commands(
         return Ok(());
     }
 
-    let (review_request, pending) =
+    let (review_requests, pending) =
         match split_review_action(&pending, &app.notifications, &app.my_prs) {
             Ok(value) => value,
             Err(err) => {
@@ -439,10 +455,10 @@ fn submit_commands(
             }
         };
 
-    if let Some(request) = review_request {
+    if !review_requests.is_empty() {
         let app_event_tx = app_event_tx.clone();
         tokio::spawn(async move {
-            let _ = app_event_tx.send(AppEvent::Review(request)).await;
+            let _ = app_event_tx.send(AppEvent::Review(review_requests)).await;
         });
     }
 
@@ -541,14 +557,21 @@ fn submit_undo(
     Ok(())
 }
 
+type SplitReviewActionResult = (Vec<ReviewRequest>, HashMap<usize, Vec<Action>>);
+
 fn split_review_action(
     commands: &HashMap<usize, Vec<Action>>,
     notifications: &[Notification],
     my_prs: &[MyPullRequest],
-) -> Result<(Option<ReviewRequest>, HashMap<usize, Vec<Action>>)> {
-    let mut review_target: Option<(usize, bool)> = None;
+) -> Result<SplitReviewActionResult> {
+    let mut command_indices: Vec<usize> = commands.keys().copied().collect();
+    command_indices.sort_unstable();
+    let mut review_targets = Vec::new();
 
-    for (index, actions) in commands {
+    for index in command_indices {
+        let actions = commands
+            .get(&index)
+            .ok_or_else(|| anyhow!("ReviewPR target is out of range"))?;
         let review_mode = actions
             .iter()
             .filter_map(|action| match action {
@@ -556,34 +579,27 @@ fn split_review_action(
                 Action::ReviewNoAnalyze => Some(false),
                 _ => None,
             })
-            .last();
+            .next_back();
 
         if let Some(analyze) = review_mode {
-            if let Some((existing_index, _)) = review_target {
-                if existing_index != *index {
-                    return Err(anyhow!("ReviewPR expects a single target"));
-                }
-            }
-
-            review_target = Some((*index, analyze));
+            review_targets.push((index, analyze));
         }
     }
 
-    let review_request = if let Some((index, analyze)) = review_target {
+    let mut review_requests = Vec::with_capacity(review_targets.len());
+    for (index, analyze) in review_targets {
         let entry = entry_for_index(index, notifications, my_prs)
             .ok_or_else(|| anyhow!("ReviewPR target is out of range"))?;
         let url = entry.url();
         if !url.contains("/pull/") {
             return Err(anyhow!("ReviewPR only supports pull request URLs"));
         }
-        Some(ReviewRequest {
+        review_requests.push(ReviewRequest {
             repo_full_name: entry.repo_full_name().to_string(),
             pr_url: url.to_string(),
             analyze,
-        })
-    } else {
-        None
-    };
+        });
+    }
 
     let mut filtered = HashMap::new();
     for (index, actions) in commands {
@@ -597,7 +613,7 @@ fn split_review_action(
         }
     }
 
-    Ok((review_request, filtered))
+    Ok((review_requests, filtered))
 }
 
 fn handle_text_input(app: &mut AppState, key: crossterm::event::KeyEvent) {
@@ -1234,7 +1250,7 @@ async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) 
                 }
             }
             EntrySnapshot::MyPullRequest(pr) => {
-                if actions.iter().any(|action| *action == Action::Unsubscribe) {
+                if actions.contains(&Action::Unsubscribe) {
                     tasks.push(UndoWork::Unignore {
                         url: pr.url.clone(),
                     });
@@ -1754,9 +1770,10 @@ mod tests {
         let mut commands = HashMap::new();
         commands.insert(1, vec![Action::Review]);
 
-        let (request, filtered) =
+        let (requests, filtered) =
             split_review_action(&commands, &notifications, &my_prs).expect("split review action");
-        let request = request.expect("review request");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
 
         assert_eq!(request.repo_full_name, "acme/widgets");
         assert_eq!(request.pr_url, "https://github.com/acme/widgets/pull/42");
@@ -1771,9 +1788,10 @@ mod tests {
         let mut commands = HashMap::new();
         commands.insert(1, vec![Action::ReviewNoAnalyze, Action::Open]);
 
-        let (request, filtered) =
+        let (requests, filtered) =
             split_review_action(&commands, &notifications, &my_prs).expect("split review action");
-        let request = request.expect("review request");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
 
         assert!(!request.analyze);
         assert_eq!(filtered.get(&1), Some(&vec![Action::Open]));
@@ -1786,10 +1804,38 @@ mod tests {
         let mut commands = HashMap::new();
         commands.insert(1, vec![Action::Review, Action::ReviewNoAnalyze]);
 
-        let (request, _filtered) =
+        let (requests, _filtered) =
             split_review_action(&commands, &notifications, &my_prs).expect("split review action");
-        let request = request.expect("review request");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
         assert!(!request.analyze);
+    }
+
+    #[test]
+    fn split_review_action_supports_multiple_targets_in_order() {
+        let mut first = sample_notification(true);
+        first.subject.url = "https://github.com/acme/widgets/pull/1".to_string();
+        first.url = first.subject.url.clone();
+
+        let mut second = sample_notification(true);
+        second.subject.url = "https://github.com/acme/widgets/pull/2".to_string();
+        second.url = second.subject.url.clone();
+
+        let notifications = vec![first, second];
+        let my_prs = Vec::new();
+        let mut commands = HashMap::new();
+        commands.insert(2, vec![Action::ReviewNoAnalyze]);
+        commands.insert(1, vec![Action::Review]);
+
+        let (requests, filtered) =
+            split_review_action(&commands, &notifications, &my_prs).expect("split review action");
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].pr_url, "https://github.com/acme/widgets/pull/1");
+        assert!(requests[0].analyze);
+        assert_eq!(requests[1].pr_url, "https://github.com/acme/widgets/pull/2");
+        assert!(!requests[1].analyze);
+        assert!(filtered.is_empty());
     }
 
     #[test]

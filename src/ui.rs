@@ -490,16 +490,16 @@ fn review_indicator(subject: &Subject) -> Option<ReviewIndicator> {
 
 fn effective_review_status(subject: &Subject) -> Option<ReviewStatus> {
     let status = subject.review_status?;
-    if status == ReviewStatus::ReviewRequired {
-        if subject.status.iter().any(|subject_status| {
+    if status == ReviewStatus::ReviewRequired
+        && subject.status.iter().any(|subject_status| {
             matches!(
                 subject_status,
                 SubjectStatus::Merged | SubjectStatus::Closed | SubjectStatus::Draft
             )
-        }) {
-            // Draft/closed/merged PRs shouldn't display a pending review indicator.
-            return None;
-        }
+        })
+    {
+        // Draft/closed/merged PRs shouldn't display a pending review indicator.
+        return None;
     }
     Some(status)
 }
