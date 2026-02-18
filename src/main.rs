@@ -603,11 +603,29 @@ fn split_review_action(
 
     let mut filtered = HashMap::new();
     for (index, actions) in commands {
+        let has_review = actions
+            .iter()
+            .any(|action| matches!(action, Action::Review | Action::ReviewNoAnalyze));
         let remaining: Vec<Action> = actions
             .iter()
             .copied()
             .filter(|action| !matches!(action, Action::Review | Action::ReviewNoAnalyze))
             .collect();
+        let mut remaining = remaining;
+
+        if has_review {
+            let has_read_like_action = remaining.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::Open | Action::Read | Action::Done | Action::Unsubscribe
+                )
+            });
+            let is_notification_target = *index > 0 && *index <= notifications.len();
+            if !has_read_like_action && is_notification_target {
+                remaining.push(Action::Read);
+            }
+        }
+
         if !remaining.is_empty() {
             filtered.insert(*index, remaining);
         }
@@ -1778,7 +1796,7 @@ mod tests {
         assert_eq!(request.repo_full_name, "acme/widgets");
         assert_eq!(request.pr_url, "https://github.com/acme/widgets/pull/42");
         assert!(request.analyze);
-        assert!(filtered.is_empty());
+        assert_eq!(filtered.get(&1), Some(&vec![Action::Read]));
     }
 
     #[test]
@@ -1835,6 +1853,25 @@ mod tests {
         assert!(requests[0].analyze);
         assert_eq!(requests[1].pr_url, "https://github.com/acme/widgets/pull/2");
         assert!(!requests[1].analyze);
+        assert_eq!(filtered.get(&1), Some(&vec![Action::Read]));
+        assert_eq!(filtered.get(&2), Some(&vec![Action::Read]));
+    }
+
+    #[test]
+    fn split_review_action_does_not_mark_my_pr_as_read() {
+        let notifications = Vec::new();
+        let my_prs = vec![sample_my_pr()];
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::Review]);
+
+        let (requests, filtered) =
+            split_review_action(&commands, &notifications, &my_prs).expect("split review action");
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].pr_url,
+            "https://github.com/acme/widgets/pull/100"
+        );
         assert!(filtered.is_empty());
     }
 
