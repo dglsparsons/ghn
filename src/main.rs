@@ -28,6 +28,7 @@ use ratatui::{
     Terminal,
 };
 use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 use tokio_stream::StreamExt;
 use tui_textarea::{CursorMove, TextArea};
 
@@ -266,6 +267,7 @@ async fn run_app(
     }
     let mut events = Some(EventStream::new());
     let mut tick = tokio::time::interval(Duration::from_millis(500));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         terminal
@@ -306,6 +308,9 @@ async fn run_app(
                         handle_undo_result(&mut app, &refresh_tx, result);
                     }
                     AppEvent::Review(requests) => {
+                        // Release crossterm's global event reader while nvim owns the terminal.
+                        events.take();
+
                         let total = requests.len();
                         let mut completed = 0usize;
                         let mut failed = false;
@@ -334,10 +339,7 @@ async fn run_app(
                             app.status_sticky = false;
                         }
                         force_redraw(terminal, &app)?;
-                        // Drop the old stream before creating the replacement. Recreating first can
-                        // block on crossterm's global event-reader lock while the old stream still
-                        // holds it in a blocking poll.
-                        events.take();
+                        // Recreate the stream now that the terminal is back under TUI control.
                         events = Some(EventStream::new());
                     }
                 }
@@ -361,6 +363,7 @@ fn spawn_poller(
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             let result = fetch_notifications_and_my_prs(&client, &token, include_read).await;

@@ -31,3 +31,8 @@ cargo fmt --all
 ```bash
 ./target/release/ghn
 ```
+
+## Runtime Gotchas
+
+- Before launching interactive terminal apps (like `nvim`) from the TUI loop, drop the active `EventStream` and recreate it after returning. Crossterm uses a global event reader and can steal input otherwise.
+- Use `tokio::time::MissedTickBehavior::Skip` for long-lived intervals in this app to avoid catch-up bursts after sleep/stalls.
