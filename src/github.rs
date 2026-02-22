@@ -51,8 +51,14 @@ struct GraphQlSubject {
     is_draft: Option<bool>,
     review_decision: Option<String>,
     head_ref_name: Option<String>,
+    author: Option<GraphQlActor>,
     commits: Option<GraphQlPullRequestCommits>,
     repository: Option<GraphQlRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlActor {
+    login: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +105,7 @@ struct GraphQlPullRequest {
     is_draft: bool,
     review_decision: Option<String>,
     head_ref_name: String,
+    author: Option<GraphQlActor>,
     repository: GraphQlRepository,
     commits: Option<GraphQlPullRequestCommits>,
 }
@@ -184,13 +191,13 @@ query GetNotifications($statuses: [NotificationStatus!]) {
         lastUpdatedAt
         reason
         optionalSubject {
-          ... on Issue { id state }
           ... on PullRequest {
             id
             state
             isDraft
             reviewDecision
             headRefName
+            author { login }
             repository {
               name
               nameWithOwner
@@ -210,6 +217,11 @@ query GetNotifications($statuses: [NotificationStatus!]) {
                 }
               }
             }
+          }
+          ... on Issue {
+            id
+            state
+            author { login }
           }
           ... on Discussion { id }
           ... on Commit { id }
@@ -232,6 +244,7 @@ query GetMyPullRequests($query: String!) {
         isDraft
         reviewDecision
         headRefName
+        author { login }
         repository {
           name
           nameWithOwner
@@ -473,10 +486,15 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
     let head_ref = optional_subject
         .as_ref()
         .and_then(|subject| subject.head_ref_name.clone());
+    let author = optional_subject
+        .as_ref()
+        .and_then(|subject| subject.author.as_ref())
+        .map(|author| author.login.clone());
     let subject = Subject {
         title: gql.title,
         url: normalized_url.clone(),
         kind,
+        author,
         status,
         ci_status,
         review_status,
@@ -542,6 +560,7 @@ fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
         title: pr.title,
         url: normalized_url.clone(),
         kind: "PullRequest".to_string(),
+        author: pr.author.map(|author| author.login),
         status,
         ci_status,
         review_status,
@@ -959,6 +978,7 @@ mod tests {
             is_draft: false,
             review_decision: None,
             head_ref_name: format!("feature/{id}"),
+            author: None,
             repository: GraphQlRepository {
                 name: "widgets".to_string(),
                 name_with_owner: "acme/widgets".to_string(),
@@ -1054,6 +1074,9 @@ mod tests {
                 is_draft: Some(false),
                 review_decision: Some("APPROVED".to_string()),
                 head_ref_name: Some("feature/branch".to_string()),
+                author: Some(super::GraphQlActor {
+                    login: "octocat".to_string(),
+                }),
                 commits: Some(super::GraphQlPullRequestCommits {
                     nodes: vec![super::GraphQlPullRequestCommit {
                         commit: Some(super::GraphQlCommit {
@@ -1085,6 +1108,7 @@ mod tests {
             notification.subject.head_ref.as_deref(),
             Some("feature/branch")
         );
+        assert_eq!(notification.subject.author.as_deref(), Some("octocat"));
         assert_eq!(notification.repository.full_name, "acme/widgets");
         assert_eq!(notification.repository.name, "widgets");
         assert_eq!(notification.url, "https://github.com/acme/widgets/pull/42");
@@ -1106,6 +1130,7 @@ mod tests {
                 is_draft: None,
                 review_decision: None,
                 head_ref_name: None,
+                author: None,
                 commits: None,
                 repository: None,
             }),
@@ -1131,6 +1156,7 @@ mod tests {
                 is_draft: Some(true),
                 review_decision: Some("REVIEW_REQUIRED".to_string()),
                 head_ref_name: Some("draft/branch".to_string()),
+                author: None,
                 commits: None,
                 repository: None,
             }),
@@ -1156,6 +1182,7 @@ mod tests {
                 is_draft: Some(true),
                 review_decision: None,
                 head_ref_name: Some("draft/closed".to_string()),
+                author: None,
                 commits: None,
                 repository: None,
             }),
@@ -1184,6 +1211,7 @@ mod tests {
                 is_draft: None,
                 review_decision: None,
                 head_ref_name: None,
+                author: None,
                 commits: None,
                 repository: None,
             }),
@@ -1209,6 +1237,7 @@ mod tests {
                 is_draft: Some(false),
                 review_decision: Some("CHANGES_REQUESTED".to_string()),
                 head_ref_name: Some("review/branch".to_string()),
+                author: None,
                 commits: None,
                 repository: None,
             }),
@@ -1231,6 +1260,9 @@ mod tests {
             is_draft: false,
             review_decision: Some("APPROVED".to_string()),
             head_ref_name: "feature/one".to_string(),
+            author: Some(super::GraphQlActor {
+                login: "hubot".to_string(),
+            }),
             repository: GraphQlRepository {
                 name: "widgets".to_string(),
                 name_with_owner: "acme/widgets".to_string(),
@@ -1259,6 +1291,7 @@ mod tests {
         assert_eq!(pr.subject.ci_status, Some(CiStatus::Success));
         assert_eq!(pr.subject.review_status, Some(ReviewStatus::Approved));
         assert_eq!(pr.subject.head_ref.as_deref(), Some("feature/one"));
+        assert_eq!(pr.subject.author.as_deref(), Some("hubot"));
         assert_eq!(pr.repository.full_name, "acme/widgets");
         assert_eq!(pr.repository.name, "widgets");
     }
@@ -1276,6 +1309,7 @@ mod tests {
                 title: "My PR".to_string(),
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
                 kind: "PullRequest".to_string(),
+                author: None,
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
@@ -1297,6 +1331,7 @@ mod tests {
                     title: "My PR".to_string(),
                     url: "https://github.com/acme/widgets/pull/1".to_string(),
                     kind: "PullRequest".to_string(),
+                    author: None,
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
@@ -1316,6 +1351,7 @@ mod tests {
                     title: "Another PR".to_string(),
                     url: "https://github.com/acme/widgets/pull/2".to_string(),
                     kind: "PullRequest".to_string(),
+                    author: None,
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,

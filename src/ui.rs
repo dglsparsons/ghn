@@ -36,6 +36,9 @@ const MAX_CI_WIDTH: usize = 1;
 const MAX_REVIEW_WIDTH: usize = 1;
 const READ_NOTIFICATION_COLOR: Color = Color::Gray;
 const REPO_META_GAP: usize = 2;
+const REPO_AUTHOR_SEPARATOR: &str = " · ";
+const MIN_AUTHOR_WIDTH: usize = 4;
+const MAX_AUTHOR_WIDTH: usize = 18;
 const CI_REVIEW_GAP: usize = 1;
 const INDICATOR_KIND_GAP: usize = 1;
 
@@ -212,7 +215,10 @@ fn draw_list_section<T: ListItemLike>(
         .unwrap_or(0);
     let max_repo = items
         .iter()
-        .map(|item| item.repo_full_name().chars().count() + status_prefix_len(item.subject()))
+        .map(|item| {
+            repo_label_width(item.repo_full_name(), item.subject().author.as_deref())
+                + status_prefix_len(item.subject())
+        })
         .max()
         .unwrap_or(0);
     let max_line = max_title.max(max_repo);
@@ -284,12 +290,25 @@ fn draw_list_section<T: ListItemLike>(
                 remaining = remaining.saturating_sub(prefix_len);
                 header_spans.push(Span::styled(prefix_text, prefix.style));
             }
-            let repo_text = truncate_with_suffix(item.repo_full_name(), remaining);
-            let repo_padded = pad_right(&repo_text, remaining);
+            let (repo_text, author_text, used) =
+                render_repo_and_author(item.repo_full_name(), subject.author.as_deref(), remaining);
             header_spans.push(Span::styled(
-                repo_padded,
+                repo_text,
                 Style::default().add_modifier(Modifier::BOLD),
             ));
+            if let Some(author_text) = author_text {
+                header_spans.push(Span::styled(
+                    REPO_AUTHOR_SEPARATOR,
+                    Style::default().fg(Color::DarkGray),
+                ));
+                header_spans.push(Span::styled(
+                    author_text,
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if remaining > used {
+                header_spans.push(Span::raw(" ".repeat(remaining - used)));
+            }
             header_spans.push(Span::raw(" ".repeat(widths.repo_meta_gap)));
 
             if widths.ci > 0 {
@@ -682,6 +701,48 @@ fn truncate_with_suffix(value: &str, max: usize) -> String {
     truncated
 }
 
+fn repo_label_width(repo: &str, author: Option<&str>) -> usize {
+    let repo_width = repo.chars().count();
+    let author_width = author
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| REPO_AUTHOR_SEPARATOR.chars().count() + value.chars().count())
+        .unwrap_or(0);
+    repo_width + author_width
+}
+
+fn render_repo_and_author(
+    repo: &str,
+    author: Option<&str>,
+    max: usize,
+) -> (String, Option<String>, usize) {
+    if max == 0 {
+        return (String::new(), None, 0);
+    }
+
+    let author = author.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(author) = author {
+        let separator_width = REPO_AUTHOR_SEPARATOR.chars().count();
+        let max_author = max
+            .saturating_sub(separator_width + 1)
+            .min(MAX_AUTHOR_WIDTH);
+        if max_author >= MIN_AUTHOR_WIDTH {
+            let author_text = truncate_with_suffix(author, max_author);
+            let author_width = author_text.chars().count();
+            if author_width >= MIN_AUTHOR_WIDTH {
+                let repo_max = max.saturating_sub(separator_width + author_width).max(1);
+                let repo_text = truncate_with_suffix(repo, repo_max);
+                let used = repo_text.chars().count() + separator_width + author_width;
+                return (repo_text, Some(author_text), used);
+            }
+        }
+    }
+
+    let repo_text = truncate_with_suffix(repo, max);
+    let used = repo_text.chars().count();
+    (repo_text, None, used)
+}
+
 fn unread_marker_style(unread: bool) -> Style {
     if unread {
         Style::default()
@@ -833,9 +894,9 @@ fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
 mod tests {
     use super::{
         action_marker, base_notification_style, build_pending_map, build_status_lines,
-        ci_indicator, kind_color, layout_widths, pending_style, review_indicator,
-        select_legend_lines, status_prefixes, truncate_with_suffix, COMMANDS_FULL,
-        READ_NOTIFICATION_COLOR, TARGETS_FULL,
+        ci_indicator, kind_color, layout_widths, pending_style, render_repo_and_author,
+        review_indicator, select_legend_lines, status_prefixes, truncate_with_suffix,
+        COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
     };
     use crate::types::{
         Action, CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject,
@@ -858,6 +919,7 @@ mod tests {
                     title: "Fix bug".to_string(),
                     url: "https://github.com/acme/widgets/pull/1".to_string(),
                     kind: "PullRequest".to_string(),
+                    author: None,
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
@@ -881,6 +943,7 @@ mod tests {
                     title: "Fix docs".to_string(),
                     url: "https://github.com/acme/widgets/issues/2".to_string(),
                     kind: "Issue".to_string(),
+                    author: None,
                     status: vec![SubjectStatus::Closed],
                     ci_status: None,
                     review_status: None,
@@ -910,6 +973,7 @@ mod tests {
                 title: "My PR".to_string(),
                 url: "https://github.com/acme/widgets/pull/99".to_string(),
                 kind: "PullRequest".to_string(),
+                author: None,
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
@@ -945,6 +1009,7 @@ mod tests {
                     title: "Pending review".to_string(),
                     url: "https://github.com/acme/widgets/pull/1".to_string(),
                     kind: "PullRequest".to_string(),
+                    author: None,
                     status: Vec::new(),
                     ci_status: None,
                     review_status: Some(ReviewStatus::ReviewRequired),
@@ -968,6 +1033,7 @@ mod tests {
                     title: "Merged PR".to_string(),
                     url: "https://github.com/acme/widgets/pull/2".to_string(),
                     kind: "PullRequest".to_string(),
+                    author: None,
                     status: vec![SubjectStatus::Merged],
                     ci_status: None,
                     review_status: Some(ReviewStatus::ReviewRequired),
@@ -991,6 +1057,7 @@ mod tests {
                     title: "Draft PR".to_string(),
                     url: "https://github.com/acme/widgets/pull/3".to_string(),
                     kind: "PullRequest".to_string(),
+                    author: None,
                     status: vec![SubjectStatus::Draft],
                     ci_status: None,
                     review_status: Some(ReviewStatus::ReviewRequired),
@@ -1014,6 +1081,7 @@ mod tests {
                     title: "Approved".to_string(),
                     url: "https://github.com/acme/widgets/pull/4".to_string(),
                     kind: "PullRequest".to_string(),
+                    author: None,
                     status: Vec::new(),
                     ci_status: None,
                     review_status: Some(ReviewStatus::Approved),
@@ -1037,6 +1105,7 @@ mod tests {
                     title: "Changes requested".to_string(),
                     url: "https://github.com/acme/widgets/pull/5".to_string(),
                     kind: "PullRequest".to_string(),
+                    author: None,
                     status: Vec::new(),
                     ci_status: None,
                     review_status: Some(ReviewStatus::ChangesRequested),
@@ -1077,6 +1146,7 @@ mod tests {
                 title: "Issue".to_string(),
                 url: "https://github.com/acme/widgets/issues/1".to_string(),
                 kind: "Issue".to_string(),
+                author: None,
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
@@ -1108,6 +1178,7 @@ mod tests {
                 title: "PR".to_string(),
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
                 kind: "PullRequest".to_string(),
+                author: None,
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
@@ -1139,6 +1210,7 @@ mod tests {
                 title: "Draft closed".to_string(),
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
                 kind: "PullRequest".to_string(),
+                author: None,
                 status: vec![SubjectStatus::Draft, SubjectStatus::Closed],
                 ci_status: None,
                 review_status: None,
@@ -1174,6 +1246,7 @@ mod tests {
                     title: "Unread".to_string(),
                     url: "https://github.com/acme/widgets/pull/1".to_string(),
                     kind: "PullRequest".to_string(),
+                    author: None,
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
@@ -1197,6 +1270,7 @@ mod tests {
                     title: "Read".to_string(),
                     url: "https://github.com/acme/widgets/pull/2".to_string(),
                     kind: "PullRequest".to_string(),
+                    author: None,
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
@@ -1229,6 +1303,7 @@ mod tests {
                 title: "PR notification".to_string(),
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
                 kind: "PullRequest".to_string(),
+                author: None,
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
@@ -1249,6 +1324,7 @@ mod tests {
                 title: "My PR".to_string(),
                 url: "https://github.com/acme/widgets/pull/2".to_string(),
                 kind: "PullRequest".to_string(),
+                author: None,
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
@@ -1283,6 +1359,7 @@ mod tests {
                 title: "Issue".to_string(),
                 url: "https://github.com/acme/widgets/issues/1".to_string(),
                 kind: "Issue".to_string(),
+                author: None,
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
@@ -1308,6 +1385,24 @@ mod tests {
             truncate_with_suffix("this is a long title", 10),
             "this is.."
         );
+    }
+
+    #[test]
+    fn render_repo_and_author_shows_author_when_space_allows() {
+        let (repo, author, used) = render_repo_and_author("acme/widgets", Some("octocat"), 32);
+
+        assert_eq!(repo, "acme/widgets");
+        assert_eq!(author.as_deref(), Some("octocat"));
+        assert_eq!(used, "acme/widgets · octocat".chars().count());
+    }
+
+    #[test]
+    fn render_repo_and_author_hides_author_when_too_narrow() {
+        let (repo, author, used) = render_repo_and_author("acme/widgets", Some("octocat"), 6);
+
+        assert_eq!(repo, "acme..");
+        assert_eq!(author, None);
+        assert_eq!(used, 6);
     }
 
     #[test]
@@ -1343,6 +1438,7 @@ mod tests {
                 title: "Review me".to_string(),
                 url: "https://github.com/acme/widgets/pull/3".to_string(),
                 kind: "PullRequest".to_string(),
+                author: None,
                 status: Vec::new(),
                 ci_status: None,
                 review_status: Some(ReviewStatus::ReviewRequired),
@@ -1373,6 +1469,7 @@ mod tests {
                 title: "Closed PR".to_string(),
                 url: "https://github.com/acme/widgets/pull/4".to_string(),
                 kind: "PullRequest".to_string(),
+                author: None,
                 status: vec![SubjectStatus::Closed],
                 ci_status: None,
                 review_status: Some(ReviewStatus::ReviewRequired),
@@ -1402,6 +1499,7 @@ mod tests {
                 title: "Draft PR".to_string(),
                 url: "https://github.com/acme/widgets/pull/5".to_string(),
                 kind: "PullRequest".to_string(),
+                author: None,
                 status: vec![SubjectStatus::Draft],
                 ci_status: None,
                 review_status: Some(ReviewStatus::ReviewRequired),
@@ -1487,6 +1585,7 @@ mod tests {
             title: "Draft PR".to_string(),
             url: "https://github.com/acme/widgets/pull/1".to_string(),
             kind: "PullRequest".to_string(),
+            author: None,
             status: vec![SubjectStatus::Draft],
             ci_status: None,
             review_status: None,
@@ -1510,6 +1609,7 @@ mod tests {
             title: "Draft closed PR".to_string(),
             url: "https://github.com/acme/widgets/pull/2".to_string(),
             kind: "PullRequest".to_string(),
+            author: None,
             status: vec![SubjectStatus::Closed, SubjectStatus::Draft],
             ci_status: None,
             review_status: None,
@@ -1528,6 +1628,7 @@ mod tests {
             title: "PR".to_string(),
             url: "https://github.com/acme/widgets/pull/2".to_string(),
             kind: "PullRequest".to_string(),
+            author: None,
             status: Vec::new(),
             ci_status: Some(CiStatus::Failure),
             review_status: None,

@@ -27,6 +27,7 @@ pub struct Subject {
     pub title: String,
     pub url: String,
     pub kind: String,
+    pub author: Option<String>,
     pub status: Vec<SubjectStatus>,
     pub ci_status: Option<CiStatus>,
     pub review_status: Option<ReviewStatus>,
