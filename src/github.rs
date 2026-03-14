@@ -4,8 +4,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::types::{
-    CiStatus, GraphQlError, GraphQlResponse, MergeMethod, MergeSettings, MyPullRequest,
-    Notification, Repository, ReviewStatus, Subject, SubjectStatus,
+    CiStatus, GraphQlError, GraphQlResponse, MergeMethod, MergeSettings, MergeStateStatus,
+    MyPullRequest, Notification, Repository, ReviewStatus, Subject, SubjectStatus,
 };
 
 const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
@@ -50,6 +50,7 @@ struct GraphQlSubject {
     state: Option<String>,
     is_draft: Option<bool>,
     review_decision: Option<String>,
+    merge_state_status: Option<String>,
     head_ref_name: Option<String>,
     author: Option<GraphQlActor>,
     commits: Option<GraphQlPullRequestCommits>,
@@ -104,6 +105,7 @@ struct GraphQlPullRequest {
     updated_at: String,
     is_draft: bool,
     review_decision: Option<String>,
+    merge_state_status: Option<String>,
     head_ref_name: String,
     author: Option<GraphQlActor>,
     repository: GraphQlRepository,
@@ -196,6 +198,7 @@ query GetNotifications($statuses: [NotificationStatus!]) {
             state
             isDraft
             reviewDecision
+            mergeStateStatus
             headRefName
             author { login }
             repository {
@@ -243,6 +246,7 @@ query GetMyPullRequests($query: String!) {
         updatedAt
         isDraft
         reviewDecision
+        mergeStateStatus
         headRefName
         author { login }
         repository {
@@ -465,6 +469,32 @@ fn subject_review_status(kind: &str, subject: Option<&GraphQlSubject>) -> Option
     map_review_status(subject.review_decision.as_deref())
 }
 
+fn map_merge_state_status(merge_state_status: Option<&str>) -> Option<MergeStateStatus> {
+    match merge_state_status {
+        Some(value) if value.eq_ignore_ascii_case("BEHIND") => Some(MergeStateStatus::Behind),
+        Some(value) if value.eq_ignore_ascii_case("BLOCKED") => Some(MergeStateStatus::Blocked),
+        Some(value) if value.eq_ignore_ascii_case("CLEAN") => Some(MergeStateStatus::Clean),
+        Some(value) if value.eq_ignore_ascii_case("DIRTY") => Some(MergeStateStatus::Dirty),
+        Some(value) if value.eq_ignore_ascii_case("DRAFT") => Some(MergeStateStatus::Draft),
+        Some(value) if value.eq_ignore_ascii_case("HAS_HOOKS") => Some(MergeStateStatus::HasHooks),
+        Some(value) if value.eq_ignore_ascii_case("UNKNOWN") => Some(MergeStateStatus::Unknown),
+        Some(value) if value.eq_ignore_ascii_case("UNSTABLE") => Some(MergeStateStatus::Unstable),
+        _ => None,
+    }
+}
+
+fn subject_merge_state_status(
+    kind: &str,
+    subject: Option<&GraphQlSubject>,
+) -> Option<MergeStateStatus> {
+    let subject = subject?;
+    if !kind.eq_ignore_ascii_case("pullrequest") {
+        return None;
+    }
+
+    map_merge_state_status(subject.merge_state_status.as_deref())
+}
+
 fn merge_settings_from_repo(repo: &GraphQlRepository) -> MergeSettings {
     MergeSettings {
         default_method: repo.viewer_default_merge_method,
@@ -483,6 +513,7 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
     let status = subject_statuses(&kind, optional_subject.as_ref());
     let ci_status = subject_ci_status(&kind, optional_subject.as_ref());
     let review_status = subject_review_status(&kind, optional_subject.as_ref());
+    let merge_state_status = subject_merge_state_status(&kind, optional_subject.as_ref());
     let head_ref = optional_subject
         .as_ref()
         .and_then(|subject| subject.head_ref_name.clone());
@@ -498,6 +529,7 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
         status,
         ci_status,
         review_status,
+        merge_state_status,
         head_ref,
     };
 
@@ -546,6 +578,10 @@ fn pull_request_review_status(pr: &GraphQlPullRequest) -> Option<ReviewStatus> {
     map_review_status(pr.review_decision.as_deref())
 }
 
+fn pull_request_merge_state_status(pr: &GraphQlPullRequest) -> Option<MergeStateStatus> {
+    map_merge_state_status(pr.merge_state_status.as_deref())
+}
+
 fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
     let status = if pr.is_draft {
         vec![SubjectStatus::Draft]
@@ -554,6 +590,7 @@ fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
     };
     let ci_status = pull_request_ci_status(&pr);
     let review_status = pull_request_review_status(&pr);
+    let merge_state_status = pull_request_merge_state_status(&pr);
     let merge_settings = Some(merge_settings_from_repo(&pr.repository));
     let normalized_url = normalize_pr_url(&pr.url);
     let subject = Subject {
@@ -564,6 +601,7 @@ fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
         status,
         ci_status,
         review_status,
+        merge_state_status,
         head_ref: Some(pr.head_ref_name),
     };
 
@@ -977,6 +1015,7 @@ mod tests {
             updated_at: "2024-01-06T00:00:00Z".to_string(),
             is_draft: false,
             review_decision: None,
+            merge_state_status: None,
             head_ref_name: format!("feature/{id}"),
             author: None,
             repository: GraphQlRepository {
@@ -1073,6 +1112,7 @@ mod tests {
                 state: Some("MERGED".to_string()),
                 is_draft: Some(false),
                 review_decision: Some("APPROVED".to_string()),
+                merge_state_status: Some("CLEAN".to_string()),
                 head_ref_name: Some("feature/branch".to_string()),
                 author: Some(super::GraphQlActor {
                     login: "octocat".to_string(),
@@ -1129,6 +1169,7 @@ mod tests {
                 state: None,
                 is_draft: None,
                 review_decision: None,
+                merge_state_status: None,
                 head_ref_name: None,
                 author: None,
                 commits: None,
@@ -1155,6 +1196,7 @@ mod tests {
                 state: Some("OPEN".to_string()),
                 is_draft: Some(true),
                 review_decision: Some("REVIEW_REQUIRED".to_string()),
+                merge_state_status: Some("DRAFT".to_string()),
                 head_ref_name: Some("draft/branch".to_string()),
                 author: None,
                 commits: None,
@@ -1181,6 +1223,7 @@ mod tests {
                 state: Some("CLOSED".to_string()),
                 is_draft: Some(true),
                 review_decision: None,
+                merge_state_status: Some("DRAFT".to_string()),
                 head_ref_name: Some("draft/closed".to_string()),
                 author: None,
                 commits: None,
@@ -1210,6 +1253,7 @@ mod tests {
                 state: Some("CLOSED".to_string()),
                 is_draft: None,
                 review_decision: None,
+                merge_state_status: None,
                 head_ref_name: None,
                 author: None,
                 commits: None,
@@ -1236,6 +1280,7 @@ mod tests {
                 state: Some("OPEN".to_string()),
                 is_draft: Some(false),
                 review_decision: Some("CHANGES_REQUESTED".to_string()),
+                merge_state_status: None,
                 head_ref_name: Some("review/branch".to_string()),
                 author: None,
                 commits: None,
@@ -1259,6 +1304,7 @@ mod tests {
             updated_at: "2024-01-06T00:00:00Z".to_string(),
             is_draft: false,
             review_decision: Some("APPROVED".to_string()),
+            merge_state_status: Some("CLEAN".to_string()),
             head_ref_name: "feature/one".to_string(),
             author: Some(super::GraphQlActor {
                 login: "hubot".to_string(),
@@ -1313,6 +1359,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
+                merge_state_status: None,
                 head_ref: None,
             },
             repository: Repository {
@@ -1335,6 +1382,7 @@ mod tests {
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
+                    merge_state_status: None,
                     head_ref: None,
                 },
                 repository: Repository {
@@ -1355,6 +1403,7 @@ mod tests {
                     status: Vec::new(),
                     ci_status: None,
                     review_status: None,
+                    merge_state_status: None,
                     head_ref: None,
                 },
                 repository: Repository {

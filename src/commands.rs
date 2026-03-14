@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::types::Action;
 
 pub fn is_target_char(ch: char) -> bool {
-    matches!(ch, 'm' | 'c' | 'f' | '?' | 'a' | 'x' | 'u')
+    matches!(ch, 'm' | 'c' | 'f' | '?' | 'a' | 'x' | 'u' | 'w')
 }
 
 // Greedily split concatenated digits into the longest valid indices based on the list size.

@@ -31,6 +31,7 @@ pub struct Subject {
     pub status: Vec<SubjectStatus>,
     pub ci_status: Option<CiStatus>,
     pub review_status: Option<ReviewStatus>,
+    pub merge_state_status: Option<MergeStateStatus>,
     pub head_ref: Option<String>,
 }
 
@@ -130,6 +131,31 @@ pub enum ReviewStatus {
     ReviewRequired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeStateStatus {
+    Behind,
+    Blocked,
+    Clean,
+    Dirty,
+    Draft,
+    HasHooks,
+    Unknown,
+    Unstable,
+}
+
+impl MergeStateStatus {
+    pub fn is_ready_to_merge(self) -> bool {
+        matches!(self, Self::Clean | Self::HasHooks)
+    }
+
+    pub fn needs_action(self) -> bool {
+        matches!(
+            self,
+            Self::Behind | Self::Blocked | Self::Dirty | Self::Unstable
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     Open,
@@ -188,7 +214,7 @@ pub struct GraphQlError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, MergeMethod, MergeSettings};
+    use super::{Action, MergeMethod, MergeSettings, MergeStateStatus};
 
     #[test]
     fn action_char_roundtrip() {
@@ -237,5 +263,20 @@ mod tests {
         };
 
         assert_eq!(settings.default_or_fallback(), Some(MergeMethod::Squash));
+    }
+
+    #[test]
+    fn merge_state_status_ready_to_merge_only_for_clean_states() {
+        assert!(MergeStateStatus::Clean.is_ready_to_merge());
+        assert!(MergeStateStatus::HasHooks.is_ready_to_merge());
+        assert!(!MergeStateStatus::Blocked.is_ready_to_merge());
+    }
+
+    #[test]
+    fn merge_state_status_needs_action_only_for_blocking_states() {
+        assert!(MergeStateStatus::Behind.needs_action());
+        assert!(MergeStateStatus::Dirty.needs_action());
+        assert!(MergeStateStatus::Unstable.needs_action());
+        assert!(!MergeStateStatus::Clean.needs_action());
     }
 }

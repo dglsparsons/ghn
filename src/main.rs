@@ -623,7 +623,10 @@ fn split_review_action(
                     Action::Open | Action::Read | Action::Done | Action::Unsubscribe
                 )
             });
-            let is_notification_target = *index > 0 && *index <= notifications.len();
+            let is_notification_target = matches!(
+                ui::display_entry_key(*index, notifications, my_prs),
+                Some(ui::DisplayEntryKey::Notification(_))
+            );
             if !has_read_like_action && is_notification_target {
                 remaining.push(Action::Read);
             }
@@ -784,7 +787,7 @@ fn restore_snapshot(app: &mut AppState, snapshot: &UndoSnapshot) {
 }
 
 fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Action>>) {
-    let notification_count = app.notifications.len();
+    let display_order = ui::display_order(&app.notifications, &app.my_prs);
     let mut remove_notifications: Vec<usize> = Vec::new();
     let mut remove_my_prs: Vec<usize> = Vec::new();
 
@@ -793,72 +796,74 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
             continue;
         }
 
-        if *index <= notification_count {
-            let idx = index.saturating_sub(1);
-            let mut remove = false;
-            let mut override_state = None;
-            let notification_id = {
-                let Some(notification) = app.notifications.get_mut(idx) else {
-                    continue;
+        match display_order.get(index.saturating_sub(1)).copied() {
+            Some(ui::DisplayEntryKey::Notification(idx)) => {
+                let mut remove = false;
+                let mut override_state = None;
+                let notification_id = {
+                    let Some(notification) = app.notifications.get_mut(idx) else {
+                        continue;
+                    };
+
+                    let notification_id = notification.id.clone();
+                    for action in actions {
+                        match action {
+                            Action::Open | Action::Read => {
+                                notification.unread = false;
+                                if !app.include_read {
+                                    remove = true;
+                                }
+                                record_override_state(
+                                    &mut override_state,
+                                    NotificationOverrideState::Read,
+                                );
+                            }
+                            Action::Done | Action::Unsubscribe => {
+                                notification.unread = false;
+                                remove = true;
+                                record_override_state(
+                                    &mut override_state,
+                                    NotificationOverrideState::Suppress,
+                                );
+                            }
+                            Action::Yank
+                            | Action::PrettyYank
+                            | Action::Review
+                            | Action::ReviewNoAnalyze
+                            | Action::Branch => {}
+                        }
+                    }
+
+                    if remove {
+                        remove_notifications.push(idx);
+                    }
+
+                    notification_id
                 };
 
-                let notification_id = notification.id.clone();
-                for action in actions {
-                    match action {
-                        Action::Open | Action::Read => {
-                            notification.unread = false;
-                            if !app.include_read {
-                                remove = true;
-                            }
-                            record_override_state(
-                                &mut override_state,
-                                NotificationOverrideState::Read,
-                            );
-                        }
-                        Action::Done | Action::Unsubscribe => {
-                            notification.unread = false;
-                            remove = true;
-                            record_override_state(
-                                &mut override_state,
-                                NotificationOverrideState::Suppress,
-                            );
-                        }
-                        Action::Yank
-                        | Action::PrettyYank
-                        | Action::Review
-                        | Action::ReviewNoAnalyze
-                        | Action::Branch => {}
+                if let Some(state) = override_state {
+                    record_notification_override(
+                        &mut app.notification_overrides,
+                        &notification_id,
+                        state,
+                    );
+                }
+            }
+            Some(ui::DisplayEntryKey::MyPullRequest(idx)) => {
+                if idx >= app.my_prs.len() {
+                    continue;
+                }
+                let ignore = actions.contains(&Action::Unsubscribe);
+                if ignore {
+                    if let Some(pr) = app.my_prs.get(idx) {
+                        app.ignored_prs.insert(pr.url.clone());
                     }
                 }
-
-                if remove {
-                    remove_notifications.push(idx);
-                }
-
-                notification_id
-            };
-
-            if let Some(state) = override_state {
-                record_notification_override(
-                    &mut app.notification_overrides,
-                    &notification_id,
-                    state,
-                );
-            }
-        } else {
-            let idx = index.saturating_sub(notification_count + 1);
-            if idx >= app.my_prs.len() {
-                continue;
-            }
-            let ignore = actions.contains(&Action::Unsubscribe);
-            if ignore {
-                if let Some(pr) = app.my_prs.get(idx) {
-                    app.ignored_prs.insert(pr.url.clone());
+                if ignore {
+                    remove_my_prs.push(idx);
                 }
             }
-            if ignore {
-                remove_my_prs.push(idx);
-            }
+            None => continue,
         }
     }
 
@@ -885,13 +890,9 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
 }
 
 fn apply_undo_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Action>>) {
-    let notification_count = app.notifications.len();
+    let display_order = ui::display_order(&app.notifications, &app.my_prs);
 
     for (index, actions) in commands {
-        if *index == 0 || *index > notification_count {
-            continue;
-        }
-
         let restore_unread = actions
             .iter()
             .any(|action| matches!(action, Action::Read | Action::Done | Action::Unsubscribe));
@@ -899,7 +900,13 @@ fn apply_undo_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Ve
             continue;
         }
 
-        if let Some(notification) = app.notifications.get_mut(index.saturating_sub(1)) {
+        let Some(ui::DisplayEntryKey::Notification(notification_idx)) =
+            display_order.get(index.saturating_sub(1)).copied()
+        else {
+            continue;
+        };
+
+        if let Some(notification) = app.notifications.get_mut(notification_idx) {
             notification.unread = true;
         }
     }
@@ -1397,18 +1404,14 @@ fn entry_for_index(
     notifications: &[Notification],
     my_prs: &[MyPullRequest],
 ) -> Option<EntrySnapshot> {
-    if index == 0 {
-        return None;
-    }
-
-    if index <= notifications.len() {
-        notifications
-            .get(index - 1)
+    match ui::display_entry_key(index, notifications, my_prs)? {
+        ui::DisplayEntryKey::Notification(idx) => notifications
+            .get(idx)
             .cloned()
-            .map(EntrySnapshot::Notification)
-    } else {
-        let idx = index - notifications.len() - 1;
-        my_prs.get(idx).cloned().map(EntrySnapshot::MyPullRequest)
+            .map(EntrySnapshot::Notification),
+        ui::DisplayEntryKey::MyPullRequest(idx) => {
+            my_prs.get(idx).cloned().map(EntrySnapshot::MyPullRequest)
+        }
     }
 }
 
@@ -1669,6 +1672,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
+                merge_state_status: None,
                 head_ref: Some("feature/branch".to_string()),
             },
             repository: Repository {
@@ -1699,6 +1703,7 @@ mod tests {
                 status: Vec::new(),
                 ci_status: None,
                 review_status: None,
+                merge_state_status: None,
                 head_ref: Some("feature/branch".to_string()),
             },
             repository: Repository {
