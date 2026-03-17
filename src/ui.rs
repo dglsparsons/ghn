@@ -171,6 +171,9 @@ fn draw_lists(f: &mut Frame, area: Rect, app: &AppState) {
     let sections_area = split_bucket_area(area, &sections);
 
     for (section, area) in sections.iter().zip(sections_area) {
+        if area.height == 0 {
+            continue;
+        }
         draw_bucket_section(
             f,
             area,
@@ -189,9 +192,13 @@ struct BucketSection<'a> {
 }
 
 impl BucketSection<'_> {
-    fn fill_weight(&self) -> u16 {
-        let count = self.entries.len().saturating_mul(3).max(1);
-        count.min(u16::MAX as usize) as u16
+    fn required_height(&self) -> u16 {
+        if self.entries.is_empty() {
+            return 0;
+        }
+
+        let content_height = self.entries.len().saturating_mul(3).saturating_sub(1);
+        content_height.saturating_add(2).min(u16::MAX as usize) as u16
     }
 }
 
@@ -245,16 +252,24 @@ fn split_bucket_area(area: Rect, sections: &[BucketSection<'_>]) -> Vec<Rect> {
         return Vec::new();
     }
 
-    let constraints: Vec<Constraint> = sections
-        .iter()
-        .map(|section| Constraint::Fill(section.fill_weight()))
-        .collect();
+    let mut next_y = area.y;
+    let mut remaining_height = area.height;
 
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area)
-        .to_vec()
+    sections
+        .iter()
+        .map(|section| {
+            let height = section.required_height().min(remaining_height);
+            let rect = Rect {
+                x: area.x,
+                y: next_y,
+                width: area.width,
+                height,
+            };
+            next_y = next_y.saturating_add(height);
+            remaining_height = remaining_height.saturating_sub(height);
+            rect
+        })
+        .collect()
 }
 
 fn bucket_item<'a>(
@@ -473,6 +488,7 @@ fn collect_layout_max(
 enum NotificationBucket {
     NeedsReview,
     NeedsAction,
+    WaitingOnCi,
     ReadyToMerge,
     Other,
     Draft,
@@ -483,6 +499,7 @@ impl NotificationBucket {
         match self {
             Self::NeedsReview => "Needs Review",
             Self::NeedsAction => "Needs Action",
+            Self::WaitingOnCi => "Waiting on CI",
             Self::ReadyToMerge => "Ready to Merge",
             Self::Other => "Other",
             Self::Draft => "Draft",
@@ -493,6 +510,7 @@ impl NotificationBucket {
         let color = match self {
             Self::NeedsReview => Color::Yellow,
             Self::NeedsAction => Color::Red,
+            Self::WaitingOnCi => Color::LightBlue,
             Self::ReadyToMerge => Color::Green,
             Self::Other => Color::DarkGray,
             Self::Draft => Color::Gray,
@@ -538,6 +556,7 @@ fn build_bucket_key_sections(
 ) -> Vec<(NotificationBucket, Vec<DisplayEntryKey>)> {
     let mut needs_review = Vec::new();
     let mut needs_action = Vec::new();
+    let mut waiting_on_ci = Vec::new();
     let mut ready_to_merge = Vec::new();
     let mut other = Vec::new();
     let mut draft = Vec::new();
@@ -548,6 +567,7 @@ fn build_bucket_key_sections(
         match notification_bucket(&BucketItem::Notification(notification)) {
             NotificationBucket::NeedsReview => needs_review.push(entry),
             NotificationBucket::NeedsAction => needs_action.push(entry),
+            NotificationBucket::WaitingOnCi => waiting_on_ci.push(entry),
             NotificationBucket::ReadyToMerge => ready_to_merge.push(entry),
             NotificationBucket::Other => other.push(entry),
             NotificationBucket::Draft => draft.push(entry),
@@ -560,6 +580,7 @@ fn build_bucket_key_sections(
         match notification_bucket(&BucketItem::MyPullRequest(pr)) {
             NotificationBucket::NeedsReview => needs_review.push(entry),
             NotificationBucket::NeedsAction => needs_action.push(entry),
+            NotificationBucket::WaitingOnCi => waiting_on_ci.push(entry),
             NotificationBucket::ReadyToMerge => ready_to_merge.push(entry),
             NotificationBucket::Other => other.push(entry),
             NotificationBucket::Draft => draft.push(entry),
@@ -567,9 +588,10 @@ fn build_bucket_key_sections(
     }
 
     let mut sections = vec![
-        (NotificationBucket::NeedsReview, needs_review),
-        (NotificationBucket::NeedsAction, needs_action),
         (NotificationBucket::ReadyToMerge, ready_to_merge),
+        (NotificationBucket::NeedsAction, needs_action),
+        (NotificationBucket::WaitingOnCi, waiting_on_ci),
+        (NotificationBucket::NeedsReview, needs_review),
     ];
     if !other.is_empty() {
         sections.push((NotificationBucket::Other, other));
@@ -615,6 +637,10 @@ fn notification_bucket(item: &BucketItem<'_>) -> NotificationBucket {
         return NotificationBucket::NeedsAction;
     }
 
+    if is_waiting_on_ci(item) {
+        return NotificationBucket::WaitingOnCi;
+    }
+
     if matches!(subject.review_status, Some(ReviewStatus::Approved))
         && subject
             .merge_state_status
@@ -641,9 +667,8 @@ fn is_draft_pull_request(subject: &Subject) -> bool {
     subject.status.contains(&SubjectStatus::Draft) && !is_terminal_pull_request(subject)
 }
 
-fn is_approved_pending_ci_from_others(item: &BucketItem<'_>) -> bool {
-    matches!(item, BucketItem::Notification(_))
-        && item.subject().kind.eq_ignore_ascii_case("pullrequest")
+fn is_waiting_on_ci(item: &BucketItem<'_>) -> bool {
+    item.subject().kind.eq_ignore_ascii_case("pullrequest")
         && !is_terminal_pull_request(item.subject())
         && !is_draft_pull_request(item.subject())
         && matches!(item.subject().review_status, Some(ReviewStatus::Approved))
@@ -1072,7 +1097,7 @@ fn build_target_map(
             targets.entry('u').or_default().push(index);
         }
 
-        if is_approved_pending_ci_from_others(&item) {
+        if is_waiting_on_ci(&item) {
             targets.entry('w').or_default().push(index);
         }
 
@@ -1188,13 +1213,14 @@ mod tests {
         action_marker, base_notification_style, build_bucket_sections, build_pending_map,
         build_status_lines, ci_indicator, collect_layout_max, kind_color, layout_widths,
         notification_bucket, pending_style, render_repo_and_author, review_indicator,
-        select_legend_lines, status_prefixes, truncate_with_suffix, BucketItem, LayoutMax,
-        NotificationBucket, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
+        select_legend_lines, split_bucket_area, status_prefixes, truncate_with_suffix, BucketItem,
+        LayoutMax, NotificationBucket, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
     };
     use crate::types::{
         Action, CiStatus, MergeStateStatus, MyPullRequest, Notification, Repository, ReviewStatus,
         Subject, SubjectStatus,
     };
+    use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier, Style};
 
     fn sample_bucket_notification(
@@ -1758,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn build_pending_map_targets_approved_pending_ci_notifications() {
+    fn build_pending_map_targets_approved_pending_ci_entries() {
         let notifications = vec![
             sample_bucket_notification(
                 "1",
@@ -1789,7 +1815,7 @@ mod tests {
         let pending = build_pending_map("wo", &notifications, &my_prs);
         assert_eq!(pending.get(&1), Some(&vec![Action::Open]));
         assert_eq!(pending.get(&2), Some(&vec![Action::Open]));
-        assert!(!pending.contains_key(&3));
+        assert_eq!(pending.get(&3), Some(&vec![Action::Open]));
     }
 
     #[test]
@@ -1847,6 +1873,24 @@ mod tests {
     }
 
     #[test]
+    fn notification_bucket_classifies_waiting_on_ci_prs() {
+        let notification = sample_bucket_notification(
+            "4",
+            "mention",
+            "PullRequest",
+            Vec::new(),
+            Some(CiStatus::Pending),
+            Some(ReviewStatus::Approved),
+            Some(MergeStateStatus::Blocked),
+        );
+
+        assert_eq!(
+            notification_bucket(&BucketItem::Notification(&notification)),
+            NotificationBucket::WaitingOnCi
+        );
+    }
+
+    #[test]
     fn build_bucket_sections_uses_rendered_sequential_indices() {
         let notifications = vec![
             sample_bucket_notification(
@@ -1867,9 +1911,23 @@ mod tests {
                 Some(ReviewStatus::Approved),
                 Some(MergeStateStatus::Clean),
             ),
+            sample_bucket_notification(
+                "4",
+                "mention",
+                "PullRequest",
+                Vec::new(),
+                Some(CiStatus::Pending),
+                Some(ReviewStatus::Approved),
+                Some(MergeStateStatus::Blocked),
+            ),
             sample_bucket_notification("3", "mention", "Issue", Vec::new(), None, None, None),
         ];
-        let notification_times = vec!["1m".to_string(), "2m".to_string(), "3m".to_string()];
+        let notification_times = vec![
+            "1m".to_string(),
+            "2m".to_string(),
+            "4m".to_string(),
+            "3m".to_string(),
+        ];
         let my_prs = vec![sample_bucket_my_pr(
             "9",
             None,
@@ -1881,19 +1939,191 @@ mod tests {
         let sections =
             build_bucket_sections(&notifications, &notification_times, &my_prs, &my_pr_times);
 
-        assert_eq!(sections.len(), 5);
-        assert_eq!(sections[0].bucket, NotificationBucket::NeedsReview);
+        assert_eq!(sections.len(), 6);
+        assert_eq!(sections[0].bucket, NotificationBucket::ReadyToMerge);
         assert_eq!(sections[0].entries[0].index, 1);
-        assert_eq!(sections[0].entries[0].relative_time, "1m");
+        assert_eq!(sections[0].entries[0].relative_time, "9m");
         assert_eq!(sections[1].bucket, NotificationBucket::NeedsAction);
         assert_eq!(sections[1].entries[0].index, 2);
-        assert_eq!(sections[2].bucket, NotificationBucket::ReadyToMerge);
+        assert_eq!(sections[2].bucket, NotificationBucket::WaitingOnCi);
         assert_eq!(sections[2].entries[0].index, 3);
-        assert_eq!(sections[2].entries[0].relative_time, "9m");
-        assert_eq!(sections[3].bucket, NotificationBucket::Other);
+        assert_eq!(sections[2].entries[0].relative_time, "4m");
+        assert_eq!(sections[3].bucket, NotificationBucket::NeedsReview);
         assert_eq!(sections[3].entries[0].index, 4);
-        assert_eq!(sections[4].bucket, NotificationBucket::Draft);
-        assert!(sections[4].entries.is_empty());
+        assert_eq!(sections[3].entries[0].relative_time, "1m");
+        assert_eq!(sections[4].bucket, NotificationBucket::Other);
+        assert_eq!(sections[4].entries[0].index, 5);
+        assert_eq!(sections[5].bucket, NotificationBucket::Draft);
+        assert!(sections[5].entries.is_empty());
+    }
+
+    #[test]
+    fn split_bucket_area_prioritizes_earlier_sections() {
+        let notifications = vec![
+            sample_bucket_notification(
+                "1",
+                "review_requested",
+                "PullRequest",
+                Vec::new(),
+                None,
+                Some(ReviewStatus::ReviewRequired),
+                None,
+            ),
+            sample_bucket_notification(
+                "2",
+                "mention",
+                "PullRequest",
+                Vec::new(),
+                Some(CiStatus::Failure),
+                Some(ReviewStatus::Approved),
+                Some(MergeStateStatus::Clean),
+            ),
+            sample_bucket_notification("3", "mention", "Issue", Vec::new(), None, None, None),
+            sample_bucket_notification(
+                "6",
+                "mention",
+                "PullRequest",
+                Vec::new(),
+                Some(CiStatus::Pending),
+                Some(ReviewStatus::Approved),
+                Some(MergeStateStatus::Blocked),
+            ),
+            sample_bucket_notification(
+                "4",
+                "mention",
+                "PullRequest",
+                vec![SubjectStatus::Draft],
+                None,
+                None,
+                Some(MergeStateStatus::Draft),
+            ),
+            sample_bucket_notification(
+                "5",
+                "mention",
+                "PullRequest",
+                vec![SubjectStatus::Draft],
+                None,
+                None,
+                Some(MergeStateStatus::Draft),
+            ),
+        ];
+        let notification_times = vec![
+            "1m".to_string(),
+            "2m".to_string(),
+            "3m".to_string(),
+            "6m".to_string(),
+            "4m".to_string(),
+            "5m".to_string(),
+        ];
+        let my_prs = vec![sample_bucket_my_pr(
+            "9",
+            None,
+            Some(ReviewStatus::Approved),
+            Some(MergeStateStatus::Clean),
+        )];
+        let my_pr_times = vec!["9m".to_string()];
+
+        let sections =
+            build_bucket_sections(&notifications, &notification_times, &my_prs, &my_pr_times);
+        let heights: Vec<u16> = split_bucket_area(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 20,
+            },
+            &sections,
+        )
+        .into_iter()
+        .map(|rect| rect.height)
+        .collect();
+
+        assert_eq!(heights, vec![4, 4, 4, 4, 4, 0]);
+    }
+
+    #[test]
+    fn split_bucket_area_caps_sections_to_rendered_height() {
+        let notifications = vec![
+            sample_bucket_notification(
+                "1",
+                "review_requested",
+                "PullRequest",
+                Vec::new(),
+                None,
+                Some(ReviewStatus::ReviewRequired),
+                None,
+            ),
+            sample_bucket_notification(
+                "2",
+                "mention",
+                "PullRequest",
+                Vec::new(),
+                Some(CiStatus::Failure),
+                Some(ReviewStatus::Approved),
+                Some(MergeStateStatus::Clean),
+            ),
+            sample_bucket_notification("3", "mention", "Issue", Vec::new(), None, None, None),
+            sample_bucket_notification(
+                "6",
+                "mention",
+                "PullRequest",
+                Vec::new(),
+                Some(CiStatus::Pending),
+                Some(ReviewStatus::Approved),
+                Some(MergeStateStatus::Blocked),
+            ),
+            sample_bucket_notification(
+                "4",
+                "mention",
+                "PullRequest",
+                vec![SubjectStatus::Draft],
+                None,
+                None,
+                Some(MergeStateStatus::Draft),
+            ),
+            sample_bucket_notification(
+                "5",
+                "mention",
+                "PullRequest",
+                vec![SubjectStatus::Draft],
+                None,
+                None,
+                Some(MergeStateStatus::Draft),
+            ),
+        ];
+        let notification_times = vec![
+            "1m".to_string(),
+            "2m".to_string(),
+            "3m".to_string(),
+            "6m".to_string(),
+            "4m".to_string(),
+            "5m".to_string(),
+        ];
+        let my_prs = vec![sample_bucket_my_pr(
+            "9",
+            None,
+            Some(ReviewStatus::Approved),
+            Some(MergeStateStatus::Clean),
+        )];
+        let my_pr_times = vec!["9m".to_string()];
+
+        let sections =
+            build_bucket_sections(&notifications, &notification_times, &my_prs, &my_pr_times);
+        let heights: Vec<u16> = split_bucket_area(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 60,
+            },
+            &sections,
+        )
+        .into_iter()
+        .map(|rect| rect.height)
+        .collect();
+
+        assert_eq!(heights, vec![4, 4, 4, 4, 4, 7]);
+        assert_eq!(heights.iter().sum::<u16>(), 27);
     }
 
     #[test]
@@ -1903,6 +2133,21 @@ mod tests {
         assert_eq!(
             notification_bucket(&BucketItem::MyPullRequest(&pr)),
             NotificationBucket::Other
+        );
+    }
+
+    #[test]
+    fn notification_bucket_classifies_waiting_on_ci_my_prs() {
+        let pr = sample_bucket_my_pr(
+            "6",
+            Some(CiStatus::Pending),
+            Some(ReviewStatus::Approved),
+            Some(MergeStateStatus::Blocked),
+        );
+
+        assert_eq!(
+            notification_bucket(&BucketItem::MyPullRequest(&pr)),
+            NotificationBucket::WaitingOnCi
         );
     }
 
