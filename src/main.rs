@@ -35,8 +35,8 @@ use tui_textarea::{CursorMove, TextArea};
 use crate::{
     commands::is_target_char,
     github::{
-        fetch_notifications_and_my_prs, fetch_pretty_pull_request, mark_as_done, mark_as_read,
-        mark_as_unread, parse_pull_request_key, subscribe_to_thread, unsubscribe,
+        fetch_notifications_and_my_prs_cached, fetch_pretty_pull_request, mark_as_done,
+        mark_as_read, mark_as_unread, parse_pull_request_key, subscribe_to_thread, unsubscribe,
         PrettyPullRequest,
     },
     ignore::{append_ignored_pr, load_ignored_prs, remove_ignored_pr},
@@ -364,15 +364,26 @@ fn spawn_poller(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut viewer_login: Option<String> = None;
 
         loop {
-            let result = fetch_notifications_and_my_prs(&client, &token, include_read).await;
+            let result = fetch_notifications_and_my_prs_cached(
+                &client,
+                &token,
+                include_read,
+                viewer_login.as_deref(),
+            )
+            .await;
             match result {
-                Ok((notifications, my_prs)) => {
+                Ok(payload) => {
+                    let next_login = payload.viewer_login.trim();
+                    if !next_login.is_empty() && next_login != "unknown" {
+                        viewer_login = Some(next_login.to_string());
+                    }
                     let _ = event_tx
                         .send(AppEvent::Data {
-                            notifications,
-                            my_prs,
+                            notifications: payload.notifications,
+                            my_prs: payload.my_prs,
                         })
                         .await;
                 }

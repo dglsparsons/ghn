@@ -9,7 +9,10 @@ use ratatui::{
 };
 
 use crate::{
-    types::{Action, CiStatus, MyPullRequest, Notification, ReviewStatus, Subject, SubjectStatus},
+    types::{
+        Action, CiStatus, MergeStateStatus, MyPullRequest, Notification, ReviewStatus, Subject,
+        SubjectStatus,
+    },
     AppState,
 };
 
@@ -21,11 +24,11 @@ const COMMANDS_SHORT: &str = "Cmds o/y/Y/r/d/q/p/P/b/U";
 const COMMANDS_TINY: &str = "o y Y r d q p P b U";
 
 const TARGETS_FULL: &str =
-    "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, w approved+CI pending, m merged, c closed, f draft";
+    "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, ! conflicts, w approved+CI pending, m merged, c closed, f draft";
 const TARGETS_COMPACT: &str =
-    "Targets: 1-3/1 2 3, u unread, ? review, a appr, x chg, w appr+CI pend, m merged, c closed, f draft";
-const TARGETS_SHORT: &str = "Tgt 1-3/1 2 3 u ? a x w m c f";
-const TARGETS_TINY: &str = "1-3 u ? a x w m c f";
+    "Targets: 1-3/1 2 3, u unread, ? review, a appr, x chg, ! conf, w appr+CI pend, m merged, c closed, f draft";
+const TARGETS_SHORT: &str = "Tgt 1-3/1 2 3 u ? a x ! w m c f";
+const TARGETS_TINY: &str = "1-3 u ? a x ! w m c f";
 const MAX_KIND_WIDTH: usize = 14;
 const MAX_TIME_WIDTH: usize = 6;
 const MIN_KIND_WIDTH: usize = 3;
@@ -466,7 +469,7 @@ fn update_layout_max<T: ListItemLike>(layout_max: &mut LayoutMax, items: &[T], t
     }
     if items
         .iter()
-        .any(|item| effective_review_status(item.subject()).is_some())
+        .any(|item| effective_review_indicator_status(item.subject()).is_some())
     {
         layout_max.max_review = MAX_REVIEW_WIDTH;
     }
@@ -745,6 +748,42 @@ struct ReviewIndicator {
     style: Style,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReviewIndicatorStatus {
+    Conflicts,
+    Approved,
+    ReviewRequired,
+    ChangesRequested,
+}
+
+impl ReviewIndicatorStatus {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Conflicts => "!",
+            Self::Approved => "A",
+            Self::ReviewRequired => "?",
+            Self::ChangesRequested => "X",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Conflicts | Self::ChangesRequested => Color::Red,
+            Self::Approved => Color::Green,
+            Self::ReviewRequired => Color::Yellow,
+        }
+    }
+
+    fn target(self) -> char {
+        match self {
+            Self::Conflicts => '!',
+            Self::Approved => 'a',
+            Self::ReviewRequired => '?',
+            Self::ChangesRequested => 'x',
+        }
+    }
+}
+
 // Keep Draft first so draft+closed/merged states stay visible in the prefix.
 const STATUS_ORDER: [SubjectStatus; 3] = [
     SubjectStatus::Draft,
@@ -798,19 +837,20 @@ fn ci_indicator(subject: &Subject) -> Option<CiIndicator> {
 }
 
 fn review_indicator(subject: &Subject) -> Option<ReviewIndicator> {
-    let status = effective_review_status(subject)?;
-    let (text, color) = match status {
-        ReviewStatus::Approved => ("A", Color::Green),
-        ReviewStatus::ReviewRequired => ("?", Color::Yellow),
-        ReviewStatus::ChangesRequested => ("X", Color::Red),
-    };
+    let status = effective_review_indicator_status(subject)?;
     Some(ReviewIndicator {
-        text,
-        style: Style::default().fg(color).add_modifier(Modifier::BOLD),
+        text: status.text(),
+        style: Style::default()
+            .fg(status.color())
+            .add_modifier(Modifier::BOLD),
     })
 }
 
-fn effective_review_status(subject: &Subject) -> Option<ReviewStatus> {
+fn effective_review_indicator_status(subject: &Subject) -> Option<ReviewIndicatorStatus> {
+    if matches!(subject.merge_state_status, Some(MergeStateStatus::Dirty)) {
+        return Some(ReviewIndicatorStatus::Conflicts);
+    }
+
     let status = subject.review_status?;
     if status == ReviewStatus::ReviewRequired
         && subject.status.iter().any(|subject_status| {
@@ -823,7 +863,11 @@ fn effective_review_status(subject: &Subject) -> Option<ReviewStatus> {
         // Draft/closed/merged PRs shouldn't display a pending review indicator.
         return None;
     }
-    Some(status)
+    Some(match status {
+        ReviewStatus::Approved => ReviewIndicatorStatus::Approved,
+        ReviewStatus::ReviewRequired => ReviewIndicatorStatus::ReviewRequired,
+        ReviewStatus::ChangesRequested => ReviewIndicatorStatus::ChangesRequested,
+    })
 }
 
 fn pending_style(pending: Option<&Vec<Action>>) -> Style {
@@ -1116,13 +1160,11 @@ fn push_status_targets(targets: &mut HashMap<char, Vec<usize>>, index: usize, su
         };
         targets.entry(key).or_default().push(index);
     }
-    if let Some(review_status) = effective_review_status(subject) {
-        let key = match review_status {
-            ReviewStatus::ReviewRequired => '?',
-            ReviewStatus::Approved => 'a',
-            ReviewStatus::ChangesRequested => 'x',
-        };
-        targets.entry(key).or_default().push(index);
+    if let Some(review_status) = effective_review_indicator_status(subject) {
+        targets
+            .entry(review_status.target())
+            .or_default()
+            .push(index);
     }
 }
 
@@ -1527,6 +1569,35 @@ mod tests {
         assert_eq!(pending.get(&4), Some(&vec![Action::Open]));
 
         let pending = build_pending_map("xo", &notifications, &my_prs);
+        assert_eq!(pending.get(&2), Some(&vec![Action::Open]));
+    }
+
+    #[test]
+    fn build_pending_map_targets_conflicts() {
+        let my_prs = Vec::new();
+        let notifications = vec![
+            sample_bucket_notification(
+                "1",
+                "mention",
+                "PullRequest",
+                Vec::new(),
+                None,
+                Some(ReviewStatus::Approved),
+                Some(MergeStateStatus::Dirty),
+            ),
+            sample_bucket_notification(
+                "2",
+                "mention",
+                "PullRequest",
+                Vec::new(),
+                None,
+                Some(ReviewStatus::ChangesRequested),
+                Some(MergeStateStatus::Dirty),
+            ),
+        ];
+
+        let pending = build_pending_map("!o", &notifications, &my_prs);
+        assert_eq!(pending.get(&1), Some(&vec![Action::Open]));
         assert_eq!(pending.get(&2), Some(&vec![Action::Open]));
     }
 
@@ -2341,6 +2412,42 @@ mod tests {
 
         let indicator = review_indicator(&notification.subject).expect("review indicator");
         assert_eq!(indicator.text, "?");
+    }
+
+    #[test]
+    fn review_indicator_shows_conflicts() {
+        let notification = Notification {
+            id: "thread-3b".to_string(),
+            node_id: "node-3b".to_string(),
+            subject_id: None,
+            unread: true,
+            reason: "review_requested".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: Subject {
+                title: "Conflicted".to_string(),
+                url: "https://github.com/acme/widgets/pull/33".to_string(),
+                kind: "PullRequest".to_string(),
+                author: None,
+                status: Vec::new(),
+                ci_status: None,
+                review_status: Some(ReviewStatus::Approved),
+                merge_state_status: Some(MergeStateStatus::Dirty),
+                head_ref: None,
+            },
+            repository: Repository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+                merge_settings: None,
+            },
+            url: "https://github.com/acme/widgets/pull/33".to_string(),
+        };
+
+        let indicator = review_indicator(&notification.subject).expect("review indicator");
+        assert_eq!(indicator.text, "!");
+        assert_eq!(
+            indicator.style,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::types::Action;
 
 pub fn is_target_char(ch: char) -> bool {
-    matches!(ch, 'm' | 'c' | 'f' | '?' | 'a' | 'x' | 'u' | 'w')
+    matches!(ch, 'm' | 'c' | 'f' | '?' | 'a' | 'x' | '!' | 'u' | 'w')
 }
 
 // Greedily split concatenated digits into the longest valid indices based on the list size.
@@ -400,5 +400,14 @@ mod tests {
         let result = parse_commands("?o", 10, &targets);
         assert_eq!(result.get(&1), Some(&vec![Action::Open]));
         assert_eq!(result.get(&3), Some(&vec![Action::Open]));
+    }
+
+    #[test]
+    fn parses_conflict_targets() {
+        let mut targets = HashMap::new();
+        targets.insert('!', vec![2, 4]);
+        let result = parse_commands("!o", 10, &targets);
+        assert_eq!(result.get(&2), Some(&vec![Action::Open]));
+        assert_eq!(result.get(&4), Some(&vec![Action::Open]));
     }
 }

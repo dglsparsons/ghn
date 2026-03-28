@@ -4,8 +4,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::types::{
-    CiStatus, GraphQlError, GraphQlResponse, MergeMethod, MergeSettings, MergeStateStatus,
-    MyPullRequest, Notification, Repository, ReviewStatus, Subject, SubjectStatus,
+    CiStatus, GraphQlError, GraphQlResponse, MergeStateStatus, MyPullRequest, Notification,
+    Repository, ReviewStatus, Subject, SubjectStatus,
 };
 
 const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
@@ -89,11 +89,6 @@ struct GraphQlRepository {
     name: String,
     name_with_owner: String,
     is_archived: bool,
-    merge_commit_allowed: Option<bool>,
-    squash_merge_allowed: Option<bool>,
-    rebase_merge_allowed: Option<bool>,
-    auto_merge_allowed: Option<bool>,
-    viewer_default_merge_method: Option<MergeMethod>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +174,13 @@ pub struct PrettyPullRequest {
     pub head_repo_name: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct InboxPayload {
+    pub notifications: Vec<Notification>,
+    pub my_prs: Vec<MyPullRequest>,
+    pub viewer_login: String,
+}
+
 const NOTIFICATIONS_QUERY: &str = r#"
 query GetNotifications($statuses: [NotificationStatus!]) {
   viewer {
@@ -205,11 +207,6 @@ query GetNotifications($statuses: [NotificationStatus!]) {
               name
               nameWithOwner
               isArchived
-              mergeCommitAllowed
-              squashMergeAllowed
-              rebaseMergeAllowed
-              autoMergeAllowed
-              viewerDefaultMergeMethod
             }
             commits(last: 1) {
               nodes {
@@ -253,11 +250,6 @@ query GetMyPullRequests($query: String!) {
           name
           nameWithOwner
           isArchived
-          mergeCommitAllowed
-          squashMergeAllowed
-          rebaseMergeAllowed
-          autoMergeAllowed
-          viewerDefaultMergeMethod
         }
         commits(last: 1) {
           nodes {
@@ -495,16 +487,6 @@ fn subject_merge_state_status(
     map_merge_state_status(subject.merge_state_status.as_deref())
 }
 
-fn merge_settings_from_repo(repo: &GraphQlRepository) -> MergeSettings {
-    MergeSettings {
-        default_method: repo.viewer_default_merge_method,
-        merge_commit_allowed: repo.merge_commit_allowed.unwrap_or(false),
-        squash_merge_allowed: repo.squash_merge_allowed.unwrap_or(false),
-        rebase_merge_allowed: repo.rebase_merge_allowed.unwrap_or(false),
-        auto_merge_allowed: repo.auto_merge_allowed.unwrap_or(false),
-    }
-}
-
 fn transform_notification(gql: GraphQlNotification) -> Notification {
     let normalized_url = normalize_pr_url(&gql.url);
     let repo_full_name = parse_repo_from_url(&normalized_url);
@@ -556,7 +538,7 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
         repository: Repository {
             name: repo_name,
             full_name: repo_full_name,
-            merge_settings: repo.map(merge_settings_from_repo),
+            merge_settings: None,
         },
         url: normalized_url,
     }
@@ -591,7 +573,6 @@ fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
     let ci_status = pull_request_ci_status(&pr);
     let review_status = pull_request_review_status(&pr);
     let merge_state_status = pull_request_merge_state_status(&pr);
-    let merge_settings = Some(merge_settings_from_repo(&pr.repository));
     let normalized_url = normalize_pr_url(&pr.url);
     let subject = Subject {
         title: pr.title,
@@ -612,7 +593,7 @@ fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
         repository: Repository {
             name: pr.repository.name,
             full_name: pr.repository.name_with_owner,
-            merge_settings,
+            merge_settings: None,
         },
         url: normalized_url,
     }
@@ -833,16 +814,40 @@ pub async fn fetch_pretty_pull_request(
     })
 }
 
-pub async fn fetch_notifications_and_my_prs(
+pub async fn fetch_notifications_and_my_prs_cached(
     client: &Client,
     token: &str,
     include_read: bool,
-) -> Result<(Vec<Notification>, Vec<MyPullRequest>)> {
-    let notifications = fetch_notifications(client, token, include_read).await?;
+    cached_viewer_login: Option<&str>,
+) -> Result<InboxPayload> {
+    let cached_viewer_login = cached_viewer_login
+        .map(str::trim)
+        .filter(|login| !login.is_empty() && *login != "unknown");
+
+    let notifications = if let Some(viewer_login) = cached_viewer_login {
+        let (notifications, pull_requests) = tokio::try_join!(
+            fetch_notifications(client, token, include_read),
+            fetch_my_pull_requests(client, token, viewer_login),
+        )?;
+        let pull_requests = dedupe_pull_requests(pull_requests, &notifications.notifications);
+
+        return Ok(InboxPayload {
+            viewer_login: notifications.viewer_login,
+            notifications: notifications.notifications,
+            my_prs: pull_requests,
+        });
+    } else {
+        fetch_notifications(client, token, include_read).await?
+    };
+
     let pull_requests = fetch_my_pull_requests(client, token, &notifications.viewer_login).await?;
     let pull_requests = dedupe_pull_requests(pull_requests, &notifications.notifications);
 
-    Ok((notifications.notifications, pull_requests))
+    Ok(InboxPayload {
+        viewer_login: notifications.viewer_login,
+        notifications: notifications.notifications,
+        my_prs: pull_requests,
+    })
 }
 
 fn dedupe_pull_requests(
@@ -1022,11 +1027,6 @@ mod tests {
                 name: "widgets".to_string(),
                 name_with_owner: "acme/widgets".to_string(),
                 is_archived,
-                merge_commit_allowed: None,
-                squash_merge_allowed: None,
-                rebase_merge_allowed: None,
-                auto_merge_allowed: None,
-                viewer_default_merge_method: None,
             },
             commits: None,
         }
@@ -1313,11 +1313,6 @@ mod tests {
                 name: "widgets".to_string(),
                 name_with_owner: "acme/widgets".to_string(),
                 is_archived: false,
-                merge_commit_allowed: None,
-                squash_merge_allowed: None,
-                rebase_merge_allowed: None,
-                auto_merge_allowed: None,
-                viewer_default_merge_method: None,
             },
             commits: Some(super::GraphQlPullRequestCommits {
                 nodes: vec![super::GraphQlPullRequestCommit {

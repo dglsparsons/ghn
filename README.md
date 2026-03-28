@@ -42,7 +42,7 @@ ghn
 
 3 * [Draft] someorg/repo ↻ ? PullRequest 10m
     Review requested: Update dependencies
-Commands: o open  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review+analyze  P review  b branch  U undo  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, w approved+CI pending, m merged, c closed, f draft  |  Executed 3 actions
+Commands: o open  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review+analyze  P review  b branch  U undo  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, ! conflicts, w approved+CI pending, m merged, c closed, f draft  |  Executed 3 actions
 > 1-3r
 ```
 
@@ -54,7 +54,7 @@ Use `q` on a My PR to add it to the ignore list.
 
 Commands target one or more numbers followed by actions. Indices can be single numbers, comma/space lists, or ranges
 like `1-3`. You can also target status groups: `m` (merged PRs), `c` (closed PRs/issues), and `f` (draft PRs),
-as well as review states: `?` (pending review), `a` (approved), `x` (changes requested), `w` (approved PRs still waiting on CI), plus `u` (unread).
+as well as PR states: `?` (pending review), `a` (approved), `x` (changes requested), `!` (has conflicts), `w` (approved PRs still waiting on CI), plus `u` (unread).
 Queue multiple commands, then press `Enter` to execute. Press `U` then `Enter` to undo the last executed batch.
 When multiple items are yanked in a single batch, their output is copied together with a blank line between each.
 Consecutive digits are parsed greedily using the longest valid prefix for the current list size. If the full number
@@ -89,6 +89,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 - `cd` - Mark all closed PR/issue notifications as done
 - `fd` - Mark all draft PR notifications as done
 - `?o` - Open all PRs pending review
+- `!o` - Open all PRs with conflicts
 - `wo` - Open approved PRs that are still waiting on CI
 - `uo` - Open all unread notifications
 
@@ -130,7 +131,7 @@ When you queue a command, the targeted notification highlights with a color indi
 | Branch | Light Blue |
 
 PRs also show a CI indicator: `✓` success, `↻` running/pending, `✗` failed.
-Review indicators show status: `?` pending review, `A` approved, `X` changes requested.
+PR indicators show status: `?` pending review, `A` approved, `X` changes requested, `!` conflicts.
 
 ## Configuration
 
