@@ -1235,7 +1235,7 @@ fn format_pretty_pull_request(pr: &PrettyPullRequest) -> String {
 
 async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) -> UndoSummary {
     enum UndoWork {
-        MarkUnread { node_id: String },
+        MarkUnread { thread_id: String },
         Resubscribe { thread_id: String },
         Unignore { url: String },
     }
@@ -1278,7 +1278,7 @@ async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) 
                 if mark_unread {
                     refresh = true;
                     tasks.push(UndoWork::MarkUnread {
-                        node_id: notification.node_id.clone(),
+                        thread_id: notification.id.clone(),
                     });
                 }
                 if resubscribe {
@@ -1305,8 +1305,8 @@ async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) 
         let client = client.clone();
         let token = token.to_string();
         let future = match task {
-            UndoWork::MarkUnread { node_id } => {
-                tokio::spawn(async move { mark_as_unread(&client, &token, &node_id).await })
+            UndoWork::MarkUnread { thread_id } => {
+                tokio::spawn(async move { mark_as_unread(&client, &token, &thread_id).await })
             }
             UndoWork::Resubscribe { thread_id } => {
                 tokio::spawn(async move { subscribe_to_thread(&client, &token, &thread_id).await })
@@ -1578,7 +1578,7 @@ async fn execute_action(
             .await??;
             if let EntrySnapshot::Notification(notification) = entry {
                 if notification.unread {
-                    mark_as_read(client, token, &notification.node_id).await?;
+                    mark_as_read(client, token, &notification.id).await?;
                 }
             }
         }
@@ -1596,20 +1596,18 @@ async fn execute_action(
         }
         Action::Read => {
             if let EntrySnapshot::Notification(notification) = entry {
-                mark_as_read(client, token, &notification.node_id).await?;
+                mark_as_read(client, token, &notification.id).await?;
             }
         }
         Action::Done => {
             if let EntrySnapshot::Notification(notification) = entry {
-                mark_as_done(client, token, &notification.node_id).await?;
+                mark_as_done(client, token, &notification.id).await?;
             }
         }
         Action::Unsubscribe => match entry {
             EntrySnapshot::Notification(notification) => {
-                if let Some(subject_id) = notification.subject_id.as_ref() {
-                    unsubscribe(client, token, subject_id).await?;
-                }
-                mark_as_done(client, token, &notification.node_id).await?;
+                unsubscribe(client, token, &notification.id).await?;
+                mark_as_done(client, token, &notification.id).await?;
             }
             EntrySnapshot::MyPullRequest(_) => {
                 append_ignored_pr(url)?;

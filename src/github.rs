@@ -13,36 +13,49 @@ const GITHUB_API: &str = "https://api.github.com";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 
 #[derive(Debug, Deserialize)]
-struct NotificationsData {
-    viewer: Viewer,
+struct ViewerLoginData {
+    viewer: ViewerLogin,
 }
 
 #[derive(Debug, Deserialize)]
-struct Viewer {
+struct ViewerLogin {
     login: String,
-    #[serde(rename = "notificationThreads")]
-    notification_threads: NotificationThreads,
 }
 
 #[derive(Debug, Deserialize)]
-struct NotificationThreads {
-    nodes: Vec<GraphQlNotification>,
+struct RestNotificationThread {
+    id: String,
+    unread: bool,
+    reason: String,
+    #[serde(rename = "updated_at")]
+    updated_at: String,
+    subject: RestNotificationSubject,
+    repository: RestNotificationRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestNotificationSubject {
+    title: String,
+    url: Option<String>,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestNotificationRepository {
+    name: String,
+    #[serde(rename = "full_name")]
+    full_name: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GraphQlNotification {
-    id: String,
-    thread_id: String,
-    title: String,
+struct GraphQlSubjectResource {
     url: String,
-    is_unread: bool,
-    last_updated_at: String,
-    reason: Option<String>,
-    optional_subject: Option<GraphQlSubject>,
+    subject: Option<GraphQlSubject>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphQlSubject {
     // GitHub sometimes returns an empty object here (e.g. for releases), so tolerate missing ids.
@@ -57,33 +70,33 @@ struct GraphQlSubject {
     repository: Option<GraphQlRepository>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GraphQlActor {
     login: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GraphQlPullRequestCommits {
     nodes: Vec<GraphQlPullRequestCommit>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GraphQlPullRequestCommit {
     commit: Option<GraphQlCommit>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GraphQlCommit {
     #[serde(rename = "statusCheckRollup")]
     status_check_rollup: Option<GraphQlStatusCheckRollup>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GraphQlStatusCheckRollup {
     state: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphQlRepository {
     name: String,
@@ -181,53 +194,10 @@ pub struct InboxPayload {
     pub viewer_login: String,
 }
 
-const NOTIFICATIONS_QUERY: &str = r#"
-query GetNotifications($statuses: [NotificationStatus!]) {
+const VIEWER_LOGIN_QUERY: &str = r#"
+query ViewerLogin {
   viewer {
     login
-    notificationThreads(first: 50, filterBy: { statuses: $statuses }) {
-      nodes {
-        id
-        threadId
-        title
-        url
-        isUnread
-        lastUpdatedAt
-        reason
-        optionalSubject {
-          ... on PullRequest {
-            id
-            state
-            isDraft
-            reviewDecision
-            mergeStateStatus
-            headRefName
-            author { login }
-            repository {
-              name
-              nameWithOwner
-              isArchived
-            }
-            commits(last: 1) {
-              nodes {
-                commit {
-                  statusCheckRollup {
-                    state
-                  }
-                }
-              }
-            }
-          }
-          ... on Issue {
-            id
-            state
-            author { login }
-          }
-          ... on Discussion { id }
-          ... on Commit { id }
-        }
-      }
-    }
   }
 }
 "#;
@@ -339,6 +309,43 @@ fn parse_subject_type(url: &str) -> String {
         "Discussion".to_string()
     } else {
         "Unknown".to_string()
+    }
+}
+
+fn first_path_segment(path: &str) -> Option<&str> {
+    path.split('/').next().filter(|segment| !segment.is_empty())
+}
+
+fn notification_subject_url(
+    api_url: Option<&str>,
+    repo_full_name: &str,
+    subject_kind: &str,
+) -> String {
+    let repo_url = format!("https://github.com/{repo_full_name}");
+    let Some(api_url) = api_url else {
+        return repo_url;
+    };
+
+    let repo_api_prefix = format!("{GITHUB_API}/repos/{repo_full_name}/");
+    let Some(path) = api_url.strip_prefix(&repo_api_prefix) else {
+        return repo_url;
+    };
+
+    match subject_kind {
+        "PullRequest" => first_path_segment(path.strip_prefix("pulls/").unwrap_or(""))
+            .map(|number| format!("{repo_url}/pull/{number}"))
+            .unwrap_or(repo_url),
+        "Issue" => first_path_segment(path.strip_prefix("issues/").unwrap_or(""))
+            .map(|number| format!("{repo_url}/issues/{number}"))
+            .unwrap_or(repo_url),
+        "Commit" => first_path_segment(path.strip_prefix("commits/").unwrap_or(""))
+            .map(|sha| format!("{repo_url}/commit/{sha}"))
+            .unwrap_or(repo_url),
+        "Discussion" => first_path_segment(path.strip_prefix("discussions/").unwrap_or(""))
+            .map(|number| format!("{repo_url}/discussions/{number}"))
+            .unwrap_or(repo_url),
+        "Release" => format!("{repo_url}/releases"),
+        _ => repo_url,
     }
 }
 
@@ -487,24 +494,49 @@ fn subject_merge_state_status(
     map_merge_state_status(subject.merge_state_status.as_deref())
 }
 
-fn transform_notification(gql: GraphQlNotification) -> Notification {
-    let normalized_url = normalize_pr_url(&gql.url);
-    let repo_full_name = parse_repo_from_url(&normalized_url);
-    let kind = parse_subject_type(&normalized_url);
-    let optional_subject = gql.optional_subject;
-    let status = subject_statuses(&kind, optional_subject.as_ref());
-    let ci_status = subject_ci_status(&kind, optional_subject.as_ref());
-    let review_status = subject_review_status(&kind, optional_subject.as_ref());
-    let merge_state_status = subject_merge_state_status(&kind, optional_subject.as_ref());
-    let head_ref = optional_subject
+fn transform_notification_thread(
+    thread: RestNotificationThread,
+    subject_details: Option<GraphQlSubject>,
+) -> Notification {
+    let RestNotificationThread {
+        id,
+        unread,
+        reason,
+        updated_at,
+        subject:
+            RestNotificationSubject {
+                title,
+                url: subject_url,
+                kind: subject_kind,
+            },
+        repository:
+            RestNotificationRepository {
+                name: repository_name,
+                full_name: repository_full_name,
+            },
+    } = thread;
+
+    let raw_url =
+        notification_subject_url(subject_url.as_deref(), &repository_full_name, &subject_kind);
+    let normalized_url = normalize_pr_url(&raw_url);
+    let kind = if subject_kind.trim().is_empty() {
+        parse_subject_type(&normalized_url)
+    } else {
+        subject_kind
+    };
+    let status = subject_statuses(&kind, subject_details.as_ref());
+    let ci_status = subject_ci_status(&kind, subject_details.as_ref());
+    let review_status = subject_review_status(&kind, subject_details.as_ref());
+    let merge_state_status = subject_merge_state_status(&kind, subject_details.as_ref());
+    let head_ref = subject_details
         .as_ref()
         .and_then(|subject| subject.head_ref_name.clone());
-    let author = optional_subject
+    let author = subject_details
         .as_ref()
         .and_then(|subject| subject.author.as_ref())
         .map(|author| author.login.clone());
     let subject = Subject {
-        title: gql.title,
+        title,
         url: normalized_url.clone(),
         kind,
         author,
@@ -515,25 +547,31 @@ fn transform_notification(gql: GraphQlNotification) -> Notification {
         head_ref,
     };
 
-    let repo = optional_subject
+    let repo = subject_details
         .as_ref()
         .and_then(|subject| subject.repository.as_ref());
     let repo_full_name = repo
         .map(|repo| repo.name_with_owner.clone())
-        .unwrap_or(repo_full_name);
+        .unwrap_or_else(|| {
+            if repository_full_name.is_empty() {
+                parse_repo_from_url(&normalized_url)
+            } else {
+                repository_full_name
+            }
+        });
     let repo_name = repo
         .map(|repo| repo.name.clone())
-        .unwrap_or_else(|| repo_full_name.split('/').nth(1).unwrap_or("").to_string());
+        .unwrap_or(repository_name);
 
     Notification {
-        id: gql.thread_id,
-        node_id: gql.id,
-        subject_id: optional_subject
+        node_id: id.clone(),
+        id,
+        subject_id: subject_details
             .as_ref()
             .and_then(|subject| subject.id.clone()),
-        unread: gql.is_unread,
-        reason: gql.reason.unwrap_or_else(|| "subscribed".to_string()),
-        updated_at: gql.last_updated_at,
+        unread,
+        reason,
+        updated_at,
         subject,
         repository: Repository {
             name: repo_name,
@@ -629,26 +667,60 @@ fn handle_graphql_errors(errors: &[GraphQlError]) -> Result<()> {
     Err(anyhow!("GraphQL error: {}", errors[0].message))
 }
 
-pub async fn fetch_notifications(
-    client: &Client,
-    token: &str,
-    include_read: bool,
-) -> Result<NotificationsPayload> {
-    let statuses = if include_read {
-        vec!["UNREAD", "READ"]
-    } else {
-        vec!["UNREAD"]
-    };
-
+async fn fetch_viewer_login(client: &Client, token: &str) -> Result<String> {
     let response = client
         .post(GITHUB_GRAPHQL)
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
         .header("User-Agent", "ghn")
-        .json(&json!({
-            "query": NOTIFICATIONS_QUERY,
-            "variables": { "statuses": statuses }
-        }))
+        .json(&json!({ "query": VIEWER_LOGIN_QUERY }))
+        .send()
+        .await
+        .context("failed to fetch viewer login")?;
+
+    if response.status() == 429 {
+        return Err(anyhow!("GitHub rate limited. Retrying later."));
+    }
+    if response.status() == 401 || response.status() == 403 {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "GitHub authentication failed ({}). {}",
+            status,
+            body.trim()
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(anyhow!("GitHub API error: {}", response.status()));
+    }
+
+    let payload: GraphQlResponse<ViewerLoginData> = response.json().await?;
+    if let Some(errors) = payload.errors {
+        handle_graphql_errors(&errors)?;
+    }
+
+    Ok(payload
+        .data
+        .map(|data| data.viewer.login)
+        .unwrap_or_else(|| "unknown".to_string()))
+}
+
+async fn fetch_notification_threads(
+    client: &Client,
+    token: &str,
+    include_read: bool,
+) -> Result<Vec<RestNotificationThread>> {
+    let response = client
+        .get(format!("{GITHUB_API}/notifications"))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+        .header("User-Agent", "ghn")
+        .query(&[
+            ("all", if include_read { "true" } else { "false" }),
+            ("participating", "false"),
+            ("per_page", "50"),
+        ])
         .send()
         .await
         .context("failed to fetch notifications")?;
@@ -669,20 +741,166 @@ pub async fn fetch_notifications(
         return Err(anyhow!("GitHub API error: {}", response.status()));
     }
 
-    let payload: GraphQlResponse<NotificationsData> = response.json().await?;
+    response
+        .json()
+        .await
+        .context("failed to decode notifications response")
+}
+
+async fn fetch_notification_subjects(
+    client: &Client,
+    token: &str,
+    urls: &[String],
+) -> Result<Vec<GraphQlSubjectResource>> {
+    if urls.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = String::from("query NotificationSubjects {\n");
+    for (idx, url) in urls.iter().enumerate() {
+        let url = serde_json::to_string(url).context("failed to encode notification url")?;
+        query.push_str(&format!(
+            r#"  n{idx}: resource(url: {url}) {{
+    ... on PullRequest {{
+      id
+      state
+      isDraft
+      reviewDecision
+      mergeStateStatus
+      headRefName
+      author {{ login }}
+      repository {{
+        name
+        nameWithOwner
+        isArchived
+      }}
+      commits(last: 1) {{
+        nodes {{
+          commit {{
+            statusCheckRollup {{
+              state
+            }}
+          }}
+        }}
+      }}
+    }}
+    ... on Issue {{
+      id
+      state
+      author {{ login }}
+      repository {{
+        name
+        nameWithOwner
+        isArchived
+      }}
+    }}
+  }}
+"#
+        ));
+    }
+    query.push_str("}\n");
+
+    let response = client
+        .post(GITHUB_GRAPHQL)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "ghn")
+        .json(&json!({ "query": query }))
+        .send()
+        .await
+        .context("failed to fetch notification subjects")?;
+
+    if response.status() == 429 {
+        return Err(anyhow!("GitHub rate limited. Retrying later."));
+    }
+    if response.status() == 401 || response.status() == 403 {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "GitHub authentication failed ({}). {}",
+            status,
+            body.trim()
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(anyhow!("GitHub API error: {}", response.status()));
+    }
+
+    let payload: GraphQlResponse<serde_json::Value> = response.json().await?;
     if let Some(errors) = payload.errors {
         handle_graphql_errors(&errors)?;
     }
 
-    let (viewer_login, nodes) = match payload.data {
-        Some(data) => {
-            let viewer = data.viewer;
-            (viewer.login, viewer.notification_threads.nodes)
-        }
-        None => ("unknown".to_string(), Vec::new()),
+    let Some(data) = payload.data.and_then(|data| data.as_object().cloned()) else {
+        return Ok(Vec::new());
     };
 
-    let notifications = nodes.into_iter().map(transform_notification).collect();
+    let mut subjects = Vec::new();
+    for (idx, url) in urls.iter().enumerate() {
+        let Some(value) = data.get(&format!("n{idx}")) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+
+        let subject = serde_json::from_value::<GraphQlSubject>(value.clone())
+            .context("failed to decode notification subject")?;
+        subjects.push(GraphQlSubjectResource {
+            url: url.clone(),
+            subject: Some(subject),
+        });
+    }
+
+    Ok(subjects)
+}
+
+pub async fn fetch_notifications(
+    client: &Client,
+    token: &str,
+    include_read: bool,
+) -> Result<NotificationsPayload> {
+    let (viewer_login, threads) = tokio::try_join!(
+        fetch_viewer_login(client, token),
+        fetch_notification_threads(client, token, include_read),
+    )?;
+
+    let mut subject_urls = Vec::new();
+    for thread in &threads {
+        if !matches!(thread.subject.kind.as_str(), "PullRequest" | "Issue") {
+            continue;
+        }
+
+        let url = notification_subject_url(
+            thread.subject.url.as_deref(),
+            &thread.repository.full_name,
+            &thread.subject.kind,
+        );
+        if !subject_urls.contains(&url) {
+            subject_urls.push(url);
+        }
+    }
+
+    let subject_details = fetch_notification_subjects(client, token, &subject_urls).await?;
+    let mut subjects_by_url = std::collections::HashMap::new();
+    for resource in subject_details {
+        if let Some(subject) = resource.subject {
+            subjects_by_url.insert(resource.url, subject);
+        }
+    }
+
+    let notifications = threads
+        .into_iter()
+        .map(|thread| {
+            let url = notification_subject_url(
+                thread.subject.url.as_deref(),
+                &thread.repository.full_name,
+                &thread.subject.kind,
+            );
+            let subject = subjects_by_url.get(&url).cloned();
+            transform_notification_thread(thread, subject)
+        })
+        .collect();
 
     Ok(NotificationsPayload {
         notifications,
@@ -877,21 +1095,11 @@ fn dedupe_pull_requests(
         .collect()
 }
 
-async fn run_mutation(
-    client: &Client,
-    token: &str,
-    query: &str,
-    variables: serde_json::Value,
+async fn send_thread_request(
+    request: reqwest::RequestBuilder,
+    context: &'static str,
 ) -> Result<()> {
-    let response = client
-        .post(GITHUB_GRAPHQL)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .header("User-Agent", "ghn")
-        .json(&json!({ "query": query, "variables": variables }))
-        .send()
-        .await
-        .context("failed to send mutation")?;
+    let response = request.send().await.context(context)?;
 
     if response.status() == 429 {
         return Err(anyhow!("GitHub rate limited. Retrying later."));
@@ -909,58 +1117,54 @@ async fn run_mutation(
         return Err(anyhow!("GitHub API error: {}", response.status()));
     }
 
-    let payload: GraphQlResponse<serde_json::Value> = response.json().await?;
-    if let Some(errors) = payload.errors {
-        handle_graphql_errors(&errors)?;
-    }
-
     Ok(())
 }
 
-pub async fn mark_as_read(client: &Client, token: &str, node_id: &str) -> Result<()> {
-    run_mutation(
-        client,
-        token,
-        r#"mutation MarkAsRead($id: ID!) {
-          markNotificationAsRead(input: { id: $id }) { success }
-        }"#,
-        json!({ "id": node_id }),
+pub async fn mark_as_read(client: &Client, token: &str, thread_id: &str) -> Result<()> {
+    let url = format!("{GITHUB_API}/notifications/threads/{thread_id}");
+    send_thread_request(
+        client
+            .patch(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .header("User-Agent", "ghn"),
+        "failed to mark thread as read",
     )
     .await
 }
 
-pub async fn mark_as_unread(client: &Client, token: &str, node_id: &str) -> Result<()> {
-    run_mutation(
-        client,
-        token,
-        r#"mutation MarkAsUnread($id: ID!) {
-          markNotificationAsUnread(input: { id: $id }) { success }
-        }"#,
-        json!({ "id": node_id }),
+pub async fn mark_as_unread(_client: &Client, _token: &str, _thread_id: &str) -> Result<()> {
+    Err(anyhow!(
+        "GitHub no longer exposes an API to mark a notification thread as unread"
+    ))
+}
+
+pub async fn mark_as_done(client: &Client, token: &str, thread_id: &str) -> Result<()> {
+    let url = format!("{GITHUB_API}/notifications/threads/{thread_id}");
+    send_thread_request(
+        client
+            .delete(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .header("User-Agent", "ghn"),
+        "failed to mark thread as done",
     )
     .await
 }
 
-pub async fn mark_as_done(client: &Client, token: &str, node_id: &str) -> Result<()> {
-    run_mutation(
-        client,
-        token,
-        r#"mutation MarkAsDone($id: ID!) {
-          markNotificationAsDone(input: { id: $id }) { success }
-        }"#,
-        json!({ "id": node_id }),
-    )
-    .await
-}
-
-pub async fn unsubscribe(client: &Client, token: &str, node_id: &str) -> Result<()> {
-    run_mutation(
-        client,
-        token,
-        r#"mutation Unsubscribe($ids: [ID!]!) {
-          unsubscribeFromNotifications(input: { ids: $ids }) { success }
-        }"#,
-        json!({ "ids": [node_id] }),
+pub async fn unsubscribe(client: &Client, token: &str, thread_id: &str) -> Result<()> {
+    let url = format!("{GITHUB_API}/notifications/threads/{thread_id}/subscription");
+    send_thread_request(
+        client
+            .put(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .header("User-Agent", "ghn")
+            .json(&json!({ "ignored": true })),
+        "failed to update thread subscription",
     )
     .await
 }
@@ -970,43 +1174,27 @@ pub async fn subscribe_to_thread(client: &Client, token: &str, thread_id: &str) 
         "{}/notifications/threads/{}/subscription",
         GITHUB_API, thread_id
     );
-    let response = client
-        .put(&url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-        .header("User-Agent", "ghn")
-        .json(&json!({ "ignored": false }))
-        .send()
-        .await
-        .context("failed to update thread subscription")?;
-
-    if response.status() == 429 {
-        return Err(anyhow!("GitHub rate limited. Retrying later."));
-    }
-    if response.status() == 401 || response.status() == 403 {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "GitHub authentication failed ({}). {}",
-            status,
-            body.trim()
-        ));
-    }
-    if !response.status().is_success() {
-        return Err(anyhow!("GitHub API error: {}", response.status()));
-    }
-
-    Ok(())
+    send_thread_request(
+        client
+            .put(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .header("User-Agent", "ghn")
+            .json(&json!({ "ignored": false })),
+        "failed to update thread subscription",
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         dedupe_pull_requests, filter_archived_pull_requests, normalize_pr_url,
-        parse_pull_request_key, parse_repo_from_url, parse_subject_type, transform_notification,
-        transform_pull_request, GraphQlNotification, GraphQlPullRequest, GraphQlRepository,
-        GraphQlSubject,
+        parse_pull_request_key, parse_repo_from_url, parse_subject_type,
+        transform_notification_thread, transform_pull_request, GraphQlPullRequest,
+        GraphQlRepository, GraphQlSubject, RestNotificationRepository, RestNotificationSubject,
+        RestNotificationThread,
     };
     use crate::types::{
         CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject, SubjectStatus,
@@ -1029,6 +1217,31 @@ mod tests {
                 is_archived,
             },
             commits: None,
+        }
+    }
+
+    fn sample_rest_notification(
+        thread_id: &str,
+        title: &str,
+        kind: &str,
+        url: &str,
+        unread: bool,
+        reason: Option<&str>,
+    ) -> RestNotificationThread {
+        RestNotificationThread {
+            id: thread_id.to_string(),
+            unread,
+            reason: reason.unwrap_or("subscribed").to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            subject: RestNotificationSubject {
+                title: title.to_string(),
+                url: Some(url.to_string()),
+                kind: kind.to_string(),
+            },
+            repository: RestNotificationRepository {
+                name: "widgets".to_string(),
+                full_name: "acme/widgets".to_string(),
+            },
         }
     }
 
@@ -1099,15 +1312,17 @@ mod tests {
 
     #[test]
     fn transform_notification_maps_fields() {
-        let gql = GraphQlNotification {
-            id: "node-1".to_string(),
-            thread_id: "thread-1".to_string(),
-            title: "Fix bug".to_string(),
-            url: "https://github.com/acme/widgets/pull/42".to_string(),
-            is_unread: true,
-            last_updated_at: "2024-01-01T00:00:00Z".to_string(),
-            reason: Some("mention".to_string()),
-            optional_subject: Some(GraphQlSubject {
+        let thread = sample_rest_notification(
+            "thread-1",
+            "Fix bug",
+            "PullRequest",
+            "https://api.github.com/repos/acme/widgets/pulls/42",
+            true,
+            Some("mention"),
+        );
+        let notification = transform_notification_thread(
+            thread,
+            Some(GraphQlSubject {
                 id: Some("subject-1".to_string()),
                 state: Some("MERGED".to_string()),
                 is_draft: Some(false),
@@ -1128,11 +1343,9 @@ mod tests {
                 }),
                 repository: None,
             }),
-        };
-
-        let notification = transform_notification(gql);
+        );
         assert_eq!(notification.id, "thread-1");
-        assert_eq!(notification.node_id, "node-1");
+        assert_eq!(notification.node_id, "thread-1");
         assert_eq!(notification.subject_id.as_deref(), Some("subject-1"));
         assert!(notification.unread);
         assert_eq!(notification.reason, "mention");
@@ -1156,15 +1369,16 @@ mod tests {
 
     #[test]
     fn transform_notification_handles_missing_subject_id() {
-        let gql = GraphQlNotification {
-            id: "node-2".to_string(),
-            thread_id: "thread-2".to_string(),
-            title: "Release v1.0.0".to_string(),
-            url: "https://github.com/acme/widgets/releases/tag/v1.0.0".to_string(),
-            is_unread: false,
-            last_updated_at: "2024-01-02T00:00:00Z".to_string(),
-            reason: None,
-            optional_subject: Some(GraphQlSubject {
+        let notification = transform_notification_thread(
+            sample_rest_notification(
+                "thread-2",
+                "Release v1.0.0",
+                "Release",
+                "https://api.github.com/repos/acme/widgets/releases/1",
+                false,
+                None,
+            ),
+            Some(GraphQlSubject {
                 id: None,
                 state: None,
                 is_draft: None,
@@ -1175,23 +1389,22 @@ mod tests {
                 commits: None,
                 repository: None,
             }),
-        };
-
-        let notification = transform_notification(gql);
+        );
         assert_eq!(notification.subject_id, None);
     }
 
     #[test]
     fn transform_notification_maps_draft_status() {
-        let gql = GraphQlNotification {
-            id: "node-3".to_string(),
-            thread_id: "thread-3".to_string(),
-            title: "WIP".to_string(),
-            url: "https://github.com/acme/widgets/pull/13".to_string(),
-            is_unread: true,
-            last_updated_at: "2024-01-03T00:00:00Z".to_string(),
-            reason: None,
-            optional_subject: Some(GraphQlSubject {
+        let notification = transform_notification_thread(
+            sample_rest_notification(
+                "thread-3",
+                "WIP",
+                "PullRequest",
+                "https://api.github.com/repos/acme/widgets/pulls/13",
+                true,
+                None,
+            ),
+            Some(GraphQlSubject {
                 id: Some("subject-3".to_string()),
                 state: Some("OPEN".to_string()),
                 is_draft: Some(true),
@@ -1202,23 +1415,22 @@ mod tests {
                 commits: None,
                 repository: None,
             }),
-        };
-
-        let notification = transform_notification(gql);
+        );
         assert_eq!(notification.subject.status, vec![SubjectStatus::Draft]);
     }
 
     #[test]
     fn transform_notification_maps_draft_and_closed_statuses() {
-        let gql = GraphQlNotification {
-            id: "node-3b".to_string(),
-            thread_id: "thread-3b".to_string(),
-            title: "Draft closed".to_string(),
-            url: "https://github.com/acme/widgets/pull/14".to_string(),
-            is_unread: true,
-            last_updated_at: "2024-01-03T00:00:00Z".to_string(),
-            reason: None,
-            optional_subject: Some(GraphQlSubject {
+        let notification = transform_notification_thread(
+            sample_rest_notification(
+                "thread-3b",
+                "Draft closed",
+                "PullRequest",
+                "https://api.github.com/repos/acme/widgets/pulls/14",
+                true,
+                None,
+            ),
+            Some(GraphQlSubject {
                 id: Some("subject-3b".to_string()),
                 state: Some("CLOSED".to_string()),
                 is_draft: Some(true),
@@ -1229,9 +1441,7 @@ mod tests {
                 commits: None,
                 repository: None,
             }),
-        };
-
-        let notification = transform_notification(gql);
+        );
         assert_eq!(
             notification.subject.status,
             vec![SubjectStatus::Draft, SubjectStatus::Closed]
@@ -1240,15 +1450,16 @@ mod tests {
 
     #[test]
     fn transform_notification_maps_closed_issue_status() {
-        let gql = GraphQlNotification {
-            id: "node-4".to_string(),
-            thread_id: "thread-4".to_string(),
-            title: "Fix docs".to_string(),
-            url: "https://github.com/acme/widgets/issues/9".to_string(),
-            is_unread: false,
-            last_updated_at: "2024-01-04T00:00:00Z".to_string(),
-            reason: None,
-            optional_subject: Some(GraphQlSubject {
+        let notification = transform_notification_thread(
+            sample_rest_notification(
+                "thread-4",
+                "Fix docs",
+                "Issue",
+                "https://api.github.com/repos/acme/widgets/issues/9",
+                false,
+                None,
+            ),
+            Some(GraphQlSubject {
                 id: Some("subject-4".to_string()),
                 state: Some("CLOSED".to_string()),
                 is_draft: None,
@@ -1259,23 +1470,22 @@ mod tests {
                 commits: None,
                 repository: None,
             }),
-        };
-
-        let notification = transform_notification(gql);
+        );
         assert_eq!(notification.subject.status, vec![SubjectStatus::Closed]);
     }
 
     #[test]
     fn transform_notification_maps_review_status() {
-        let gql = GraphQlNotification {
-            id: "node-5".to_string(),
-            thread_id: "thread-5".to_string(),
-            title: "Needs changes".to_string(),
-            url: "https://github.com/acme/widgets/pull/9".to_string(),
-            is_unread: true,
-            last_updated_at: "2024-01-05T00:00:00Z".to_string(),
-            reason: None,
-            optional_subject: Some(GraphQlSubject {
+        let notification = transform_notification_thread(
+            sample_rest_notification(
+                "thread-5",
+                "Needs changes",
+                "PullRequest",
+                "https://api.github.com/repos/acme/widgets/pulls/9",
+                true,
+                None,
+            ),
+            Some(GraphQlSubject {
                 id: Some("subject-5".to_string()),
                 state: Some("OPEN".to_string()),
                 is_draft: Some(false),
@@ -1286,9 +1496,7 @@ mod tests {
                 commits: None,
                 repository: None,
             }),
-        };
-
-        let notification = transform_notification(gql);
+        );
         assert_eq!(
             notification.subject.review_status,
             Some(ReviewStatus::ChangesRequested)
