@@ -1,6 +1,10 @@
 mod commands;
+mod discussion;
 mod github;
+mod github_discussions;
+mod github_notifications;
 mod ignore;
+mod notification_auth;
 mod types;
 mod ui;
 mod util;
@@ -34,10 +38,18 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
     commands::is_target_char,
+    discussion::{
+        default_state_path, diff_discussion, load_observed_state, save_observed_state, Actor,
+        DiscussionActivity, DiscussionComment, DiscussionStateKey, PullRequestDiscussion,
+        ReviewLocation, ReviewThread,
+    },
     github::{
-        fetch_notifications_and_my_prs_cached, fetch_pretty_pull_request, mark_as_done,
-        mark_as_read, mark_as_unread, parse_pull_request_key, subscribe_to_thread, unsubscribe,
+        fetch_notifications_and_my_prs_cached, fetch_pretty_pull_request, parse_pull_request_key,
         PrettyPullRequest,
+    },
+    github_discussions::fetch_pull_request_discussion,
+    github_notifications::{
+        mark_as_done, mark_as_read, mark_as_undone, mark_as_unread, subscribe, unsubscribe,
     },
     ignore::{append_ignored_pr, load_ignored_prs, remove_ignored_pr},
     types::{Action, MyPullRequest, Notification},
@@ -51,6 +63,8 @@ struct Args {
     interval: u64,
     #[arg(long, help = "Show only unread notifications")]
     unread_only: bool,
+    #[arg(long, help = "Replace the stored GitHub notification authorization")]
+    reauthorize_notifications: bool,
 }
 
 #[derive(Debug)]
@@ -59,10 +73,29 @@ enum AppEvent {
         notifications: Vec<Notification>,
         my_prs: Vec<MyPullRequest>,
     },
+    Discussions(Vec<DiscussionInboxUpdate>),
     Error(String),
-    CommandResult(ExecSummary),
+    CommandResult {
+        summary: ExecSummary,
+        snapshot: UndoSnapshot,
+    },
     UndoResult(UndoSummary),
     Review(Vec<ReviewRequest>),
+}
+
+#[derive(Debug, Clone)]
+struct DiscussionInboxUpdate {
+    pr_url: String,
+    viewer_login: String,
+    snapshot: PullRequestDiscussion,
+    activity: Vec<DiscussionActivity>,
+    complete: bool,
+}
+
+#[derive(Debug, Clone)]
+enum Screen {
+    Inbox,
+    Discussion { pr_url: String, selected: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +118,9 @@ pub struct AppState {
     pub relative_times: Vec<String>,
     pub my_pr_relative_times: Vec<String>,
     pub ignored_prs: HashSet<String>,
+    discussions: HashMap<String, DiscussionInboxUpdate>,
+    screen: Screen,
+    visible_count: usize,
     notification_overrides: HashMap<String, NotificationOverride>,
     last_undo: Option<UndoBatch>,
     undo_in_flight: bool,
@@ -107,6 +143,9 @@ impl AppState {
             relative_times: Vec::new(),
             my_pr_relative_times: Vec::new(),
             ignored_prs,
+            discussions: HashMap::new(),
+            screen: Screen::Inbox,
+            visible_count: 0,
             notification_overrides: HashMap::new(),
             last_undo: None,
             undo_in_flight: false,
@@ -154,6 +193,10 @@ impl AppState {
             return notifications;
         }
 
+        let incoming_ids = notifications
+            .iter()
+            .map(|notification| notification.id.clone())
+            .collect::<HashSet<_>>();
         let mut merged = Vec::with_capacity(notifications.len());
         let mut clear_ids = Vec::new();
 
@@ -192,6 +235,15 @@ impl AppState {
             }
         }
 
+        // The private Inbox query is authoritative: absence confirms a read-only
+        // or Done mutation and lets the short-lived optimistic state disappear.
+        clear_ids.extend(
+            self.notification_overrides
+                .keys()
+                .filter(|id| !incoming_ids.contains(*id))
+                .cloned(),
+        );
+
         for id in clear_ids {
             self.notification_overrides.remove(&id);
         }
@@ -200,8 +252,23 @@ impl AppState {
     }
 
     fn update_pending(&mut self) {
-        self.pending =
-            ui::build_pending_map(&self.command_text(), &self.notifications, &self.my_prs);
+        self.pending = ui::build_visible_pending_map(
+            &self.command_text(),
+            &self.notifications,
+            &self.my_prs,
+            self.visible_count,
+        );
+    }
+
+    fn set_visible_count(&mut self, visible_count: usize) {
+        if self.visible_count != visible_count {
+            self.visible_count = visible_count;
+            self.update_pending();
+        }
+    }
+
+    fn restrict_visible_count(&mut self, visible_count: usize) {
+        self.set_visible_count(self.visible_count.min(visible_count));
     }
 
     fn clear_commands(&mut self) {
@@ -218,6 +285,9 @@ impl AppState {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let token = gh_auth_token()?;
+    let client = reqwest::Client::new();
+    let notification_token =
+        notification_auth::notification_token(&client, args.reauthorize_notifications).await?;
 
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -226,7 +296,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
-    let result = run_app(&mut terminal, args, token).await;
+    let result = run_app(&mut terminal, args, token, notification_token).await;
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
@@ -239,9 +309,11 @@ async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     args: Args,
     token: String,
+    notification_token: String,
 ) -> Result<()> {
     let client = Arc::new(reqwest::Client::new());
     let token = Arc::new(token);
+    let notification_token = Arc::new(notification_token);
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(4);
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>(1);
@@ -249,6 +321,7 @@ async fn run_app(
     spawn_poller(
         client.clone(),
         token.clone(),
+        notification_token.clone(),
         args.interval,
         !args.unread_only,
         event_tx.clone(),
@@ -270,6 +343,7 @@ async fn run_app(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
+        refresh_visible_count(terminal, &mut app)?;
         terminal
             .draw(|f| ui::draw(f, &app))
             .context("render failed")?;
@@ -280,7 +354,16 @@ async fn run_app(
                 .expect("event stream should always be initialized")
                 .next() => {
                 if let Some(Ok(event)) = maybe_event {
-                    if handle_input(event, &mut app, &refresh_tx, &event_tx, &client, &token)? {
+                    restrict_visible_count_to_terminal(terminal, &mut app)?;
+                    if handle_input(
+                        event,
+                        &mut app,
+                        &refresh_tx,
+                        &event_tx,
+                        &client,
+                        &token,
+                        &notification_token,
+                    )? {
                         break;
                     }
                 }
@@ -293,6 +376,12 @@ async fn run_app(
                             app.status = None;
                         }
                     }
+                    AppEvent::Discussions(discussions) => {
+                        for mut discussion in discussions {
+                            reconcile_discussion_update(&mut discussion);
+                            app.discussions.insert(discussion.pr_url.clone(), discussion);
+                        }
+                    }
                     AppEvent::Error(message) => {
                         app.status = Some(clean_error_message(&message));
                         app.status_sticky = true;
@@ -301,8 +390,8 @@ async fn run_app(
                             app.command_in_flight = false;
                         }
                     }
-                    AppEvent::CommandResult(result) => {
-                        handle_command_result(&mut app, &refresh_tx, result);
+                    AppEvent::CommandResult { summary, snapshot } => {
+                        handle_command_result(&mut app, &refresh_tx, summary, &snapshot);
                     }
                     AppEvent::UndoResult(result) => {
                         handle_undo_result(&mut app, &refresh_tx, result);
@@ -353,9 +442,39 @@ async fn run_app(
     Ok(())
 }
 
+fn refresh_visible_count(
+    terminal: &Terminal<CrosstermBackend<Stdout>>,
+    app: &mut AppState,
+) -> Result<()> {
+    let visible_count = terminal_visible_count(terminal, app)?;
+    app.set_visible_count(visible_count);
+    Ok(())
+}
+
+fn restrict_visible_count_to_terminal(
+    terminal: &Terminal<CrosstermBackend<Stdout>>,
+    app: &mut AppState,
+) -> Result<()> {
+    let visible_count = terminal_visible_count(terminal, app)?;
+    app.restrict_visible_count(visible_count);
+    Ok(())
+}
+
+fn terminal_visible_count(
+    terminal: &Terminal<CrosstermBackend<Stdout>>,
+    app: &AppState,
+) -> Result<usize> {
+    let size = terminal.size().context("failed to read terminal size")?;
+    Ok(ui::visible_entry_count(
+        Rect::new(0, 0, size.width, size.height),
+        app,
+    ))
+}
+
 fn spawn_poller(
     client: Arc<reqwest::Client>,
-    token: Arc<String>,
+    public_token: Arc<String>,
+    notification_token: Arc<String>,
     interval_secs: u64,
     include_read: bool,
     event_tx: mpsc::Sender<AppEvent>,
@@ -365,11 +484,14 @@ fn spawn_poller(
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut viewer_login: Option<String> = None;
+        let mut discussion_versions = HashMap::new();
+        let mut force_discussions = false;
 
         loop {
             let result = fetch_notifications_and_my_prs_cached(
                 &client,
-                &token,
+                &public_token,
+                &notification_token,
                 include_read,
                 viewer_login.as_deref(),
             )
@@ -380,12 +502,26 @@ fn spawn_poller(
                     if !next_login.is_empty() && next_login != "unknown" {
                         viewer_login = Some(next_login.to_string());
                     }
+                    let notifications = payload.notifications;
+                    let my_prs = payload.my_prs;
                     let _ = event_tx
                         .send(AppEvent::Data {
-                            notifications: payload.notifications,
-                            my_prs: payload.my_prs,
+                            notifications: notifications.clone(),
+                            my_prs: my_prs.clone(),
                         })
                         .await;
+                    let discussions = fetch_inbox_discussions(
+                        &client,
+                        &public_token,
+                        &payload.viewer_login,
+                        &notifications,
+                        &my_prs,
+                        &mut discussion_versions,
+                        force_discussions,
+                    )
+                    .await;
+                    force_discussions = false;
+                    let _ = event_tx.send(AppEvent::Discussions(discussions)).await;
                 }
                 Err(err) => {
                     let _ = event_tx.send(AppEvent::Error(err.to_string())).await;
@@ -394,10 +530,164 @@ fn spawn_poller(
 
             tokio::select! {
                 _ = interval.tick() => {},
-                _ = refresh_rx.recv() => {},
+                _ = refresh_rx.recv() => { force_discussions = true; },
             }
         }
     });
+}
+
+async fn fetch_inbox_discussions(
+    client: &reqwest::Client,
+    token: &str,
+    viewer_login: &str,
+    notifications: &[Notification],
+    my_prs: &[MyPullRequest],
+    versions: &mut HashMap<String, String>,
+    force: bool,
+) -> Vec<DiscussionInboxUpdate> {
+    let state_path = default_state_path();
+    let mut observed = state_path
+        .as_deref()
+        .and_then(|path| load_observed_state(path).ok())
+        .unwrap_or_default();
+    let mut established_baseline = false;
+    let mut candidates = HashMap::new();
+    for (url, updated_at) in notifications
+        .iter()
+        .filter(|notification| {
+            notification
+                .subject
+                .kind
+                .eq_ignore_ascii_case("pullrequest")
+        })
+        .map(|notification| {
+            (
+                notification.subject.url.as_str(),
+                notification.updated_at.as_str(),
+            )
+        })
+        .chain(
+            my_prs
+                .iter()
+                .map(|pr| (pr.subject.url.as_str(), pr.updated_at.as_str())),
+        )
+    {
+        candidates
+            .entry(url.to_string())
+            .and_modify(|current: &mut String| {
+                if updated_at > current.as_str() {
+                    *current = updated_at.to_string();
+                }
+            })
+            .or_insert_with(|| updated_at.to_string());
+    }
+
+    let mut updates = Vec::new();
+    for (url, version) in candidates {
+        if !force
+            && versions
+                .get(&url)
+                .is_some_and(|current| current == &version)
+        {
+            continue;
+        }
+        let Some(key) = parse_pull_request_key(&url) else {
+            continue;
+        };
+        let Ok(raw) = fetch_pull_request_discussion(client, token, &key, viewer_login).await else {
+            continue;
+        };
+        let complete = raw.complete;
+        let Ok(snapshot) = normalize_discussion(raw, &key, viewer_login) else {
+            continue;
+        };
+        let state_key = DiscussionStateKey {
+            host: "github.com".to_string(),
+            viewer: viewer_login.to_string(),
+            pull_request_id: snapshot.pull_request_id.clone(),
+        };
+        let previous = observed.get(&state_key);
+        let activity = diff_discussion(previous, &snapshot, viewer_login);
+        if previous.is_none() && complete {
+            observed.insert(state_key, snapshot.observed(viewer_login));
+            established_baseline = true;
+        }
+        if complete {
+            versions.insert(url.clone(), version);
+        }
+        updates.push(DiscussionInboxUpdate {
+            pr_url: url,
+            viewer_login: viewer_login.to_string(),
+            snapshot,
+            activity,
+            complete,
+        });
+    }
+
+    if established_baseline {
+        if let Some(path) = state_path.as_deref() {
+            let _ = save_observed_state(path, &observed);
+        }
+    }
+    updates
+}
+
+fn normalize_discussion(
+    raw: github_discussions::PullRequestDiscussion,
+    key: &github::PullRequestKey,
+    viewer_login: &str,
+) -> Result<PullRequestDiscussion> {
+    let threads = raw
+        .threads
+        .into_iter()
+        .map(|thread| {
+            let comments = thread
+                .comments
+                .into_iter()
+                .map(|comment| {
+                    let author = comment
+                        .author_login
+                        .or_else(|| comment.viewer_did_author.then(|| viewer_login.to_string()))
+                        .map(|login| Actor { login });
+                    Ok(DiscussionComment {
+                        id: comment.id,
+                        author,
+                        body: comment.body_text,
+                        created_at: chrono::DateTime::parse_from_rfc3339(&comment.created_at)
+                            .context("invalid discussion comment createdAt")?
+                            .with_timezone(&chrono::Utc),
+                        updated_at: chrono::DateTime::parse_from_rfc3339(&comment.updated_at)
+                            .context("invalid discussion comment updatedAt")?
+                            .with_timezone(&chrono::Utc),
+                        reply_to: comment.reply_to_id,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ReviewThread {
+                id: thread.id,
+                location: ReviewLocation {
+                    path: thread.path,
+                    line: thread.line.and_then(|line| u32::try_from(line).ok()),
+                    start_line: None,
+                },
+                is_resolved: thread.is_resolved,
+                resolved_by: thread.resolved_by_login.map(|login| Actor { login }),
+                is_outdated: thread.is_outdated,
+                comments,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(PullRequestDiscussion {
+        pull_request_id: raw.id,
+        owner: key.owner.clone(),
+        repository: key.repo.clone(),
+        number: u64::try_from(key.number).context("invalid pull request number")?,
+        author: raw.author_login.map(|login| Actor { login }),
+        head_oid: raw.head_oid,
+        fetched_at: chrono::Utc::now(),
+        threads,
+    })
 }
 
 fn handle_input(
@@ -406,11 +696,16 @@ fn handle_input(
     refresh_tx: &mpsc::Sender<()>,
     app_event_tx: &mpsc::Sender<AppEvent>,
     client: &reqwest::Client,
-    token: &str,
+    public_token: &str,
+    notification_token: &str,
 ) -> Result<bool> {
     if let Event::Key(key) = event {
         if key.kind != KeyEventKind::Press {
             return Ok(false);
+        }
+
+        if matches!(app.screen, Screen::Discussion { .. }) {
+            return handle_discussion_input(key, app, refresh_tx, app_event_tx);
         }
 
         match key.code {
@@ -422,10 +717,10 @@ fn handle_input(
                 app.status_sticky = false;
             }
             KeyCode::Enter => {
-                submit_commands(app, app_event_tx, client, token)?;
+                submit_commands(app, app_event_tx, client, public_token, notification_token)?;
             }
             KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                submit_commands(app, app_event_tx, client, token)?;
+                submit_commands(app, app_event_tx, client, public_token, notification_token)?;
             }
             KeyCode::Esc => {
                 app.clear_commands();
@@ -439,23 +734,96 @@ fn handle_input(
     Ok(false)
 }
 
+fn handle_discussion_input(
+    key: crossterm::event::KeyEvent,
+    app: &mut AppState,
+    refresh_tx: &mpsc::Sender<()>,
+    app_event_tx: &mpsc::Sender<AppEvent>,
+) -> Result<bool> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Ok(true);
+    }
+    match key.code {
+        KeyCode::Esc => app.screen = Screen::Inbox,
+        KeyCode::Char('R') => {
+            let _ = refresh_tx.try_send(());
+            app.status = Some("Refreshing discussion...".to_string());
+            app.status_sticky = false;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let max = discussion_thread_count(app).saturating_sub(1);
+            if let Screen::Discussion { selected, .. } = &mut app.screen {
+                *selected = (*selected + 1).min(max);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Screen::Discussion { selected, .. } = &mut app.screen {
+                *selected = selected.saturating_sub(1);
+            }
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            let Screen::Discussion { pr_url, .. } = &app.screen else {
+                return Ok(false);
+            };
+            let pr_key = parse_pull_request_key(pr_url)
+                .ok_or_else(|| anyhow!("invalid pull request URL"))?;
+            let request = ReviewRequest {
+                repo_full_name: format!("{}/{}", pr_key.owner, pr_key.repo),
+                pr_url: pr_url.clone(),
+                analyze: key.code == KeyCode::Char('p'),
+            };
+            app_event_tx
+                .try_send(AppEvent::Review(vec![request]))
+                .map_err(|_| anyhow!("unable to start ReviewPR"))?;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn discussion_thread_count(app: &AppState) -> usize {
+    let Screen::Discussion { pr_url, .. } = &app.screen else {
+        return 0;
+    };
+    app.discussions
+        .get(pr_url)
+        .map(|update| {
+            update
+                .snapshot
+                .relevant_threads(&update.viewer_login)
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn submit_commands(
     app: &mut AppState,
     app_event_tx: &mpsc::Sender<AppEvent>,
     client: &reqwest::Client,
-    token: &str,
+    public_token: &str,
+    notification_token: &str,
 ) -> Result<()> {
     let command_text = app.command_text();
     if is_undo_command(&command_text) {
-        return submit_undo(app, app_event_tx, client, token);
+        return submit_undo(app, app_event_tx, client, notification_token);
     }
 
-    let pending = ui::build_pending_map(&app.command_text(), &app.notifications, &app.my_prs);
+    let pending = ui::build_visible_pending_map(
+        &app.command_text(),
+        &app.notifications,
+        &app.my_prs,
+        app.visible_count,
+    );
     if pending.is_empty() {
         app.status = Some("No commands to run".to_string());
         app.status_sticky = false;
         app.clear_commands();
         return Ok(());
+    }
+
+    let (view_url, pending) = split_view_action(&pending, &app.notifications, &app.my_prs)?;
+    if let Some(url) = view_url {
+        open_discussion(app, &url);
     }
 
     let (review_requests, pending) =
@@ -477,15 +845,18 @@ fn submit_commands(
     }
 
     if pending.is_empty() {
-        app.status = Some("Opening ReviewPR in nvim...".to_string());
+        if matches!(app.screen, Screen::Inbox) {
+            app.status = Some("Opening ReviewPR in nvim...".to_string());
+        }
         app.status_sticky = false;
         app.clear_commands();
         return Ok(());
     }
 
+    let command_snapshot = snapshot_state(app);
     app.last_undo = Some(UndoBatch {
         commands: pending.clone(),
-        snapshot: snapshot_state(app),
+        snapshot: command_snapshot.clone(),
     });
 
     let notifications_snapshot = app.notifications.clone();
@@ -499,27 +870,27 @@ fn submit_commands(
     app.clear_commands();
 
     let client = client.clone();
-    let token = token.to_string();
+    let public_token = public_token.to_string();
+    let notification_token = notification_token.to_string();
     let app_event_tx = app_event_tx.clone();
 
     // Run network mutations in the background so the UI can render the optimistic state immediately.
     tokio::spawn(async move {
-        let result = execute_commands(
+        let summary = execute_commands(
             &client,
-            &token,
+            &public_token,
+            &notification_token,
             &pending,
             &notifications_snapshot,
             &my_prs_snapshot,
         )
         .await;
-        match result {
-            Ok(summary) => {
-                let _ = app_event_tx.send(AppEvent::CommandResult(summary)).await;
-            }
-            Err(err) => {
-                let _ = app_event_tx.send(AppEvent::Error(err.to_string())).await;
-            }
-        }
+        let _ = app_event_tx
+            .send(AppEvent::CommandResult {
+                summary,
+                snapshot: command_snapshot,
+            })
+            .await;
     });
 
     Ok(())
@@ -529,7 +900,7 @@ fn submit_undo(
     app: &mut AppState,
     app_event_tx: &mpsc::Sender<AppEvent>,
     client: &reqwest::Client,
-    token: &str,
+    notification_token: &str,
 ) -> Result<()> {
     if app.undo_in_flight {
         app.status = Some("Undo already running".to_string());
@@ -560,11 +931,11 @@ fn submit_undo(
     app.clear_commands();
 
     let client = client.clone();
-    let token = token.to_string();
+    let notification_token = notification_token.to_string();
     let app_event_tx = app_event_tx.clone();
 
     tokio::spawn(async move {
-        let summary = execute_undo(&client, &token, &batch).await;
+        let summary = execute_undo(&client, &notification_token, &batch).await;
         let _ = app_event_tx.send(AppEvent::UndoResult(summary)).await;
     });
 
@@ -572,6 +943,108 @@ fn submit_undo(
 }
 
 type SplitReviewActionResult = (Vec<ReviewRequest>, HashMap<usize, Vec<Action>>);
+type SplitViewActionResult = (Option<String>, HashMap<usize, Vec<Action>>);
+
+fn split_view_action(
+    commands: &HashMap<usize, Vec<Action>>,
+    notifications: &[Notification],
+    my_prs: &[MyPullRequest],
+) -> Result<SplitViewActionResult> {
+    let mut indices: Vec<_> = commands.keys().copied().collect();
+    indices.sort_unstable();
+    let mut view_url = None;
+    let mut filtered = HashMap::new();
+    for index in indices {
+        let actions = commands.get(&index).cloned().unwrap_or_default();
+        if actions.contains(&Action::View) && view_url.is_none() {
+            let entry = entry_for_index(index, notifications, my_prs)
+                .ok_or_else(|| anyhow!("PR view target is out of range"))?;
+            if !entry.url().contains("/pull/") {
+                return Err(anyhow!("View only supports pull requests"));
+            }
+            view_url = Some(entry.url().to_string());
+        }
+        let remaining: Vec<_> = actions
+            .into_iter()
+            .filter(|action| *action != Action::View)
+            .collect();
+        if !remaining.is_empty() {
+            filtered.insert(index, remaining);
+        }
+    }
+    Ok((view_url, filtered))
+}
+
+fn open_discussion(app: &mut AppState, url: &str) {
+    let Some(update) = app.discussions.get_mut(url) else {
+        app.screen = Screen::Discussion {
+            pr_url: url.to_string(),
+            selected: 0,
+        };
+        app.status = Some("Discussion data is not loaded yet; press R to refresh".to_string());
+        return;
+    };
+    let changed_thread = update.activity.iter().find_map(activity_thread_id);
+    let selected = changed_thread
+        .and_then(|thread_id| {
+            update
+                .snapshot
+                .relevant_threads(&update.viewer_login)
+                .position(|thread| thread.id == thread_id)
+        })
+        .unwrap_or(0);
+    app.screen = Screen::Discussion {
+        pr_url: url.to_string(),
+        selected,
+    };
+    if update.complete {
+        let Some(path) = default_state_path() else {
+            update.activity.clear();
+            return;
+        };
+        let mut state = load_observed_state(&path).unwrap_or_default();
+        state.insert(
+            DiscussionStateKey {
+                host: "github.com".to_string(),
+                viewer: update.viewer_login.clone(),
+                pull_request_id: update.snapshot.pull_request_id.clone(),
+            },
+            update.snapshot.observed(&update.viewer_login),
+        );
+        if let Err(error) = save_observed_state(&path, &state) {
+            app.status = Some(error.to_string());
+            app.status_sticky = true;
+        }
+    }
+    update.activity.clear();
+}
+
+fn activity_thread_id(activity: &DiscussionActivity) -> Option<&str> {
+    match activity {
+        DiscussionActivity::RelevantThreadAdded { thread_id }
+        | DiscussionActivity::ReplyAdded { thread_id, .. }
+        | DiscussionActivity::ThreadResolved { thread_id, .. }
+        | DiscussionActivity::ThreadReopened { thread_id }
+        | DiscussionActivity::ThreadBecameOutdated { thread_id }
+        | DiscussionActivity::CommentEdited { thread_id, .. } => Some(thread_id),
+        DiscussionActivity::HeadUpdated { .. } => None,
+    }
+}
+
+fn reconcile_discussion_update(update: &mut DiscussionInboxUpdate) {
+    let Some(path) = default_state_path() else {
+        return;
+    };
+    let Ok(state) = load_observed_state(&path) else {
+        return;
+    };
+    let key = DiscussionStateKey {
+        host: "github.com".to_string(),
+        viewer: update.viewer_login.clone(),
+        pull_request_id: update.snapshot.pull_request_id.clone(),
+    };
+    update.activity = diff_discussion(state.get(&key), &update.snapshot, &update.viewer_login);
+}
 
 fn split_review_action(
     commands: &HashMap<usize, Vec<Action>>,
@@ -841,6 +1314,7 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
                             | Action::PrettyYank
                             | Action::Review
                             | Action::ReviewNoAnalyze
+                            | Action::View
                             | Action::Branch => {}
                         }
                     }
@@ -947,13 +1421,23 @@ struct UndoSummary {
     attempted: bool,
 }
 
-fn handle_command_result(app: &mut AppState, refresh_tx: &mpsc::Sender<()>, result: ExecSummary) {
+fn handle_command_result(
+    app: &mut AppState,
+    refresh_tx: &mpsc::Sender<()>,
+    result: ExecSummary,
+    snapshot: &UndoSnapshot,
+) {
+    if result.failed > 0 {
+        // A mixed batch is reconciled from GitHub after restoring the pre-command view.
+        restore_snapshot(app, snapshot);
+        app.last_undo = None;
+    }
     let (message, refresh, sticky) = command_status(&result);
     app.status = Some(message);
     app.status_sticky = sticky;
     app.executing.clear();
     app.command_in_flight = false;
-    if refresh {
+    if refresh || result.failed > 0 {
         let _ = refresh_tx.try_send(());
     }
 }
@@ -1011,11 +1495,12 @@ fn undo_status(result: &UndoSummary) -> (String, bool, bool) {
 
 async fn execute_commands(
     client: &reqwest::Client,
-    token: &str,
+    public_token: &str,
+    notification_token: &str,
     commands: &HashMap<usize, Vec<Action>>,
     notifications: &[Notification],
     my_prs: &[MyPullRequest],
-) -> Result<ExecSummary> {
+) -> ExecSummary {
     let mut tasks = Vec::new();
     let (yank_urls, yank_count) = collect_yank_targets(commands, notifications, my_prs);
     let (pretty_yank_targets, pretty_yank_count) =
@@ -1035,11 +1520,12 @@ async fn execute_commands(
             }
             let entry = entry.clone();
             let client = client.clone();
-            let token = token.to_string();
+            let notification_token = notification_token.to_string();
             let url = url.clone();
 
             tasks.push(tokio::spawn(async move {
-                let result = execute_action(&client, &token, action, &entry, &url).await;
+                let result =
+                    execute_action(&client, &notification_token, action, &entry, &url).await;
                 (action, result)
             }));
         }
@@ -1069,7 +1555,7 @@ async fn execute_commands(
     }
 
     if pretty_yank_count > 0 {
-        let text = build_pretty_yank_text(client, token, &pretty_yank_targets).await;
+        let text = build_pretty_yank_text(client, public_token, &pretty_yank_targets).await;
         match text {
             Ok(text) => match tokio::task::spawn_blocking(move || copy_to_clipboard(&text)).await {
                 Ok(Ok(())) => {
@@ -1114,13 +1600,13 @@ async fn execute_commands(
         }
     }
 
-    Ok(ExecSummary {
+    ExecSummary {
         succeeded,
         failed,
         errors,
         api_failed,
         refresh,
-    })
+    }
 }
 
 fn collect_yank_targets(
@@ -1233,11 +1719,27 @@ fn format_pretty_pull_request(pr: &PrettyPullRequest) -> String {
     )
 }
 
-async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) -> UndoSummary {
+async fn execute_undo(
+    client: &reqwest::Client,
+    notification_token: &str,
+    batch: &UndoBatch,
+) -> UndoSummary {
     enum UndoWork {
-        MarkUnread { thread_id: String },
-        Resubscribe { thread_id: String },
-        Unignore { url: String },
+        MarkUnread {
+            thread_id: String,
+        },
+        RestoreDone {
+            thread_id: String,
+            unread: bool,
+        },
+        RestoreUnsubscribe {
+            thread_id: String,
+            subscribable_id: String,
+            unread: bool,
+        },
+        Unignore {
+            url: String,
+        },
     }
 
     let mut tasks = Vec::new();
@@ -1256,34 +1758,44 @@ async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) 
         match entry {
             EntrySnapshot::Notification(notification) => {
                 let mut mark_unread = false;
-                let mut resubscribe = false;
+                let mut restore_done = false;
+                let mut unsubscribed = false;
                 for action in actions {
                     match action {
-                        Action::Read | Action::Done => {
-                            mark_unread = true;
-                        }
+                        Action::Read => mark_unread = notification.unread,
+                        Action::Done => restore_done = true,
                         Action::Unsubscribe => {
-                            mark_unread = true;
-                            resubscribe = true;
+                            restore_done = true;
+                            unsubscribed = true;
                         }
                         Action::Open
                         | Action::Yank
                         | Action::PrettyYank
                         | Action::Review
                         | Action::ReviewNoAnalyze
+                        | Action::View
                         | Action::Branch => {}
                     }
                 }
 
-                if mark_unread {
+                if unsubscribed {
+                    refresh = true;
+                    if let Some(subscribable_id) = notification.subject_id.clone() {
+                        tasks.push(UndoWork::RestoreUnsubscribe {
+                            thread_id: notification.id.clone(),
+                            subscribable_id,
+                            unread: notification.unread,
+                        });
+                    }
+                } else if restore_done {
+                    refresh = true;
+                    tasks.push(UndoWork::RestoreDone {
+                        thread_id: notification.id.clone(),
+                        unread: notification.unread,
+                    });
+                } else if mark_unread {
                     refresh = true;
                     tasks.push(UndoWork::MarkUnread {
-                        thread_id: notification.id.clone(),
-                    });
-                }
-                if resubscribe {
-                    refresh = true;
-                    tasks.push(UndoWork::Resubscribe {
                         thread_id: notification.id.clone(),
                     });
                 }
@@ -1303,14 +1815,30 @@ async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) 
 
     for task in tasks {
         let client = client.clone();
-        let token = token.to_string();
+        let token = notification_token.to_string();
         let future = match task {
             UndoWork::MarkUnread { thread_id } => {
                 tokio::spawn(async move { mark_as_unread(&client, &token, &thread_id).await })
             }
-            UndoWork::Resubscribe { thread_id } => {
-                tokio::spawn(async move { subscribe_to_thread(&client, &token, &thread_id).await })
-            }
+            UndoWork::RestoreDone { thread_id, unread } => tokio::spawn(async move {
+                mark_as_undone(&client, &token, &thread_id).await?;
+                if unread {
+                    mark_as_unread(&client, &token, &thread_id).await?;
+                }
+                Ok(())
+            }),
+            UndoWork::RestoreUnsubscribe {
+                thread_id,
+                subscribable_id,
+                unread,
+            } => tokio::spawn(async move {
+                subscribe(&client, &token, &subscribable_id).await?;
+                mark_as_undone(&client, &token, &thread_id).await?;
+                if unread {
+                    mark_as_unread(&client, &token, &thread_id).await?;
+                }
+                Ok(())
+            }),
             UndoWork::Unignore { url } => {
                 tokio::spawn(async move { remove_ignored_pr(&url).map(|_| ()) })
             }
@@ -1563,7 +2091,7 @@ fn force_redraw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &AppStat
 
 async fn execute_action(
     client: &reqwest::Client,
-    token: &str,
+    notification_token: &str,
     action: Action,
     entry: &EntrySnapshot,
     url: &str,
@@ -1578,7 +2106,7 @@ async fn execute_action(
             .await??;
             if let EntrySnapshot::Notification(notification) = entry {
                 if notification.unread {
-                    mark_as_read(client, token, &notification.id).await?;
+                    mark_as_read(client, notification_token, &notification.id).await?;
                 }
             }
         }
@@ -1596,18 +2124,34 @@ async fn execute_action(
         }
         Action::Read => {
             if let EntrySnapshot::Notification(notification) = entry {
-                mark_as_read(client, token, &notification.id).await?;
+                mark_as_read(client, notification_token, &notification.id).await?;
             }
         }
         Action::Done => {
             if let EntrySnapshot::Notification(notification) = entry {
-                mark_as_done(client, token, &notification.id).await?;
+                mark_as_done(client, notification_token, &notification.id).await?;
             }
         }
         Action::Unsubscribe => match entry {
             EntrySnapshot::Notification(notification) => {
-                unsubscribe(client, token, &notification.id).await?;
-                mark_as_done(client, token, &notification.id).await?;
+                let subject_id = notification
+                    .subject_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("GitHub subscription target is unavailable"))?;
+                unsubscribe(client, notification_token, subject_id).await?;
+                if let Err(error) = mark_as_done(client, notification_token, &notification.id).await
+                {
+                    if let Err(rollback_error) =
+                        subscribe(client, notification_token, subject_id).await
+                    {
+                        return Err(anyhow!(
+                            "{}; subscription rollback also failed: {}",
+                            error,
+                            rollback_error
+                        ));
+                    }
+                    return Err(error);
+                }
             }
             EntrySnapshot::MyPullRequest(_) => {
                 append_ignored_pr(url)?;
@@ -1628,6 +2172,11 @@ async fn execute_action(
                 "ReviewPR should be triggered via the 'p' or 'P' action in the UI"
             ));
         }
+        Action::View => {
+            return Err(anyhow!(
+                "PR view should be triggered via the 'v' action in the UI"
+            ));
+        }
     }
 
     Ok(ActionOutcome { refresh })
@@ -1645,10 +2194,11 @@ mod tests {
     use super::{
         apply_optimistic_update, apply_undo_optimistic_update, clean_error_message,
         collect_pretty_yank_targets, collect_yank_targets, command_status, entry_for_index,
-        format_pretty_pull_request, handle_text_input, is_api_action, parse_updated_at,
-        repo_dir_for_full_name, reviewpr_command, sort_by_updated_at, split_review_action,
-        undo_status, AppState, EntrySnapshot, ExecSummary, NotificationOverride,
-        NotificationOverrideState, PrettyPullRequest, ReviewRequest, UndoSummary,
+        format_pretty_pull_request, handle_command_result, handle_text_input, is_api_action,
+        parse_updated_at, repo_dir_for_full_name, reviewpr_command, snapshot_state,
+        sort_by_updated_at, split_review_action, split_view_action, undo_status, AppState,
+        EntrySnapshot, ExecSummary, NotificationOverride, NotificationOverrideState,
+        PrettyPullRequest, ReviewRequest, UndoSummary,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -1691,6 +2241,34 @@ mod tests {
             },
             url: "https://github.com/acme/widgets/pull/42".to_string(),
         }
+    }
+
+    #[test]
+    fn visibility_change_revalidates_pending_commands() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.notifications = vec![sample_notification(true), sample_notification(true)];
+        app.set_visible_count(2);
+        handle_text_input(&mut app, key_event(KeyCode::Char('2'), KeyModifiers::NONE));
+        handle_text_input(&mut app, key_event(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.pending.get(&2), Some(&vec![Action::Done]));
+
+        app.set_visible_count(1);
+
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn terminal_growth_does_not_expose_targets_before_rendering() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.notifications = vec![sample_notification(true), sample_notification(true)];
+        app.set_visible_count(1);
+
+        app.restrict_visible_count(2);
+        handle_text_input(&mut app, key_event(KeyCode::Char('2'), KeyModifiers::NONE));
+        handle_text_input(&mut app, key_event(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert_eq!(app.visible_count, 1);
+        assert!(app.pending.is_empty());
     }
 
     fn sample_my_pr() -> MyPullRequest {
@@ -1791,6 +2369,29 @@ mod tests {
         let mut app = AppState::new(true, HashSet::new());
         handle_text_input(&mut app, key_event(KeyCode::Char('P'), KeyModifiers::NONE));
         assert_eq!(app.command_text(), "P");
+    }
+
+    #[test]
+    fn allows_view_input() {
+        let mut app = AppState::new(true, HashSet::new());
+        handle_text_input(&mut app, key_event(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.command_text(), "v");
+    }
+
+    #[test]
+    fn split_view_action_returns_pr_and_preserves_other_actions() {
+        let notifications = vec![sample_notification(true)];
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::View, Action::Read]);
+
+        let (url, filtered) =
+            split_view_action(&commands, &notifications, &[]).expect("split view action");
+
+        assert_eq!(
+            url.as_deref(),
+            Some("https://github.com/acme/widgets/pull/42")
+        );
+        assert_eq!(filtered.get(&1), Some(&vec![Action::Read]));
     }
 
     #[test]
@@ -2332,6 +2933,49 @@ mod tests {
         assert_eq!(app.notifications.len(), 1);
         assert!(app.notifications[0].unread);
         assert!(!app.notification_overrides.contains_key(&updated.id));
+    }
+
+    #[test]
+    fn authoritative_absence_clears_optimistic_override() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.notifications = vec![sample_notification(true)];
+        let id = app.notifications[0].id.clone();
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::Done]);
+        apply_optimistic_update(&mut app, &commands);
+
+        app.set_data(Vec::new(), Vec::new());
+
+        assert!(!app.notification_overrides.contains_key(&id));
+    }
+
+    #[test]
+    fn failed_command_rolls_back_optimistic_state() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.notifications = vec![sample_notification(true)];
+        let snapshot = snapshot_state(&app);
+        let mut commands = HashMap::new();
+        commands.insert(1, vec![Action::Done]);
+        apply_optimistic_update(&mut app, &commands);
+        assert!(app.notifications.is_empty());
+
+        let (refresh_tx, _refresh_rx) = tokio::sync::mpsc::channel(1);
+        handle_command_result(
+            &mut app,
+            &refresh_tx,
+            ExecSummary {
+                succeeded: 0,
+                failed: 1,
+                errors: vec!["mutation rejected".to_string()],
+                api_failed: true,
+                refresh: false,
+            },
+            &snapshot,
+        );
+
+        assert_eq!(app.notifications.len(), 1);
+        assert!(app.notifications[0].unread);
+        assert!(app.notification_overrides.is_empty());
     }
 
     #[test]

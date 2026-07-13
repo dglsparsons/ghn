@@ -3,6 +3,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::github_notifications;
 use crate::types::{
     CiStatus, GraphQlError, GraphQlResponse, MergeStateStatus, MyPullRequest, Notification,
     Repository, ReviewStatus, Subject, SubjectStatus,
@@ -10,17 +11,6 @@ use crate::types::{
 
 const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
 const GITHUB_API: &str = "https://api.github.com";
-const GITHUB_API_VERSION: &str = "2022-11-28";
-
-#[derive(Debug, Deserialize)]
-struct ViewerLoginData {
-    viewer: ViewerLogin,
-}
-
-#[derive(Debug, Deserialize)]
-struct ViewerLogin {
-    login: String,
-}
 
 #[derive(Debug, Deserialize)]
 struct RestNotificationThread {
@@ -194,14 +184,6 @@ pub struct InboxPayload {
     pub viewer_login: String,
 }
 
-const VIEWER_LOGIN_QUERY: &str = r#"
-query ViewerLogin {
-  viewer {
-    login
-  }
-}
-"#;
-
 const MY_PULL_REQUESTS_QUERY: &str = r#"
 query GetMyPullRequests($query: String!) {
   search(query: $query, type: ISSUE, first: 50) {
@@ -325,6 +307,10 @@ fn notification_subject_url(
     let Some(api_url) = api_url else {
         return repo_url;
     };
+
+    if api_url.starts_with("https://github.com/") {
+        return api_url.to_string();
+    }
 
     let repo_api_prefix = format!("{GITHUB_API}/repos/{repo_full_name}/");
     let Some(path) = api_url.strip_prefix(&repo_api_prefix) else {
@@ -667,84 +653,33 @@ fn handle_graphql_errors(errors: &[GraphQlError]) -> Result<()> {
     Err(anyhow!("GraphQL error: {}", errors[0].message))
 }
 
-async fn fetch_viewer_login(client: &Client, token: &str) -> Result<String> {
-    let response = client
-        .post(GITHUB_GRAPHQL)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .header("User-Agent", "ghn")
-        .json(&json!({ "query": VIEWER_LOGIN_QUERY }))
-        .send()
-        .await
-        .context("failed to fetch viewer login")?;
-
-    if response.status() == 429 {
-        return Err(anyhow!("GitHub rate limited. Retrying later."));
-    }
-    if response.status() == 401 || response.status() == 403 {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "GitHub authentication failed ({}). {}",
-            status,
-            body.trim()
-        ));
-    }
-    if !response.status().is_success() {
-        return Err(anyhow!("GitHub API error: {}", response.status()));
-    }
-
-    let payload: GraphQlResponse<ViewerLoginData> = response.json().await?;
-    if let Some(errors) = payload.errors {
-        handle_graphql_errors(&errors)?;
-    }
-
-    Ok(payload
-        .data
-        .map(|data| data.viewer.login)
-        .unwrap_or_else(|| "unknown".to_string()))
-}
-
 async fn fetch_notification_threads(
     client: &Client,
-    token: &str,
+    notification_token: &str,
     include_read: bool,
-) -> Result<Vec<RestNotificationThread>> {
-    let response = client
-        .get(format!("{GITHUB_API}/notifications"))
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-        .header("User-Agent", "ghn")
-        .query(&[
-            ("all", if include_read { "true" } else { "false" }),
-            ("participating", "false"),
-            ("per_page", "50"),
-        ])
-        .send()
-        .await
-        .context("failed to fetch notifications")?;
-
-    if response.status() == 429 {
-        return Err(anyhow!("GitHub rate limited. Retrying later."));
-    }
-    if response.status() == 401 || response.status() == 403 {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "GitHub authentication failed ({}). {}",
-            status,
-            body.trim()
-        ));
-    }
-    if !response.status().is_success() {
-        return Err(anyhow!("GitHub API error: {}", response.status()));
-    }
-
-    response
-        .json()
-        .await
-        .context("failed to decode notifications response")
+) -> Result<(String, Vec<RestNotificationThread>)> {
+    let inbox =
+        github_notifications::fetch_inbox(client, notification_token, !include_read).await?;
+    let threads = inbox
+        .threads
+        .into_iter()
+        .map(|thread| RestNotificationThread {
+            id: thread.id,
+            unread: thread.unread,
+            reason: thread.reason,
+            updated_at: thread.updated_at,
+            subject: RestNotificationSubject {
+                title: thread.title,
+                url: Some(thread.url),
+                kind: thread.subject_kind,
+            },
+            repository: RestNotificationRepository {
+                name: thread.repository_name,
+                full_name: thread.repository_full_name,
+            },
+        })
+        .collect();
+    Ok((inbox.viewer_login, threads))
 }
 
 async fn fetch_notification_subjects(
@@ -857,13 +792,12 @@ async fn fetch_notification_subjects(
 
 pub async fn fetch_notifications(
     client: &Client,
-    token: &str,
+    public_token: &str,
+    notification_token: &str,
     include_read: bool,
 ) -> Result<NotificationsPayload> {
-    let (viewer_login, threads) = tokio::try_join!(
-        fetch_viewer_login(client, token),
-        fetch_notification_threads(client, token, include_read),
-    )?;
+    let (viewer_login, threads) =
+        fetch_notification_threads(client, notification_token, include_read).await?;
 
     let mut subject_urls = Vec::new();
     for thread in &threads {
@@ -881,7 +815,7 @@ pub async fn fetch_notifications(
         }
     }
 
-    let subject_details = fetch_notification_subjects(client, token, &subject_urls).await?;
+    let subject_details = fetch_notification_subjects(client, public_token, &subject_urls).await?;
     let mut subjects_by_url = std::collections::HashMap::new();
     for resource in subject_details {
         if let Some(subject) = resource.subject {
@@ -1034,7 +968,8 @@ pub async fn fetch_pretty_pull_request(
 
 pub async fn fetch_notifications_and_my_prs_cached(
     client: &Client,
-    token: &str,
+    public_token: &str,
+    notification_token: &str,
     include_read: bool,
     cached_viewer_login: Option<&str>,
 ) -> Result<InboxPayload> {
@@ -1044,8 +979,8 @@ pub async fn fetch_notifications_and_my_prs_cached(
 
     let notifications = if let Some(viewer_login) = cached_viewer_login {
         let (notifications, pull_requests) = tokio::try_join!(
-            fetch_notifications(client, token, include_read),
-            fetch_my_pull_requests(client, token, viewer_login),
+            fetch_notifications(client, public_token, notification_token, include_read),
+            fetch_my_pull_requests(client, public_token, viewer_login),
         )?;
         let pull_requests = dedupe_pull_requests(pull_requests, &notifications.notifications);
 
@@ -1055,10 +990,11 @@ pub async fn fetch_notifications_and_my_prs_cached(
             my_prs: pull_requests,
         });
     } else {
-        fetch_notifications(client, token, include_read).await?
+        fetch_notifications(client, public_token, notification_token, include_read).await?
     };
 
-    let pull_requests = fetch_my_pull_requests(client, token, &notifications.viewer_login).await?;
+    let pull_requests =
+        fetch_my_pull_requests(client, public_token, &notifications.viewer_login).await?;
     let pull_requests = dedupe_pull_requests(pull_requests, &notifications.notifications);
 
     Ok(InboxPayload {
@@ -1093,98 +1029,6 @@ fn dedupe_pull_requests(
         .into_iter()
         .filter(|pr| !ids.contains(&pr.id) && !urls.contains(&pr.url))
         .collect()
-}
-
-async fn send_thread_request(
-    request: reqwest::RequestBuilder,
-    context: &'static str,
-) -> Result<()> {
-    let response = request.send().await.context(context)?;
-
-    if response.status() == 429 {
-        return Err(anyhow!("GitHub rate limited. Retrying later."));
-    }
-    if response.status() == 401 || response.status() == 403 {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "GitHub authentication failed ({}). {}",
-            status,
-            body.trim()
-        ));
-    }
-    if !response.status().is_success() {
-        return Err(anyhow!("GitHub API error: {}", response.status()));
-    }
-
-    Ok(())
-}
-
-pub async fn mark_as_read(client: &Client, token: &str, thread_id: &str) -> Result<()> {
-    let url = format!("{GITHUB_API}/notifications/threads/{thread_id}");
-    send_thread_request(
-        client
-            .patch(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-            .header("User-Agent", "ghn"),
-        "failed to mark thread as read",
-    )
-    .await
-}
-
-pub async fn mark_as_unread(_client: &Client, _token: &str, _thread_id: &str) -> Result<()> {
-    Err(anyhow!(
-        "GitHub no longer exposes an API to mark a notification thread as unread"
-    ))
-}
-
-pub async fn mark_as_done(client: &Client, token: &str, thread_id: &str) -> Result<()> {
-    let url = format!("{GITHUB_API}/notifications/threads/{thread_id}");
-    send_thread_request(
-        client
-            .delete(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-            .header("User-Agent", "ghn"),
-        "failed to mark thread as done",
-    )
-    .await
-}
-
-pub async fn unsubscribe(client: &Client, token: &str, thread_id: &str) -> Result<()> {
-    let url = format!("{GITHUB_API}/notifications/threads/{thread_id}/subscription");
-    send_thread_request(
-        client
-            .put(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-            .header("User-Agent", "ghn")
-            .json(&json!({ "ignored": true })),
-        "failed to update thread subscription",
-    )
-    .await
-}
-
-pub async fn subscribe_to_thread(client: &Client, token: &str, thread_id: &str) -> Result<()> {
-    let url = format!(
-        "{}/notifications/threads/{}/subscription",
-        GITHUB_API, thread_id
-    );
-    send_thread_request(
-        client
-            .put(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-            .header("User-Agent", "ghn")
-            .json(&json!({ "ignored": false })),
-        "failed to update thread subscription",
-    )
-    .await
 }
 
 #[cfg(test)]

@@ -4,24 +4,25 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
 use crate::{
+    discussion::DiscussionActivity,
     types::{
         Action, CiStatus, MergeStateStatus, MyPullRequest, Notification, ReviewStatus, Subject,
         SubjectStatus,
     },
-    AppState,
+    AppState, DiscussionInboxUpdate, Screen,
 };
 
 const COMMANDS_FULL: &str =
-    "Commands: o open/read  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review+analyze  P review  b branch  U undo";
+    "Commands: o open/read  v view PR  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review+analyze  P review  b branch  U undo";
 const COMMANDS_COMPACT: &str =
-    "Cmds: o open/read  y pretty  Y yank  r read  d done  q unsub/ign  p rev+anlz  P review  b branch  U undo";
-const COMMANDS_SHORT: &str = "Cmds o/y/Y/r/d/q/p/P/b/U";
-const COMMANDS_TINY: &str = "o y Y r d q p P b U";
+    "Cmds: o open/read  v view  y pretty  Y yank  r read  d done  q unsub/ign  p rev+anlz  P review  b branch  U undo";
+const COMMANDS_SHORT: &str = "Cmds o/v/y/Y/r/d/q/p/P/b/U";
+const COMMANDS_TINY: &str = "o v y Y r d q p P b U";
 
 const TARGETS_FULL: &str =
     "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, ! conflicts, w approved+CI pending, m merged, c closed, f draft";
@@ -139,22 +140,155 @@ pub enum DisplayEntryKey {
 }
 
 pub fn draw(f: &mut Frame, app: &AppState) {
+    if matches!(app.screen, Screen::Discussion { .. }) {
+        draw_discussion(f, app);
+        return;
+    }
     let size = f.area();
     let status_lines = build_status_lines(size.width, app.status.as_deref());
     let status_height = status_lines.len().max(1) as u16;
+    let chunks = layout_chunks(size, status_height);
 
+    draw_lists(f, chunks[0], app);
+    draw_status(f, chunks[1], status_lines);
+    draw_command(f, chunks[2], app);
+}
+
+fn draw_discussion(f: &mut Frame, app: &AppState) {
+    let size = f.area();
     let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .split(size);
+    let Screen::Discussion { pr_url, selected } = &app.screen else {
+        return;
+    };
+    let Some(update) = app.discussions.get(pr_url) else {
+        f.render_widget(
+            Paragraph::new("Discussion data is not loaded yet. Press R to retry or Esc to return.")
+                .block(
+                    Block::default()
+                        .title("PR Discussion")
+                        .borders(Borders::ALL),
+                ),
+            size,
+        );
+        return;
+    };
+    let snapshot = &update.snapshot;
+    let threads: Vec<_> = snapshot.relevant_threads(&update.viewer_login).collect();
+    let unresolved = threads.iter().filter(|thread| !thread.is_resolved).count();
+    let header = Paragraph::new(format!(
+        "{}/{} #{}  {} relevant threads · {} unresolved · head {}",
+        snapshot.owner,
+        snapshot.repository,
+        snapshot.number,
+        threads.len(),
+        unresolved,
+        short_oid(&snapshot.head_oid)
+    ))
+    .block(
+        Block::default()
+            .title("PR Discussion")
+            .borders(Borders::ALL),
+    );
+    f.render_widget(header, chunks[0]);
+
+    let items: Vec<ListItem> = threads
+        .iter()
+        .map(|thread| {
+            let state = if thread.is_resolved {
+                "✓ resolved"
+            } else if thread.is_outdated {
+                "◌ outdated"
+            } else {
+                "● unresolved"
+            };
+            let location = match thread.location.line {
+                Some(line) => format!("{}:{line}", thread.location.path),
+                None => thread.location.path.clone(),
+            };
+            let mut lines = vec![Line::from(vec![
+                Span::styled(state, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled(location, Style::default().fg(Color::Cyan)),
+            ])];
+            for comment in &thread.comments {
+                let author = comment
+                    .author
+                    .as_ref()
+                    .map(|actor| actor.login.as_str())
+                    .unwrap_or("unknown");
+                let prefix = if comment.reply_to.is_some() {
+                    "  ↳ "
+                } else {
+                    "  "
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{prefix}{author}: "),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw(comment.body.replace('\n', " ")),
+                ]));
+            }
+            ListItem::new(lines)
+        })
+        .collect();
+    if items.is_empty() {
+        f.render_widget(
+            Paragraph::new("No review threads relevant to you.")
+                .block(Block::default().borders(Borders::ALL)),
+            chunks[1],
+        );
+    } else {
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL))
+            .highlight_symbol("▶ ")
+            .highlight_style(Style::default().bg(Color::DarkGray));
+        let mut state =
+            ListState::default().with_selected(Some((*selected).min(threads.len() - 1)));
+        f.render_stateful_widget(list, chunks[1], &mut state);
+    }
+    f.render_widget(
+        Paragraph::new("j/k navigate  R refresh  p/P investigate  Esc back")
+            .style(Style::default().fg(Color::Gray)),
+        chunks[2],
+    );
+}
+
+fn layout_chunks(size: Rect, status_height: u16) -> std::rc::Rc<[Rect]> {
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(8),
             Constraint::Length(status_height),
             Constraint::Length(2),
         ])
-        .split(size);
+        .split(size)
+}
 
-    draw_lists(f, chunks[0], app);
-    draw_status(f, chunks[1], status_lines);
-    draw_command(f, chunks[2], app);
+pub fn visible_entry_count(size: Rect, app: &AppState) -> usize {
+    let status_height = build_status_lines(size.width, app.status.as_deref())
+        .len()
+        .max(1) as u16;
+    let list_area = layout_chunks(size, status_height)[0];
+    let sections = build_bucket_sections(
+        &app.notifications,
+        &app.relative_times,
+        &app.my_prs,
+        &app.my_pr_relative_times,
+    );
+
+    sections
+        .iter()
+        .zip(split_bucket_area(list_area, &sections, &app.discussions))
+        .map(|(section, area)| visible_entries_for_section(section, area.height, &app.discussions))
+        .sum()
 }
 
 fn draw_lists(f: &mut Frame, area: Rect, app: &AppState) {
@@ -171,7 +305,7 @@ fn draw_lists(f: &mut Frame, area: Rect, app: &AppState) {
         &app.my_prs,
         &app.my_pr_relative_times,
     );
-    let sections_area = split_bucket_area(area, &sections);
+    let sections_area = split_bucket_area(area, &sections, &app.discussions);
 
     for (section, area) in sections.iter().zip(sections_area) {
         if area.height == 0 {
@@ -183,6 +317,7 @@ fn draw_lists(f: &mut Frame, area: Rect, app: &AppState) {
             section,
             &app.pending,
             &app.executing,
+            &app.discussions,
             total_count,
             &layout_max,
         );
@@ -195,12 +330,17 @@ struct BucketSection<'a> {
 }
 
 impl BucketSection<'_> {
-    fn required_height(&self) -> u16 {
+    fn required_height(&self, discussions: &HashMap<String, DiscussionInboxUpdate>) -> u16 {
         if self.entries.is_empty() {
             return 0;
         }
 
-        let content_height = self.entries.len().saturating_mul(3).saturating_sub(1);
+        let content_height = self
+            .entries
+            .iter()
+            .map(|entry| 3 + activity_line_count(&entry.item, discussions))
+            .sum::<usize>()
+            .saturating_sub(1);
         content_height.saturating_add(2).min(u16::MAX as usize) as u16
     }
 }
@@ -218,6 +358,7 @@ fn draw_bucket_section(
     section: &BucketSection<'_>,
     pending: &HashMap<usize, Vec<Action>>,
     executing: &HashSet<String>,
+    discussions: &HashMap<String, DiscussionInboxUpdate>,
     total_count: usize,
     layout_max: &LayoutMax,
 ) {
@@ -228,10 +369,12 @@ fn draw_bucket_section(
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner_area = block.inner(area);
     let widths = layout_widths(inner_area.width, total_count, layout_max);
+    let visible_count = visible_entries_for_section(section, area.height, discussions);
 
     let items: Vec<ListItem> = section
         .entries
         .iter()
+        .take(visible_count)
         .enumerate()
         .map(|(idx, entry)| {
             build_list_item(
@@ -240,8 +383,9 @@ fn draw_bucket_section(
                 entry.relative_time,
                 pending,
                 executing,
+                activity_lines(&entry.item, discussions),
                 &widths,
-                idx + 1 < section.entries.len(),
+                idx + 1 < visible_count,
             )
         })
         .collect();
@@ -250,7 +394,11 @@ fn draw_bucket_section(
     f.render_widget(list, area);
 }
 
-fn split_bucket_area(area: Rect, sections: &[BucketSection<'_>]) -> Vec<Rect> {
+fn split_bucket_area(
+    area: Rect,
+    sections: &[BucketSection<'_>],
+    discussions: &HashMap<String, DiscussionInboxUpdate>,
+) -> Vec<Rect> {
     if sections.is_empty() {
         return Vec::new();
     }
@@ -261,7 +409,7 @@ fn split_bucket_area(area: Rect, sections: &[BucketSection<'_>]) -> Vec<Rect> {
     sections
         .iter()
         .map(|section| {
-            let height = section.required_height().min(remaining_height);
+            let height = section.required_height(discussions).min(remaining_height);
             let rect = Rect {
                 x: area.x,
                 y: next_y,
@@ -273,6 +421,155 @@ fn split_bucket_area(area: Rect, sections: &[BucketSection<'_>]) -> Vec<Rect> {
             rect
         })
         .collect()
+}
+
+#[cfg(test)]
+fn visible_entries_for_height(entry_count: usize, height: u16) -> usize {
+    let inner_height = height.saturating_sub(2) as usize;
+    if inner_height < 2 {
+        return 0;
+    }
+
+    ((inner_height + 1) / 3).min(entry_count)
+}
+
+fn visible_entries_for_section(
+    section: &BucketSection<'_>,
+    height: u16,
+    discussions: &HashMap<String, DiscussionInboxUpdate>,
+) -> usize {
+    let mut remaining = height.saturating_sub(2) as usize;
+    let mut visible = 0;
+    for entry in &section.entries {
+        let rows = 3 + activity_line_count(&entry.item, discussions);
+        if rows.saturating_sub(1) > remaining {
+            break;
+        }
+        remaining = remaining.saturating_sub(rows);
+        visible += 1;
+    }
+    visible
+}
+
+fn activity_line_count(
+    item: &BucketItem<'_>,
+    discussions: &HashMap<String, DiscussionInboxUpdate>,
+) -> usize {
+    discussions
+        .get(&item.subject().url)
+        .map(|discussion| discussion.activity.len())
+        .unwrap_or(0)
+}
+
+fn activity_lines(
+    item: &BucketItem<'_>,
+    discussions: &HashMap<String, DiscussionInboxUpdate>,
+) -> Vec<(String, Style)> {
+    let Some(discussion) = discussions.get(&item.subject().url) else {
+        return Vec::new();
+    };
+    ordered_activity(&discussion.activity)
+        .into_iter()
+        .map(|activity| activity_line(activity, discussion))
+        .collect()
+}
+
+fn ordered_activity(activity: &[DiscussionActivity]) -> Vec<&DiscussionActivity> {
+    let mut ordered: Vec<_> = activity.iter().collect();
+    ordered.sort_by_key(|activity| match activity {
+        DiscussionActivity::ReplyAdded { .. }
+        | DiscussionActivity::ThreadReopened { .. }
+        | DiscussionActivity::RelevantThreadAdded { .. } => 0,
+        DiscussionActivity::ThreadResolved { .. } => 1,
+        DiscussionActivity::CommentEdited { .. } => 2,
+        DiscussionActivity::ThreadBecameOutdated { .. } => 3,
+        DiscussionActivity::HeadUpdated { .. } => 4,
+    });
+    ordered
+}
+
+fn activity_line(
+    activity: &DiscussionActivity,
+    discussion: &DiscussionInboxUpdate,
+) -> (String, Style) {
+    let find_thread = |id: &str| {
+        discussion
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+    };
+    let location = |id: &str| {
+        find_thread(id)
+            .map(|thread| match thread.location.line {
+                Some(line) => format!("{}:{line}", thread.location.path),
+                None => thread.location.path.clone(),
+            })
+            .unwrap_or_else(|| "review thread".to_string())
+    };
+    match activity {
+        DiscussionActivity::HeadUpdated { previous, current } => (
+            format!(
+                "└─ ↑ Head updated {} → {}",
+                short_oid(previous),
+                short_oid(current)
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+        DiscussionActivity::RelevantThreadAdded { thread_id } => (
+            format!("└─ ● New relevant thread · {}", location(thread_id)),
+            Style::default().fg(Color::Yellow),
+        ),
+        DiscussionActivity::ReplyAdded {
+            thread_id,
+            comment_id,
+        } => {
+            let actor = find_thread(thread_id)
+                .and_then(|thread| {
+                    thread
+                        .comments
+                        .iter()
+                        .find(|comment| &comment.id == comment_id)
+                })
+                .and_then(|comment| comment.author.as_ref())
+                .map(|actor| actor.login.as_str())
+                .unwrap_or("unknown");
+            (
+                format!("└─ ● New reply · {} · {actor}", location(thread_id)),
+                Style::default().fg(Color::Yellow),
+            )
+        }
+        DiscussionActivity::ThreadResolved {
+            thread_id,
+            resolved_by,
+        } => (
+            format!(
+                "└─ ✓ Thread resolved · {} · {}",
+                location(thread_id),
+                resolved_by
+                    .as_ref()
+                    .map(|actor| actor.login.as_str())
+                    .unwrap_or("unknown")
+            ),
+            Style::default().fg(Color::Green),
+        ),
+        DiscussionActivity::ThreadReopened { thread_id } => (
+            format!("└─ ! Thread reopened · {}", location(thread_id)),
+            Style::default().fg(Color::Red),
+        ),
+        DiscussionActivity::ThreadBecameOutdated { thread_id } => (
+            format!("└─ ◌ Thread outdated · {}", location(thread_id)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        DiscussionActivity::CommentEdited { thread_id, .. } => (
+            format!("└─ ~ Comment edited · {}", location(thread_id)),
+            Style::default().fg(Color::Magenta),
+        ),
+    }
+}
+
+fn short_oid(oid: &str) -> &str {
+    oid.get(..7).unwrap_or(oid)
 }
 
 fn bucket_item<'a>(
@@ -298,12 +595,14 @@ fn relative_time_for_key<'a>(
     .unwrap_or("?")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_list_item<T: ListItemLike>(
     index: usize,
     item: &T,
     relative_time: &str,
     pending: &HashMap<usize, Vec<Action>>,
     executing: &HashSet<String>,
+    activity: Vec<(String, Style)>,
     widths: &LayoutWidths,
     add_spacer: bool,
 ) -> ListItem<'static> {
@@ -409,9 +708,12 @@ fn build_list_item<T: ListItemLike>(
 
     let header = Line::from(header_spans);
     let title_text = truncate_with_suffix(&subject.title, widths.title);
-    let title = Line::from(vec![Span::raw(indent), Span::raw(title_text)]);
+    let title = Line::from(vec![Span::raw(indent.clone()), Span::raw(title_text)]);
 
     let mut lines = vec![header, title];
+    lines.extend(activity.into_iter().map(|(text, style)| {
+        Line::from(vec![Span::raw(indent.clone()), Span::styled(text, style)])
+    }));
     if add_spacer {
         lines.push(Line::from(Span::raw(" ")));
     }
@@ -894,6 +1196,7 @@ fn action_color(action: Action) -> Color {
         Action::Unsubscribe => Color::Red,
         Action::Review => Color::Cyan,
         Action::ReviewNoAnalyze => Color::Cyan,
+        Action::View => Color::Magenta,
         Action::Branch => Color::LightBlue,
     }
 }
@@ -1128,10 +1431,15 @@ fn kind_color(kind: &str) -> Color {
 fn build_target_map(
     notifications: &[Notification],
     my_prs: &[MyPullRequest],
+    visible_count: usize,
 ) -> HashMap<char, Vec<usize>> {
     let mut targets: HashMap<char, Vec<usize>> = HashMap::new();
 
-    for (display_idx, key) in display_order(notifications, my_prs).into_iter().enumerate() {
+    for (display_idx, key) in display_order(notifications, my_prs)
+        .into_iter()
+        .take(visible_count)
+        .enumerate()
+    {
         let index = display_idx + 1;
         let Some(item) = bucket_item(key, notifications, my_prs) else {
             continue;
@@ -1168,14 +1476,29 @@ fn push_status_targets(targets: &mut HashMap<char, Vec<usize>>, index: usize, su
     }
 }
 
+#[cfg(test)]
 pub fn build_pending_map(
     input: &str,
     notifications: &[Notification],
     my_prs: &[MyPullRequest],
 ) -> HashMap<usize, Vec<Action>> {
-    let targets = build_target_map(notifications, my_prs);
-    let parsed =
-        crate::commands::parse_commands(input, notifications.len() + my_prs.len(), &targets);
+    build_visible_pending_map(
+        input,
+        notifications,
+        my_prs,
+        notifications.len() + my_prs.len(),
+    )
+}
+
+pub fn build_visible_pending_map(
+    input: &str,
+    notifications: &[Notification],
+    my_prs: &[MyPullRequest],
+    visible_count: usize,
+) -> HashMap<usize, Vec<Action>> {
+    let visible_count = visible_count.min(notifications.len() + my_prs.len());
+    let targets = build_target_map(notifications, my_prs, visible_count);
+    let parsed = crate::commands::parse_commands(input, visible_count, &targets);
 
     filter_pending_actions(parsed, notifications, my_prs)
 }
@@ -1229,7 +1552,7 @@ enum PendingEntry {
 fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
     match entry {
         PendingEntry::Notification { is_pull_request } => {
-            if matches!(action, Action::Branch | Action::PrettyYank) {
+            if matches!(action, Action::Branch | Action::PrettyYank | Action::View) {
                 *is_pull_request
             } else {
                 true
@@ -1244,6 +1567,7 @@ fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
                 | Action::Unsubscribe
                 | Action::Review
                 | Action::ReviewNoAnalyze
+                | Action::View
                 | Action::Branch
         ),
     }
@@ -1253,10 +1577,11 @@ fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
 mod tests {
     use super::{
         action_marker, base_notification_style, build_bucket_sections, build_pending_map,
-        build_status_lines, ci_indicator, collect_layout_max, kind_color, layout_widths,
-        notification_bucket, pending_style, render_repo_and_author, review_indicator,
-        select_legend_lines, split_bucket_area, status_prefixes, truncate_with_suffix, BucketItem,
-        LayoutMax, NotificationBucket, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
+        build_status_lines, build_visible_pending_map, ci_indicator, collect_layout_max,
+        kind_color, layout_widths, notification_bucket, pending_style, render_repo_and_author,
+        review_indicator, select_legend_lines, split_bucket_area, status_prefixes,
+        truncate_with_suffix, visible_entries_for_height, BucketItem, LayoutMax,
+        NotificationBucket, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
     };
     use crate::types::{
         Action, CiStatus, MergeStateStatus, MyPullRequest, Notification, Repository, ReviewStatus,
@@ -1264,6 +1589,7 @@ mod tests {
     };
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier, Style};
+    use std::collections::HashMap;
 
     fn sample_bucket_notification(
         id: &str,
@@ -1334,6 +1660,27 @@ mod tests {
             },
             url: format!("https://github.com/acme/widgets/pull/{id}"),
         }
+    }
+
+    #[test]
+    fn hidden_entries_cannot_be_targeted_by_number() {
+        let notifications = vec![
+            sample_bucket_notification("1", "mention", "Issue", Vec::new(), None, None, None),
+            sample_bucket_notification("2", "mention", "Issue", Vec::new(), None, None, None),
+        ];
+
+        let visible = build_visible_pending_map("1d", &notifications, &[], 1);
+        let hidden = build_visible_pending_map("2d", &notifications, &[], 1);
+
+        assert_eq!(visible.get(&1), Some(&vec![Action::Done]));
+        assert!(hidden.is_empty());
+    }
+
+    #[test]
+    fn visible_entry_count_excludes_buckets_without_room_for_a_row() {
+        assert_eq!(visible_entries_for_height(45, 2), 0);
+        assert_eq!(visible_entries_for_height(45, 4), 1);
+        assert_eq!(visible_entries_for_height(45, 7), 2);
     }
 
     #[test]
@@ -2104,6 +2451,7 @@ mod tests {
                 height: 20,
             },
             &sections,
+            &HashMap::new(),
         )
         .into_iter()
         .map(|rect| rect.height)
@@ -2188,6 +2536,7 @@ mod tests {
                 height: 60,
             },
             &sections,
+            &HashMap::new(),
         )
         .into_iter()
         .map(|rect| rect.height)
