@@ -10,6 +10,7 @@ A fast, keyboard-driven TUI for GitHub notifications. Built for power users who 
 - **Visual feedback**: Notifications highlight based on pending action
 - **Full keyboard control**: Never touch the mouse
 - **My PRs included**: Keeps your open pull requests visible even without notifications and places them in the same buckets
+- **PR discussion activity**: Shows head updates, relevant replies, and review-thread state changes beneath each PR
 
 ## Installation
 
@@ -24,6 +25,12 @@ cargo build --release
 - Rust toolchain (`cargo`)
 - [GitHub CLI](https://cli.github.com/) (`gh`) installed and authenticated
 - `gh auth login` completed (supports SSO, enterprise GitHub, etc.)
+
+On first launch, `ghn` also opens a browser for notification-only authorization. GitHub's public
+notification API cannot distinguish Inbox items from items marked Done, so `ghn` uses the private
+notification GraphQL contract shipped by GitHub Mobile. On macOS the resulting token is stored in
+Keychain; it is not written to `ghn`'s configuration files. This contract is deliberately isolated
+because GitHub can change it without notice.
 
 ## Usage
 
@@ -64,6 +71,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 | Action | Key | Description |
 |--------|-----|-------------|
 | Open | `o` | Open notification in browser (marks as read) |
+| View PR | `v` | Inspect review threads relevant to you and acknowledge their current state locally |
 | Pretty yank | `y` | Copy PR summary to clipboard (PRs only) |
 | Yank | `Y` | Copy URL to clipboard |
 | Read | `r` | Mark as read |
@@ -76,6 +84,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 
 **Examples:**
 - `1o` - Open notification #1 in browser (marks it as read)
+- `1v` - View relevant review discussion for pull request #1
 - `1-3r` - Mark notifications 1, 2, and 3 as read
 - `1,2,3r` - Same as above, using a list separator
 - `5y` - Copy PR summary for notification #5
@@ -99,7 +108,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 |-----|--------|
 | `0-9` | Build number for command |
 | `-` / `,` / `Space` | Range or list separators |
-| `o/y/Y/r/d/q/p/P/b` | Queue action for current number |
+| `o/v/y/Y/r/d/q/p/P/b` | Queue action for current number |
 | `p` | Review PR in nvim with `--analyze` |
 | `P` | Review PR in nvim without `--analyze` |
 | `Enter` | Execute all queued commands |
@@ -132,6 +141,9 @@ When you queue a command, the targeted notification highlights with a color indi
 
 PRs also show a CI indicator: `✓` success, `↻` running/pending, `✗` failed.
 PR indicators show status: `?` pending review, `A` approved, `X` changes requested, `!` conflicts.
+Relevant review activity is derived locally from complete GitHub review-thread snapshots. A quiet
+`↑` child means only the PR head changed; replies, resolutions, reopenings, outdated threads, and
+edits appear as children when they involve you (or on any thread when you authored the PR).
 
 ## Configuration
 
@@ -140,12 +152,13 @@ Command-line flags:
 ```bash
 ghn --interval 30       # Poll interval in seconds (default: 60)
 ghn --unread-only       # Show only unread notifications
+ghn --reauthorize-notifications # Replace the stored notification authorization
 ```
 
 ## How It Works
 
-1. Gets your GitHub token via `gh auth token`
-2. Fetches notifications from the GitHub GraphQL API
+1. Gets the public GitHub token via `gh auth token` for PR status and discussion data
+2. Fetches exact Inbox state and notification mutations through an isolated GitHub Mobile client
 3. Polls for updates on the requested interval
 
 ## License
