@@ -23,20 +23,27 @@ cargo build --release
 ### Prerequisites
 
 - Rust toolchain (`cargo`)
-- [GitHub CLI](https://cli.github.com/) (`gh`) installed and authenticated
-- `gh auth login` completed (supports SSO, enterprise GitHub, etc.)
+- [Codex desktop](https://developers.openai.com/codex/) with the `review-pr`
+  skill for conversational PR reviews
 
-On first launch, `ghn` also opens a browser for notification-only authorization. GitHub's public
-notification API cannot distinguish Inbox items from items marked Done, so `ghn` uses the private
-notification GraphQL contract shipped by GitHub Mobile. On macOS the resulting token is stored in
-Keychain; it is not written to `ghn`'s configuration files. This contract is deliberately isolated
-because GitHub can change it without notice.
+On first launch, `ghn` opens a browser for GitHub authorization with the `repo` and `notifications`
+scopes. GitHub's public notification API cannot distinguish Inbox items from items marked Done, so
+the token is issued through GitHub Mobile's OAuth client and can use the private notification
+GraphQL contract shipped by GitHub Mobile. The same token accesses PR metadata, status checks, and
+review discussions, including in private repositories. GitHub's classic OAuth scopes do not offer
+read-only private-repository access, so `repo` grants broader repository access than `ghn` uses.
+On macOS the token is stored in Keychain; it is not written to `ghn`'s configuration files. The
+authorization-code exchange is protected with PKCE. The private notification contract can change
+without notice.
 
 ## Usage
 
 ```bash
 ghn
 ```
+
+Pressing `p` opens a new Codex task with `$review-pr <PR URL>` prefilled.
+Press `Enter` in Codex to start it.
 
 ### UI Overview
 
@@ -49,7 +56,7 @@ ghn
 
 3 * [Draft] someorg/repo ↻ ? PullRequest 10m
     Review requested: Update dependencies
-Commands: o open  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review+analyze  P review  b branch  U undo  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, ! conflicts, w approved+CI pending, m merged, c closed, f draft  |  Executed 3 actions
+Commands: o open  y pretty yank  Y yank  r read  d done  q unsub/ignore  p Codex review  b branch  U undo  |  Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, ! conflicts, w approved+CI pending, m merged, c closed, f draft  |  Executed 3 actions
 > 1-3r
 ```
 
@@ -77,8 +84,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 | Read | `r` | Mark as read |
 | Done | `d` | Mark as done (removes from inbox) |
 | Unsubscribe | `q` | Unsubscribe from thread; in My PRs, ignore PRs (saved to `~/.config/ghn/ignores.txt`) |
-| ReviewPR (analyze) | `p` | Open nvim in `~/Developer/<owner>/<repo>` with `ReviewPR <url> --analyze` |
-| ReviewPR | `P` | Open nvim in `~/Developer/<owner>/<repo>` with `ReviewPR <url>` |
+| Codex review | `p` | Prefill a new Codex task with `$review-pr <url>` |
 | Branch | `b` | Copy branch name (pull requests only) |
 | Undo | `U` | Undo last executed batch (press `U` then `Enter`) |
 
@@ -90,8 +96,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 - `5y` - Copy PR summary for notification #5
 - `5Y` - Copy URL of notification #5
 - `1r` - Mark #1 as read without opening
-- `1p` - Open PR #1 in nvim using ReviewPR with `--analyze`
-- `1P` - Open PR #1 in nvim using ReviewPR without `--analyze`
+- `1p` - Prefill Codex with `$review-pr` and PR #1's URL; press `Enter` to start
 - `1b` - Copy branch name for PR #1
 - `23r` - With 10 items, marks #2 and #3; with 30 items, marks #23
 - `md` - Mark all merged PR notifications as done
@@ -108,9 +113,8 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 |-----|--------|
 | `0-9` | Build number for command |
 | `-` / `,` / `Space` | Range or list separators |
-| `o/v/y/Y/r/d/q/p/P/b` | Queue action for current number |
-| `p` | Review PR in nvim with `--analyze` |
-| `P` | Review PR in nvim without `--analyze` |
+| `o/v/y/Y/r/d/q/p/b` | Queue action for current number |
+| `p` | Review the PR directly in Codex |
 | `Enter` | Execute all queued commands |
 | `U` | Undo last executed batch (press `U` then `Enter`) |
 | `Esc` | Clear command buffer |
@@ -125,6 +129,9 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 | `Up` | Move highlight up |
 | `R` | Refresh notifications |
 | `Ctrl+C` | Quit |
+
+Authorization and scope failures show a sticky prompt; press `Enter` while that prompt is visible to
+start the same reauthorization flow.
 
 ### Visual Feedback
 
@@ -152,13 +159,16 @@ Command-line flags:
 ```bash
 ghn --interval 30       # Poll interval in seconds (default: 60)
 ghn --unread-only       # Show only unread notifications
-ghn --reauthorize-notifications # Replace the stored notification authorization
+ghn --reauthorize       # Replace the stored GitHub authorization
 ```
+
+`GHN_TOKEN` can supply a Mobile-issued token directly instead of Keychain storage. It must grant
+both required scopes; `GHN_NOTIFICATIONS_TOKEN` remains as a legacy alias.
 
 ## How It Works
 
-1. Gets the public GitHub token via `gh auth token` for PR status and discussion data
-2. Fetches exact Inbox state and notification mutations through an isolated GitHub Mobile client
+1. Loads the GitHub Mobile-issued token from Keychain, upgrading older notification-only tokens
+2. Fetches exact Inbox state, PR status, and discussion data with that token
 3. Polls for updates on the requested interval
 
 ## License

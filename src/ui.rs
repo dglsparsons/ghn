@@ -18,11 +18,11 @@ use crate::{
 };
 
 const COMMANDS_FULL: &str =
-    "Commands: o open/read  v view PR  y pretty yank  Y yank  r read  d done  q unsub/ignore  p review+analyze  P review  b branch  U undo";
+    "Commands: o open/read  v view PR  y pretty yank  Y yank  r read  d done  q unsub/ignore  p Codex review  b branch  U undo";
 const COMMANDS_COMPACT: &str =
-    "Cmds: o open/read  v view  y pretty  Y yank  r read  d done  q unsub/ign  p rev+anlz  P review  b branch  U undo";
-const COMMANDS_SHORT: &str = "Cmds o/v/y/Y/r/d/q/p/P/b/U";
-const COMMANDS_TINY: &str = "o v y Y r d q p P b U";
+    "Cmds: o open/read  v view  y pretty  Y yank  r read  d done  q unsub/ign  p review  b branch  U undo";
+const COMMANDS_SHORT: &str = "Cmds o/v/y/Y/r/d/q/p/b/U";
+const COMMANDS_TINY: &str = "o v y Y r d q p b U";
 
 const TARGETS_FULL: &str =
     "Targets: 1-3, 1 2 3, u unread, ? pending review, a approved, x changes requested, ! conflicts, w approved+CI pending, m merged, c closed, f draft";
@@ -255,7 +255,7 @@ fn draw_discussion(f: &mut Frame, app: &AppState) {
         f.render_stateful_widget(list, chunks[1], &mut state);
     }
     f.render_widget(
-        Paragraph::new("j/k navigate  R refresh  p/P investigate  Esc back")
+        Paragraph::new("j/k navigate  R refresh  p review  Esc back")
             .style(Style::default().fg(Color::Gray)),
         chunks[2],
     );
@@ -1235,8 +1235,7 @@ fn action_color(action: Action) -> Color {
         Action::Read => Color::DarkGray,
         Action::Done => Color::Green,
         Action::Unsubscribe => Color::Red,
-        Action::Review => Color::Cyan,
-        Action::ReviewNoAnalyze => Color::Cyan,
+        Action::ReviewCodex => Color::Cyan,
         Action::View => Color::Magenta,
         Action::Branch => Color::LightBlue,
     }
@@ -1606,8 +1605,7 @@ fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
                 | Action::Yank
                 | Action::PrettyYank
                 | Action::Unsubscribe
-                | Action::Review
-                | Action::ReviewNoAnalyze
+                | Action::ReviewCodex
                 | Action::View
                 | Action::Branch
         ),
@@ -1947,10 +1945,10 @@ mod tests {
         }];
 
         let map = build_pending_map("1p", &notifications, &my_prs);
-        assert_eq!(map.get(&1), Some(&vec![Action::Review]));
+        assert_eq!(map.get(&1), Some(&vec![Action::ReviewCodex]));
 
         let map = build_pending_map("1P", &notifications, &my_prs);
-        assert_eq!(map.get(&1), Some(&vec![Action::ReviewNoAnalyze]));
+        assert!(map.is_empty());
     }
 
     #[test]

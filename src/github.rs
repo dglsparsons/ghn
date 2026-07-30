@@ -645,9 +645,7 @@ fn handle_graphql_errors(errors: &[GraphQlError]) -> Result<()> {
     });
 
     if insufficient.is_some() {
-        return Err(anyhow!(
-            "missing 'notifications' scope. Run: gh auth refresh -h github.com -s notifications"
-        ));
+        return Err(anyhow!("GitHub authorization is missing a required scope"));
     }
 
     Err(anyhow!("GraphQL error: {}", errors[0].message))
@@ -655,11 +653,10 @@ fn handle_graphql_errors(errors: &[GraphQlError]) -> Result<()> {
 
 async fn fetch_notification_threads(
     client: &Client,
-    notification_token: &str,
+    token: &str,
     include_read: bool,
 ) -> Result<(String, Vec<RestNotificationThread>)> {
-    let inbox =
-        github_notifications::fetch_inbox(client, notification_token, !include_read).await?;
+    let inbox = github_notifications::fetch_inbox(client, token, !include_read).await?;
     let threads = inbox
         .threads
         .into_iter()
@@ -792,12 +789,10 @@ async fn fetch_notification_subjects(
 
 pub async fn fetch_notifications(
     client: &Client,
-    public_token: &str,
-    notification_token: &str,
+    token: &str,
     include_read: bool,
 ) -> Result<NotificationsPayload> {
-    let (viewer_login, threads) =
-        fetch_notification_threads(client, notification_token, include_read).await?;
+    let (viewer_login, threads) = fetch_notification_threads(client, token, include_read).await?;
 
     let mut subject_urls = Vec::new();
     for thread in &threads {
@@ -815,7 +810,7 @@ pub async fn fetch_notifications(
         }
     }
 
-    let subject_details = fetch_notification_subjects(client, public_token, &subject_urls).await?;
+    let subject_details = fetch_notification_subjects(client, token, &subject_urls).await?;
     let mut subjects_by_url = std::collections::HashMap::new();
     for resource in subject_details {
         if let Some(subject) = resource.subject {
@@ -968,8 +963,7 @@ pub async fn fetch_pretty_pull_request(
 
 pub async fn fetch_notifications_and_my_prs_cached(
     client: &Client,
-    public_token: &str,
-    notification_token: &str,
+    token: &str,
     include_read: bool,
     cached_viewer_login: Option<&str>,
 ) -> Result<InboxPayload> {
@@ -979,8 +973,8 @@ pub async fn fetch_notifications_and_my_prs_cached(
 
     let notifications = if let Some(viewer_login) = cached_viewer_login {
         let (notifications, pull_requests) = tokio::try_join!(
-            fetch_notifications(client, public_token, notification_token, include_read),
-            fetch_my_pull_requests(client, public_token, viewer_login),
+            fetch_notifications(client, token, include_read),
+            fetch_my_pull_requests(client, token, viewer_login),
         )?;
         let pull_requests = dedupe_pull_requests(pull_requests, &notifications.notifications);
 
@@ -990,11 +984,10 @@ pub async fn fetch_notifications_and_my_prs_cached(
             my_prs: pull_requests,
         });
     } else {
-        fetch_notifications(client, public_token, notification_token, include_read).await?
+        fetch_notifications(client, token, include_read).await?
     };
 
-    let pull_requests =
-        fetch_my_pull_requests(client, public_token, &notifications.viewer_login).await?;
+    let pull_requests = fetch_my_pull_requests(client, token, &notifications.viewer_login).await?;
     let pull_requests = dedupe_pull_requests(pull_requests, &notifications.notifications);
 
     Ok(InboxPayload {

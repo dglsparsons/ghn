@@ -250,10 +250,10 @@ mod tests {
         assert_eq!(result.get(&2), Some(&vec![Action::Unsubscribe]));
 
         let result = parse_commands("4p", 10, &targets);
-        assert_eq!(result.get(&4), Some(&vec![Action::Review]));
+        assert_eq!(result.get(&4), Some(&vec![Action::ReviewCodex]));
 
         let result = parse_commands("4P", 10, &targets);
-        assert_eq!(result.get(&4), Some(&vec![Action::ReviewNoAnalyze]));
+        assert!(result.is_empty());
 
         let result = parse_commands("6b", 10, &targets);
         assert_eq!(result.get(&6), Some(&vec![Action::Branch]));

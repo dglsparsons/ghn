@@ -5,6 +5,7 @@ mod github_discussions;
 mod github_notifications;
 mod ignore;
 mod notification_auth;
+mod review;
 mod types;
 mod ui;
 mod util;
@@ -12,9 +13,7 @@ mod util;
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Stdout},
-    path::{Path, PathBuf},
-    process::Command,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -53,7 +52,7 @@ use crate::{
     },
     ignore::{append_ignored_pr, load_ignored_prs, remove_ignored_pr},
     types::{Action, MyPullRequest, Notification},
-    util::{copy_to_clipboard, format_relative_time, gh_auth_token, open_in_browser},
+    util::{copy_to_clipboard, format_relative_time, open_in_browser},
 };
 
 #[derive(Parser, Debug)]
@@ -63,18 +62,29 @@ struct Args {
     interval: u64,
     #[arg(long, help = "Show only unread notifications")]
     unread_only: bool,
-    #[arg(long, help = "Replace the stored GitHub notification authorization")]
-    reauthorize_notifications: bool,
+    #[arg(
+        long,
+        alias = "reauthorize-notifications",
+        help = "Replace the stored GitHub authorization"
+    )]
+    reauthorize: bool,
 }
 
 #[derive(Debug)]
 enum AppEvent {
     Data {
+        generation: u64,
         notifications: Vec<Notification>,
         my_prs: Vec<MyPullRequest>,
     },
-    Discussions(Vec<DiscussionInboxUpdate>),
-    Error(String),
+    Discussions {
+        generation: u64,
+        discussions: Vec<DiscussionInboxUpdate>,
+    },
+    Error {
+        generation: u64,
+        message: String,
+    },
     CommandResult {
         summary: ExecSummary,
         snapshot: UndoSnapshot,
@@ -82,6 +92,18 @@ enum AppEvent {
     UndoResult(UndoSummary),
     Review(Vec<ReviewRequest>),
 }
+
+struct ActiveAuthorization {
+    token: String,
+    generation: u64,
+}
+
+struct TokenSnapshot {
+    token: String,
+    generation: u64,
+}
+
+type SharedToken = Arc<RwLock<ActiveAuthorization>>;
 
 #[derive(Debug, Clone)]
 struct DiscussionInboxUpdate {
@@ -98,11 +120,16 @@ enum Screen {
     Discussion { pr_url: String, selected: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputOutcome {
+    Continue,
+    Quit,
+    Reauthorize,
+}
+
 #[derive(Debug, Clone)]
 struct ReviewRequest {
-    repo_full_name: String,
     pr_url: String,
-    analyze: bool,
 }
 
 pub struct AppState {
@@ -125,6 +152,7 @@ pub struct AppState {
     last_undo: Option<UndoBatch>,
     undo_in_flight: bool,
     command_in_flight: bool,
+    reauthorize_on_enter: bool,
 }
 
 impl AppState {
@@ -150,6 +178,7 @@ impl AppState {
             last_undo: None,
             undo_in_flight: false,
             command_in_flight: false,
+            reauthorize_on_enter: false,
         }
     }
 
@@ -284,11 +313,9 @@ impl AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let token = gh_auth_token()?;
     let client = reqwest::Client::new();
-    let notification_token =
-        notification_auth::notification_token(&client, args.reauthorize_notifications).await?;
 
+    let token = notification_auth::github_token(&client, args.reauthorize).await?;
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
@@ -296,7 +323,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
-    let result = run_app(&mut terminal, args, token, notification_token).await;
+    let result = run_app(&mut terminal, args, token).await;
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
@@ -309,11 +336,12 @@ async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     args: Args,
     token: String,
-    notification_token: String,
 ) -> Result<()> {
     let client = Arc::new(reqwest::Client::new());
-    let token = Arc::new(token);
-    let notification_token = Arc::new(notification_token);
+    let token = Arc::new(RwLock::new(ActiveAuthorization {
+        token,
+        generation: 0,
+    }));
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(4);
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>(1);
@@ -321,7 +349,6 @@ async fn run_app(
     spawn_poller(
         client.clone(),
         token.clone(),
-        notification_token.clone(),
         args.interval,
         !args.unread_only,
         event_tx.clone(),
@@ -355,36 +382,64 @@ async fn run_app(
                 .next() => {
                 if let Some(Ok(event)) = maybe_event {
                     restrict_visible_count_to_terminal(terminal, &mut app)?;
-                    if handle_input(
+                    let active_token = current_token(&token);
+                    match handle_input(
                         event,
                         &mut app,
                         &refresh_tx,
                         &event_tx,
                         &client,
-                        &token,
-                        &notification_token,
+                        &active_token.token,
                     )? {
-                        break;
+                        InputOutcome::Continue => {}
+                        InputOutcome::Quit => break,
+                        InputOutcome::Reauthorize => {
+                            // Release terminal input while the browser callback flow is active.
+                            events.take();
+                            let authorization = reauthorize_in_app(terminal, &client).await;
+                            match authorization {
+                                Ok(new_token) => {
+                                    replace_token(&token, new_token);
+                                    app.reauthorize_on_enter = false;
+                                    app.status = Some(
+                                        "GitHub authorization updated; refreshing...".to_string(),
+                                    );
+                                    app.status_sticky = false;
+                                    let _ = refresh_tx.try_send(());
+                                }
+                                Err(error) => {
+                                    set_error_status(
+                                        &mut app,
+                                        &format!("GitHub reauthorization failed: {error}"),
+                                    );
+                                }
+                            }
+                            force_redraw(terminal, &app)?;
+                            events = Some(EventStream::new());
+                        }
                     }
                 }
             }
             Some(app_event) = event_rx.recv() => {
                 match app_event {
-                    AppEvent::Data { notifications, my_prs } => {
+                    AppEvent::Data { generation, notifications, my_prs } if generation == token_generation(&token) => {
                         app.set_data(notifications, my_prs);
+                        if app.reauthorize_on_enter {
+                            app.reauthorize_on_enter = false;
+                            app.status_sticky = false;
+                        }
                         if !app.status_sticky {
                             app.status = None;
                         }
                     }
-                    AppEvent::Discussions(discussions) => {
+                    AppEvent::Discussions { generation, discussions } if generation == token_generation(&token) => {
                         for mut discussion in discussions {
                             reconcile_discussion_update(&mut discussion);
                             app.discussions.insert(discussion.pr_url.clone(), discussion);
                         }
                     }
-                    AppEvent::Error(message) => {
-                        app.status = Some(clean_error_message(&message));
-                        app.status_sticky = true;
+                    AppEvent::Error { generation, message } if generation == token_generation(&token) => {
+                        set_error_status(&mut app, &message);
                         app.loading = false;
                         if app.command_in_flight {
                             app.command_in_flight = false;
@@ -397,15 +452,12 @@ async fn run_app(
                         handle_undo_result(&mut app, &refresh_tx, result);
                     }
                     AppEvent::Review(requests) => {
-                        // Release crossterm's global event reader while nvim owns the terminal.
-                        events.take();
-
                         let total = requests.len();
                         let mut completed = 0usize;
                         let mut failed = false;
 
                         for request in requests {
-                            let result = run_review_in_nvim(terminal, &request);
+                            let result = open_review_in_codex(&request);
                             match result {
                                 Ok(()) => {
                                     completed += 1;
@@ -421,16 +473,19 @@ async fn run_app(
 
                         if !failed {
                             app.status = if total == 1 {
-                                Some("ReviewPR finished".to_string())
+                                Some("Opened review prompt in Codex; press Enter to start".to_string())
                             } else {
-                                Some(format!("ReviewPR finished for {completed} targets"))
+                                Some(format!(
+                                    "Opened {completed} review prompts; press Enter in Codex to start each"
+                                ))
                             };
                             app.status_sticky = false;
                         }
                         force_redraw(terminal, &app)?;
-                        // Recreate the stream now that the terminal is back under TUI control.
-                        events = Some(EventStream::new());
                     }
+                    AppEvent::Data { .. }
+                    | AppEvent::Discussions { .. }
+                    | AppEvent::Error { .. } => {}
                 }
             }
             _ = tick.tick() => {
@@ -473,8 +528,7 @@ fn terminal_visible_count(
 
 fn spawn_poller(
     client: Arc<reqwest::Client>,
-    public_token: Arc<String>,
-    notification_token: Arc<String>,
+    token: SharedToken,
     interval_secs: u64,
     include_read: bool,
     event_tx: mpsc::Sender<AppEvent>,
@@ -486,12 +540,20 @@ fn spawn_poller(
         let mut viewer_login: Option<String> = None;
         let mut discussion_versions = HashMap::new();
         let mut force_discussions = false;
+        let mut previous_generation: Option<u64> = None;
 
         loop {
+            let active_token = current_token(&token);
+            if previous_generation != Some(active_token.generation) {
+                // Reauthorization may switch accounts, so no identity-derived cache can carry over.
+                viewer_login = None;
+                discussion_versions.clear();
+                force_discussions = true;
+                previous_generation = Some(active_token.generation);
+            }
             let result = fetch_notifications_and_my_prs_cached(
                 &client,
-                &public_token,
-                &notification_token,
+                &active_token.token,
                 include_read,
                 viewer_login.as_deref(),
             )
@@ -506,13 +568,14 @@ fn spawn_poller(
                     let my_prs = payload.my_prs;
                     let _ = event_tx
                         .send(AppEvent::Data {
+                            generation: active_token.generation,
                             notifications: notifications.clone(),
                             my_prs: my_prs.clone(),
                         })
                         .await;
                     let discussions = fetch_inbox_discussions(
                         &client,
-                        &public_token,
+                        &active_token.token,
                         &payload.viewer_login,
                         &notifications,
                         &my_prs,
@@ -521,10 +584,20 @@ fn spawn_poller(
                     )
                     .await;
                     force_discussions = false;
-                    let _ = event_tx.send(AppEvent::Discussions(discussions)).await;
+                    let _ = event_tx
+                        .send(AppEvent::Discussions {
+                            generation: active_token.generation,
+                            discussions,
+                        })
+                        .await;
                 }
                 Err(err) => {
-                    let _ = event_tx.send(AppEvent::Error(err.to_string())).await;
+                    let _ = event_tx
+                        .send(AppEvent::Error {
+                            generation: active_token.generation,
+                            message: err.to_string(),
+                        })
+                        .await;
                 }
             }
 
@@ -534,6 +607,31 @@ fn spawn_poller(
             }
         }
     });
+}
+
+fn current_token(token: &SharedToken) -> TokenSnapshot {
+    let authorization = token
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    TokenSnapshot {
+        token: authorization.token.clone(),
+        generation: authorization.generation,
+    }
+}
+
+fn replace_token(token: &SharedToken, new_token: String) {
+    let mut authorization = token
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    authorization.token = new_token;
+    authorization.generation = authorization.generation.wrapping_add(1);
+}
+
+fn token_generation(token: &SharedToken) -> u64 {
+    token
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .generation
 }
 
 async fn fetch_inbox_discussions(
@@ -696,20 +794,40 @@ fn handle_input(
     refresh_tx: &mpsc::Sender<()>,
     app_event_tx: &mpsc::Sender<AppEvent>,
     client: &reqwest::Client,
-    public_token: &str,
-    notification_token: &str,
-) -> Result<bool> {
+    token: &str,
+) -> Result<InputOutcome> {
     if let Event::Key(key) = event {
         if key.kind != KeyEventKind::Press {
-            return Ok(false);
+            return Ok(InputOutcome::Continue);
+        }
+
+        if key.code == KeyCode::Enter && app.reauthorize_on_enter {
+            if app.command_in_flight || app.undo_in_flight {
+                app.status = Some("Wait for actions to finish before reauthorizing".to_string());
+                app.status_sticky = false;
+                return Ok(InputOutcome::Continue);
+            }
+            app.status = Some("Starting GitHub reauthorization...".to_string());
+            app.status_sticky = false;
+            app.reauthorize_on_enter = false;
+            app.clear_commands();
+            return Ok(InputOutcome::Reauthorize);
         }
 
         if matches!(app.screen, Screen::Discussion { .. }) {
-            return handle_discussion_input(key, app, refresh_tx, app_event_tx);
+            return handle_discussion_input(key, app, refresh_tx, app_event_tx).map(|quit| {
+                if quit {
+                    InputOutcome::Quit
+                } else {
+                    InputOutcome::Continue
+                }
+            });
         }
 
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(InputOutcome::Quit);
+            }
             KeyCode::Down | KeyCode::Up => {}
             KeyCode::Char('R') => {
                 let _ = refresh_tx.try_send(());
@@ -717,10 +835,10 @@ fn handle_input(
                 app.status_sticky = false;
             }
             KeyCode::Enter => {
-                submit_commands(app, app_event_tx, client, public_token, notification_token)?;
+                submit_commands(app, app_event_tx, client, token)?;
             }
             KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                submit_commands(app, app_event_tx, client, public_token, notification_token)?;
+                submit_commands(app, app_event_tx, client, token)?;
             }
             KeyCode::Esc => {
                 app.clear_commands();
@@ -731,7 +849,7 @@ fn handle_input(
         }
     }
 
-    Ok(false)
+    Ok(InputOutcome::Continue)
 }
 
 fn handle_discussion_input(
@@ -761,20 +879,16 @@ fn handle_discussion_input(
                 *selected = selected.saturating_sub(1);
             }
         }
-        KeyCode::Char('p') | KeyCode::Char('P') => {
+        KeyCode::Char('p') => {
             let Screen::Discussion { pr_url, .. } = &app.screen else {
                 return Ok(false);
             };
-            let pr_key = parse_pull_request_key(pr_url)
-                .ok_or_else(|| anyhow!("invalid pull request URL"))?;
             let request = ReviewRequest {
-                repo_full_name: format!("{}/{}", pr_key.owner, pr_key.repo),
                 pr_url: pr_url.clone(),
-                analyze: key.code == KeyCode::Char('p'),
             };
             app_event_tx
                 .try_send(AppEvent::Review(vec![request]))
-                .map_err(|_| anyhow!("unable to start ReviewPR"))?;
+                .map_err(|_| anyhow!("unable to start review"))?;
         }
         _ => {}
     }
@@ -800,12 +914,11 @@ fn submit_commands(
     app: &mut AppState,
     app_event_tx: &mpsc::Sender<AppEvent>,
     client: &reqwest::Client,
-    public_token: &str,
-    notification_token: &str,
+    token: &str,
 ) -> Result<()> {
     let command_text = app.command_text();
     if is_undo_command(&command_text) {
-        return submit_undo(app, app_event_tx, client, notification_token);
+        return submit_undo(app, app_event_tx, client, token);
     }
 
     let pending = ui::build_visible_pending_map(
@@ -846,7 +959,7 @@ fn submit_commands(
 
     if pending.is_empty() {
         if matches!(app.screen, Screen::Inbox) {
-            app.status = Some("Opening ReviewPR in nvim...".to_string());
+            app.status = Some("Opening review...".to_string());
         }
         app.status_sticky = false;
         app.clear_commands();
@@ -870,16 +983,14 @@ fn submit_commands(
     app.clear_commands();
 
     let client = client.clone();
-    let public_token = public_token.to_string();
-    let notification_token = notification_token.to_string();
+    let token = token.to_string();
     let app_event_tx = app_event_tx.clone();
 
     // Run network mutations in the background so the UI can render the optimistic state immediately.
     tokio::spawn(async move {
         let summary = execute_commands(
             &client,
-            &public_token,
-            &notification_token,
+            &token,
             &pending,
             &notifications_snapshot,
             &my_prs_snapshot,
@@ -900,7 +1011,7 @@ fn submit_undo(
     app: &mut AppState,
     app_event_tx: &mpsc::Sender<AppEvent>,
     client: &reqwest::Client,
-    notification_token: &str,
+    token: &str,
 ) -> Result<()> {
     if app.undo_in_flight {
         app.status = Some("Undo already running".to_string());
@@ -931,11 +1042,11 @@ fn submit_undo(
     app.clear_commands();
 
     let client = client.clone();
-    let notification_token = notification_token.to_string();
+    let token = token.to_string();
     let app_event_tx = app_event_tx.clone();
 
     tokio::spawn(async move {
-        let summary = execute_undo(&client, &notification_token, &batch).await;
+        let summary = execute_undo(&client, &token, &batch).await;
         let _ = app_event_tx.send(AppEvent::UndoResult(summary)).await;
     });
 
@@ -1058,63 +1169,32 @@ fn split_review_action(
     for index in command_indices {
         let actions = commands
             .get(&index)
-            .ok_or_else(|| anyhow!("ReviewPR target is out of range"))?;
-        let review_mode = actions
-            .iter()
-            .filter_map(|action| match action {
-                Action::Review => Some(true),
-                Action::ReviewNoAnalyze => Some(false),
-                _ => None,
-            })
-            .next_back();
-
-        if let Some(analyze) = review_mode {
-            review_targets.push((index, analyze));
+            .ok_or_else(|| anyhow!("Review target is out of range"))?;
+        if actions.contains(&Action::ReviewCodex) {
+            review_targets.push(index);
         }
     }
 
     let mut review_requests = Vec::with_capacity(review_targets.len());
-    for (index, analyze) in review_targets {
+    for index in review_targets {
         let entry = entry_for_index(index, notifications, my_prs)
-            .ok_or_else(|| anyhow!("ReviewPR target is out of range"))?;
+            .ok_or_else(|| anyhow!("Review target is out of range"))?;
         let url = entry.url();
         if !url.contains("/pull/") {
-            return Err(anyhow!("ReviewPR only supports pull request URLs"));
+            return Err(anyhow!("Review only supports pull request URLs"));
         }
         review_requests.push(ReviewRequest {
-            repo_full_name: entry.repo_full_name().to_string(),
             pr_url: url.to_string(),
-            analyze,
         });
     }
 
     let mut filtered = HashMap::new();
     for (index, actions) in commands {
-        let has_review = actions
-            .iter()
-            .any(|action| matches!(action, Action::Review | Action::ReviewNoAnalyze));
         let remaining: Vec<Action> = actions
             .iter()
             .copied()
-            .filter(|action| !matches!(action, Action::Review | Action::ReviewNoAnalyze))
+            .filter(|action| !matches!(action, Action::ReviewCodex))
             .collect();
-        let mut remaining = remaining;
-
-        if has_review {
-            let has_read_like_action = remaining.iter().any(|action| {
-                matches!(
-                    action,
-                    Action::Open | Action::Read | Action::Done | Action::Unsubscribe
-                )
-            });
-            let is_notification_target = matches!(
-                ui::display_entry_key(*index, notifications, my_prs),
-                Some(ui::DisplayEntryKey::Notification(_))
-            );
-            if !has_read_like_action && is_notification_target {
-                remaining.push(Action::Read);
-            }
-        }
 
         if !remaining.is_empty() {
             filtered.insert(*index, remaining);
@@ -1312,8 +1392,7 @@ fn apply_optimistic_update(app: &mut AppState, commands: &HashMap<usize, Vec<Act
                             }
                             Action::Yank
                             | Action::PrettyYank
-                            | Action::Review
-                            | Action::ReviewNoAnalyze
+                            | Action::ReviewCodex
                             | Action::View
                             | Action::Branch => {}
                         }
@@ -1433,8 +1512,13 @@ fn handle_command_result(
         app.last_undo = None;
     }
     let (message, refresh, sticky) = command_status(&result);
-    app.status = Some(message);
-    app.status_sticky = sticky;
+    if sticky {
+        set_error_status(app, &message);
+    } else {
+        app.status = Some(message);
+        app.status_sticky = false;
+        app.reauthorize_on_enter = false;
+    }
     app.executing.clear();
     app.command_in_flight = false;
     if refresh || result.failed > 0 {
@@ -1444,8 +1528,13 @@ fn handle_command_result(
 
 fn handle_undo_result(app: &mut AppState, refresh_tx: &mpsc::Sender<()>, result: UndoSummary) {
     let (message, refresh, sticky) = undo_status(&result);
-    app.status = Some(message);
-    app.status_sticky = sticky;
+    if sticky {
+        set_error_status(app, &message);
+    } else {
+        app.status = Some(message);
+        app.status_sticky = false;
+        app.reauthorize_on_enter = false;
+    }
     app.undo_in_flight = false;
     if refresh {
         let _ = refresh_tx.try_send(());
@@ -1495,8 +1584,7 @@ fn undo_status(result: &UndoSummary) -> (String, bool, bool) {
 
 async fn execute_commands(
     client: &reqwest::Client,
-    public_token: &str,
-    notification_token: &str,
+    token: &str,
     commands: &HashMap<usize, Vec<Action>>,
     notifications: &[Notification],
     my_prs: &[MyPullRequest],
@@ -1520,12 +1608,11 @@ async fn execute_commands(
             }
             let entry = entry.clone();
             let client = client.clone();
-            let notification_token = notification_token.to_string();
+            let token = token.to_string();
             let url = url.clone();
 
             tasks.push(tokio::spawn(async move {
-                let result =
-                    execute_action(&client, &notification_token, action, &entry, &url).await;
+                let result = execute_action(&client, &token, action, &entry, &url).await;
                 (action, result)
             }));
         }
@@ -1555,7 +1642,7 @@ async fn execute_commands(
     }
 
     if pretty_yank_count > 0 {
-        let text = build_pretty_yank_text(client, public_token, &pretty_yank_targets).await;
+        let text = build_pretty_yank_text(client, token, &pretty_yank_targets).await;
         match text {
             Ok(text) => match tokio::task::spawn_blocking(move || copy_to_clipboard(&text)).await {
                 Ok(Ok(())) => {
@@ -1719,11 +1806,7 @@ fn format_pretty_pull_request(pr: &PrettyPullRequest) -> String {
     )
 }
 
-async fn execute_undo(
-    client: &reqwest::Client,
-    notification_token: &str,
-    batch: &UndoBatch,
-) -> UndoSummary {
+async fn execute_undo(client: &reqwest::Client, token: &str, batch: &UndoBatch) -> UndoSummary {
     enum UndoWork {
         MarkUnread {
             thread_id: String,
@@ -1771,8 +1854,7 @@ async fn execute_undo(
                         Action::Open
                         | Action::Yank
                         | Action::PrettyYank
-                        | Action::Review
-                        | Action::ReviewNoAnalyze
+                        | Action::ReviewCodex
                         | Action::View
                         | Action::Branch => {}
                     }
@@ -1815,7 +1897,7 @@ async fn execute_undo(
 
     for task in tasks {
         let client = client.clone();
-        let token = notification_token.to_string();
+        let token = token.to_string();
         let future = match task {
             UndoWork::MarkUnread { thread_id } => {
                 tokio::spawn(async move { mark_as_unread(&client, &token, &thread_id).await })
@@ -1909,6 +1991,32 @@ fn clean_error_message(message: &str) -> String {
     text
 }
 
+fn set_error_status(app: &mut AppState, message: &str) {
+    let message = clean_error_message(message);
+    app.reauthorize_on_enter = is_authorization_error(&message);
+    app.status = Some(if app.reauthorize_on_enter {
+        format!(
+            "{}. Press Enter to reauthorize.",
+            message.trim_end_matches(|ch: char| ch == '.' || ch.is_whitespace())
+        )
+    } else {
+        message
+    });
+    app.status_sticky = true;
+}
+
+fn is_authorization_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("authorization failed")
+        || message.contains("authentication failed")
+        || message.contains("missing a required scope")
+        || message.contains("did not grant the required access")
+        || message.contains("resource not accessible by integration")
+        || message.contains("bad credentials")
+        || message.contains("401 unauthorized")
+        || (message.contains("403 forbidden") && !message.contains("rate limit"))
+}
+
 #[derive(Clone)]
 enum EntrySnapshot {
     Notification(Notification),
@@ -1929,13 +2037,6 @@ impl EntrySnapshot {
             EntrySnapshot::MyPullRequest(pr) => pr.subject.head_ref.as_deref(),
         }
     }
-
-    fn repo_full_name(&self) -> &str {
-        match self {
-            EntrySnapshot::Notification(notification) => &notification.repository.full_name,
-            EntrySnapshot::MyPullRequest(pr) => &pr.repository.full_name,
-        }
-    }
 }
 
 fn entry_for_index(
@@ -1952,42 +2053,6 @@ fn entry_for_index(
             my_prs.get(idx).cloned().map(EntrySnapshot::MyPullRequest)
         }
     }
-}
-
-fn home_dir() -> Result<PathBuf> {
-    if let Ok(value) = std::env::var("HOME") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-
-    if let Ok(value) = std::env::var("USERPROFILE") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-
-    Err(anyhow!("HOME/USERPROFILE is not set"))
-}
-
-fn repo_dir_for_full_name(base: &Path, full_name: &str) -> Result<PathBuf> {
-    let mut parts = full_name.split('/');
-    let owner = parts
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let repo = parts
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    if owner.is_none() || repo.is_none() || parts.next().is_some() {
-        return Err(anyhow!("invalid repository name: {}", full_name));
-    }
-
-    Ok(base.join(owner.unwrap()).join(repo.unwrap()))
 }
 
 struct TuiGuard<'a> {
@@ -2031,45 +2096,19 @@ impl Drop for TuiGuard<'_> {
     }
 }
 
-fn reviewpr_command(request: &ReviewRequest) -> String {
-    let mut command = format!("ReviewPR {}", request.pr_url);
-    if request.analyze {
-        command.push_str(" --analyze");
-    }
-    command
+async fn reauthorize_in_app(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    client: &reqwest::Client,
+) -> Result<String> {
+    let mut guard = TuiGuard::suspend(terminal)?;
+    eprintln!("Reauthorizing GHN with GitHub...");
+    let authorization = notification_auth::github_token(client, true).await;
+    guard.restore()?;
+    authorization
 }
 
-fn run_review_in_nvim(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    request: &ReviewRequest,
-) -> Result<()> {
-    if !request.pr_url.contains("/pull/") {
-        return Err(anyhow!("ReviewPR only supports pull request URLs"));
-    }
-
-    let base = home_dir()?.join("Developer");
-    let repo_dir = repo_dir_for_full_name(&base, &request.repo_full_name)?;
-    if !repo_dir.is_dir() {
-        return Err(anyhow!(
-            "repository directory not found: {}",
-            repo_dir.display()
-        ));
-    }
-
-    let mut guard = TuiGuard::suspend(terminal)?;
-    let status = Command::new("nvim")
-        .current_dir(&repo_dir)
-        .arg("-c")
-        .arg(reviewpr_command(request))
-        .status()
-        .context("failed to launch nvim")?;
-    guard.restore()?;
-
-    if !status.success() {
-        return Err(anyhow!("nvim exited with status {}", status));
-    }
-
-    Ok(())
+fn open_review_in_codex(request: &ReviewRequest) -> Result<()> {
+    review::open_codex_review(&request.pr_url)
 }
 
 fn reset_terminal_buffers(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
@@ -2091,7 +2130,7 @@ fn force_redraw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &AppStat
 
 async fn execute_action(
     client: &reqwest::Client,
-    notification_token: &str,
+    token: &str,
     action: Action,
     entry: &EntrySnapshot,
     url: &str,
@@ -2106,7 +2145,7 @@ async fn execute_action(
             .await??;
             if let EntrySnapshot::Notification(notification) = entry {
                 if notification.unread {
-                    mark_as_read(client, notification_token, &notification.id).await?;
+                    mark_as_read(client, token, &notification.id).await?;
                 }
             }
         }
@@ -2124,12 +2163,12 @@ async fn execute_action(
         }
         Action::Read => {
             if let EntrySnapshot::Notification(notification) = entry {
-                mark_as_read(client, notification_token, &notification.id).await?;
+                mark_as_read(client, token, &notification.id).await?;
             }
         }
         Action::Done => {
             if let EntrySnapshot::Notification(notification) = entry {
-                mark_as_done(client, notification_token, &notification.id).await?;
+                mark_as_done(client, token, &notification.id).await?;
             }
         }
         Action::Unsubscribe => match entry {
@@ -2138,12 +2177,9 @@ async fn execute_action(
                     .subject_id
                     .as_deref()
                     .ok_or_else(|| anyhow!("GitHub subscription target is unavailable"))?;
-                unsubscribe(client, notification_token, subject_id).await?;
-                if let Err(error) = mark_as_done(client, notification_token, &notification.id).await
-                {
-                    if let Err(rollback_error) =
-                        subscribe(client, notification_token, subject_id).await
-                    {
+                unsubscribe(client, token, subject_id).await?;
+                if let Err(error) = mark_as_done(client, token, &notification.id).await {
+                    if let Err(rollback_error) = subscribe(client, token, subject_id).await {
                         return Err(anyhow!(
                             "{}; subscription rollback also failed: {}",
                             error,
@@ -2167,9 +2203,9 @@ async fn execute_action(
             })
             .await??;
         }
-        Action::Review | Action::ReviewNoAnalyze => {
+        Action::ReviewCodex => {
             return Err(anyhow!(
-                "ReviewPR should be triggered via the 'p' or 'P' action in the UI"
+                "Review should be triggered via the 'p' action in the UI"
             ));
         }
         Action::View => {
@@ -2194,15 +2230,15 @@ mod tests {
     use super::{
         apply_optimistic_update, apply_undo_optimistic_update, clean_error_message,
         collect_pretty_yank_targets, collect_yank_targets, command_status, entry_for_index,
-        format_pretty_pull_request, handle_command_result, handle_text_input, is_api_action,
-        parse_updated_at, repo_dir_for_full_name, reviewpr_command, snapshot_state,
-        sort_by_updated_at, split_review_action, split_view_action, undo_status, AppState,
-        EntrySnapshot, ExecSummary, NotificationOverride, NotificationOverrideState,
-        PrettyPullRequest, ReviewRequest, UndoSummary,
+        format_pretty_pull_request, handle_command_result, handle_discussion_input, handle_input,
+        handle_text_input, is_api_action, is_authorization_error, parse_updated_at,
+        set_error_status, snapshot_state, sort_by_updated_at, split_review_action,
+        split_view_action, undo_status, AppEvent, AppState, EntrySnapshot, ExecSummary,
+        InputOutcome, NotificationOverride, NotificationOverrideState, PrettyPullRequest, Screen,
+        UndoSummary,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
 
     use crate::types::{Action, MyPullRequest, Notification, Repository, Subject};
 
@@ -2365,10 +2401,10 @@ mod tests {
     }
 
     #[test]
-    fn allows_review_without_analyze_input() {
+    fn ignores_removed_uppercase_review_input() {
         let mut app = AppState::new(true, HashSet::new());
         handle_text_input(&mut app, key_event(KeyCode::Char('P'), KeyModifiers::NONE));
-        assert_eq!(app.command_text(), "P");
+        assert_eq!(app.command_text(), "");
     }
 
     #[test]
@@ -2402,51 +2438,19 @@ mod tests {
     }
 
     #[test]
-    fn split_review_action_enables_analyze_for_lowercase_review() {
+    fn split_review_action_only_opens_codex() {
         let notifications = vec![sample_notification(true)];
         let my_prs = Vec::new();
         let mut commands = HashMap::new();
-        commands.insert(1, vec![Action::Review]);
+        commands.insert(1, vec![Action::ReviewCodex]);
 
         let (requests, filtered) =
             split_review_action(&commands, &notifications, &my_prs).expect("split review action");
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
 
-        assert_eq!(request.repo_full_name, "acme/widgets");
         assert_eq!(request.pr_url, "https://github.com/acme/widgets/pull/42");
-        assert!(request.analyze);
-        assert_eq!(filtered.get(&1), Some(&vec![Action::Read]));
-    }
-
-    #[test]
-    fn split_review_action_disables_analyze_for_uppercase_review() {
-        let notifications = vec![sample_notification(true)];
-        let my_prs = Vec::new();
-        let mut commands = HashMap::new();
-        commands.insert(1, vec![Action::ReviewNoAnalyze, Action::Open]);
-
-        let (requests, filtered) =
-            split_review_action(&commands, &notifications, &my_prs).expect("split review action");
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
-
-        assert!(!request.analyze);
-        assert_eq!(filtered.get(&1), Some(&vec![Action::Open]));
-    }
-
-    #[test]
-    fn split_review_action_uses_last_review_mode_on_same_target() {
-        let notifications = vec![sample_notification(true)];
-        let my_prs = Vec::new();
-        let mut commands = HashMap::new();
-        commands.insert(1, vec![Action::Review, Action::ReviewNoAnalyze]);
-
-        let (requests, _filtered) =
-            split_review_action(&commands, &notifications, &my_prs).expect("split review action");
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
-        assert!(!request.analyze);
+        assert!(filtered.is_empty());
     }
 
     #[test]
@@ -2462,19 +2466,16 @@ mod tests {
         let notifications = vec![first, second];
         let my_prs = Vec::new();
         let mut commands = HashMap::new();
-        commands.insert(2, vec![Action::ReviewNoAnalyze]);
-        commands.insert(1, vec![Action::Review]);
+        commands.insert(2, vec![Action::ReviewCodex]);
+        commands.insert(1, vec![Action::ReviewCodex]);
 
         let (requests, filtered) =
             split_review_action(&commands, &notifications, &my_prs).expect("split review action");
 
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].pr_url, "https://github.com/acme/widgets/pull/1");
-        assert!(requests[0].analyze);
         assert_eq!(requests[1].pr_url, "https://github.com/acme/widgets/pull/2");
-        assert!(!requests[1].analyze);
-        assert_eq!(filtered.get(&1), Some(&vec![Action::Read]));
-        assert_eq!(filtered.get(&2), Some(&vec![Action::Read]));
+        assert!(filtered.is_empty());
     }
 
     #[test]
@@ -2482,7 +2483,7 @@ mod tests {
         let notifications = Vec::new();
         let my_prs = vec![sample_my_pr()];
         let mut commands = HashMap::new();
-        commands.insert(1, vec![Action::Review]);
+        commands.insert(1, vec![Action::ReviewCodex]);
 
         let (requests, filtered) =
             split_review_action(&commands, &notifications, &my_prs).expect("split review action");
@@ -2496,30 +2497,30 @@ mod tests {
     }
 
     #[test]
-    fn reviewpr_command_includes_analyze_when_requested() {
-        let request = ReviewRequest {
-            repo_full_name: "acme/widgets".to_string(),
+    fn discussion_review_key_opens_codex_review() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.screen = Screen::Discussion {
             pr_url: "https://github.com/acme/widgets/pull/42".to_string(),
-            analyze: true,
+            selected: 0,
         };
+        let (refresh_tx, _refresh_rx) = tokio::sync::mpsc::channel(1);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
 
-        assert_eq!(
-            reviewpr_command(&request),
-            "ReviewPR https://github.com/acme/widgets/pull/42 --analyze"
-        );
-    }
+        handle_discussion_input(
+            key_event(KeyCode::Char('p'), KeyModifiers::NONE),
+            &mut app,
+            &refresh_tx,
+            &event_tx,
+        )
+        .expect("review key");
 
-    #[test]
-    fn reviewpr_command_omits_analyze_when_not_requested() {
-        let request = ReviewRequest {
-            repo_full_name: "acme/widgets".to_string(),
-            pr_url: "https://github.com/acme/widgets/pull/42".to_string(),
-            analyze: false,
+        let AppEvent::Review(requests) = event_rx.try_recv().expect("review event") else {
+            panic!("unexpected event");
         };
-
+        assert_eq!(requests.len(), 1);
         assert_eq!(
-            reviewpr_command(&request),
-            "ReviewPR https://github.com/acme/widgets/pull/42"
+            requests[0].pr_url,
+            "https://github.com/acme/widgets/pull/42"
         );
     }
 
@@ -2699,12 +2700,7 @@ mod tests {
 
     #[test]
     fn review_is_not_api_action() {
-        assert!(!is_api_action(Action::Review));
-    }
-
-    #[test]
-    fn review_without_analyze_is_not_api_action() {
-        assert!(!is_api_action(Action::ReviewNoAnalyze));
+        assert!(!is_api_action(Action::ReviewCodex));
     }
 
     #[test]
@@ -2802,20 +2798,6 @@ mod tests {
             format_pretty_pull_request(&pr),
             ":pr: [octocat/widgets] [Add feature](https://github.com/acme/widgets/pull/42) +10/\u{2212}2"
         );
-    }
-
-    #[test]
-    fn repo_dir_for_full_name_builds_path() {
-        let base = PathBuf::from("/tmp/base");
-        let path = repo_dir_for_full_name(&base, "acme/widgets").unwrap();
-        assert_eq!(path, base.join("acme").join("widgets"));
-    }
-
-    #[test]
-    fn repo_dir_for_full_name_rejects_invalid() {
-        let base = PathBuf::from("/tmp/base");
-        assert!(repo_dir_for_full_name(&base, "acme").is_err());
-        assert!(repo_dir_for_full_name(&base, "acme/widgets/extra").is_err());
     }
 
     #[test]
@@ -2982,6 +2964,52 @@ mod tests {
     fn clean_error_message_strips_prefixes() {
         let message = "failed to fetch notifications: GraphQL error: GitHub API error: boom";
         assert_eq!(clean_error_message(message), "boom");
+    }
+
+    #[test]
+    fn identifies_authorization_errors_without_treating_rate_limits_as_permissions() {
+        assert!(is_authorization_error(
+            "GitHub authentication failed (403 Forbidden)"
+        ));
+        assert!(is_authorization_error(
+            "Resource not accessible by integration"
+        ));
+        assert!(!is_authorization_error(
+            "GitHub API rate limit returned 403 Forbidden"
+        ));
+        assert!(!is_authorization_error("pull request not found"));
+    }
+
+    #[test]
+    fn authorization_error_prompts_for_enter_retry() {
+        let mut app = AppState::new(true, HashSet::new());
+        set_error_status(&mut app, "GitHub authorization failed (401 Unauthorized)");
+
+        assert!(app.reauthorize_on_enter);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("GitHub authorization failed (401 Unauthorized). Press Enter to reauthorize.")
+        );
+    }
+
+    #[test]
+    fn prompted_enter_requests_reauthorization() {
+        let mut app = AppState::new(true, HashSet::new());
+        let (refresh_tx, _refresh_rx) = tokio::sync::mpsc::channel(1);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
+        let client = reqwest::Client::new();
+
+        app.reauthorize_on_enter = true;
+        let outcome = handle_input(
+            crossterm::event::Event::Key(key_event(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &refresh_tx,
+            &event_tx,
+            &client,
+            "token",
+        )
+        .expect("auth retry");
+        assert_eq!(outcome, InputOutcome::Reauthorize);
     }
 
     #[test]

@@ -86,10 +86,12 @@ This proves technical feasibility but not that a third-party application should 
 ### `ghn` implementation decision (2026-07-13)
 
 `ghn` now deliberately accepts that dependency. Notification listing and mutations live behind a
-separate private-API module, while normal PR metadata and discussion queries continue to use the
-public token from `gh`. First launch requests only the documented `notifications` scope through the
-Mobile OAuth client; macOS stores the resulting token in Keychain. The default query is GitHub's
-Inbox (read and unread, excluding Done), and `--unread-only` uses `is:unread`.
+separate private-API module, but one Mobile-issued OAuth token is used for all GitHub requests.
+First launch requests `repo notifications`: `notifications` covers Inbox operations, while the
+classic OAuth model requires the broad `repo` scope to inspect private PRs, status checks, and review
+threads. The authorization-code exchange uses PKCE, and macOS stores the resulting token in
+Keychain. The default query is GitHub's Inbox (read and unread, excluding Done), and `--unread-only`
+uses `is:unread`.
 
 The Mobile client has device flow disabled, so the macOS flow temporarily registers a `github://`
 callback helper in the user cache. It is unregistered and deleted after success or failure. The

@@ -13,8 +13,10 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::types::GraphQlResponse;
 use crate::util::open_in_browser;
 
 const MOBILE_CLIENT_ID: &str = "3f8b8834a91f0caad392";
@@ -24,6 +26,9 @@ const MOBILE_CLIENT_SECRET: &str = "00e76fc8358899d7795a46cd04ace865fcdc0165";
 const CALLBACK_URL: &str = "github://com.github.android/oauth";
 const KEYCHAIN_SERVICE: &str = "ghn-github-notifications";
 const KEYCHAIN_ACCOUNT: &str = "github.com";
+const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
+const GITHUB_USER_API: &str = "https://api.github.com/user";
+const REQUIRED_SCOPES: [&str; 2] = ["repo", "notifications"];
 
 #[derive(Debug, Deserialize)]
 struct AccessTokenResponse {
@@ -32,23 +37,118 @@ struct AccessTokenResponse {
     error_description: Option<String>,
 }
 
-pub async fn notification_token(client: &Client, reauthorize: bool) -> Result<String> {
-    if let Ok(token) = std::env::var("GHN_NOTIFICATIONS_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            return Ok(token.to_string());
+pub async fn github_token(client: &Client, reauthorize: bool) -> Result<String> {
+    if let Some((name, token)) = token_from_environment() {
+        if token_has_required_access(client, &token).await? {
+            return Ok(token);
         }
+        return Err(anyhow!(
+            "{name} must be Mobile-issued and grant the 'repo' and 'notifications' scopes"
+        ));
     }
 
     if !reauthorize {
         if let Some(token) = load_stored_token()? {
-            return Ok(token);
+            if token_has_required_access(client, &token).await? {
+                return Ok(token);
+            }
+            eprintln!("ghn needs to upgrade its stored GitHub authorization.");
         }
     }
 
     let token = authorize(client).await?;
+    if !token_has_required_access(client, &token).await? {
+        return Err(anyhow!(
+            "GitHub authorization did not grant the required access"
+        ));
+    }
     store_token(&token)?;
     Ok(token)
+}
+
+fn token_from_environment() -> Option<(String, String)> {
+    ["GHN_TOKEN", "GHN_NOTIFICATIONS_TOKEN"]
+        .into_iter()
+        .find_map(|name| {
+            let token = std::env::var(name).ok()?;
+            let token = token.trim();
+            (!token.is_empty()).then(|| (name.to_string(), token.to_string()))
+        })
+}
+
+async fn token_has_required_access(client: &Client, token: &str) -> Result<bool> {
+    let response = client
+        .get(GITHUB_USER_API)
+        .bearer_auth(token)
+        .header("User-Agent", "ghn")
+        .send()
+        .await
+        .context("failed to validate GitHub authorization")?;
+    if response.status() == 401 {
+        return Ok(false);
+    }
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "failed to validate GitHub authorization: {}",
+            response.status()
+        ));
+    }
+
+    let scopes = response
+        .headers()
+        .get("x-oauth-scopes")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !has_required_scopes(scopes) {
+        return Ok(false);
+    }
+
+    token_has_mobile_inbox_access(client, token).await
+}
+
+async fn token_has_mobile_inbox_access(client: &Client, token: &str) -> Result<bool> {
+    let response = client
+        .post(GITHUB_GRAPHQL)
+        .bearer_auth(token)
+        .header("User-Agent", "GitHub-Android/1.267.0")
+        .json(&json!({
+            "query": "query GHNAuthorizationCheck { viewer { notificationThreads(first: 1, query: \"is:unread\") { nodes { id } } } }"
+        }))
+        .send()
+        .await
+        .context("failed to validate GitHub Mobile authorization")?;
+    if response.status() == 401 {
+        return Ok(false);
+    }
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "failed to validate GitHub Mobile authorization: {}",
+            response.status()
+        ));
+    }
+
+    let payload: GraphQlResponse<serde_json::Value> = response
+        .json()
+        .await
+        .context("failed to decode GitHub Mobile authorization check")?;
+    let has_errors = payload
+        .errors
+        .as_ref()
+        .map(|errors| !errors.is_empty())
+        .unwrap_or(false);
+    let has_inbox = payload
+        .data
+        .as_ref()
+        .and_then(|data| data.pointer("/viewer/notificationThreads"))
+        .is_some_and(|inbox| !inbox.is_null());
+    Ok(has_inbox && !has_errors)
+}
+
+fn has_required_scopes(scopes: &str) -> bool {
+    let scopes: Vec<_> = scopes.split(',').map(str::trim).collect();
+    REQUIRED_SCOPES
+        .iter()
+        .all(|required| scopes.contains(required))
 }
 
 async fn authorize(client: &Client) -> Result<String> {
@@ -56,10 +156,10 @@ async fn authorize(client: &Client) -> Result<String> {
     let code_verifier = random_hex(32)?;
     let code_challenge = pkce_challenge(&code_verifier);
     let authorize_url = format!(
-        "https://github.com/login/oauth/authorize?client_id={MOBILE_CLIENT_ID}&redirect_uri=github%3A%2F%2Fcom.github.android%2Foauth&scope=notifications&state={state}&code_challenge={code_challenge}&code_challenge_method=S256"
+        "https://github.com/login/oauth/authorize?client_id={MOBILE_CLIENT_ID}&redirect_uri=github%3A%2F%2Fcom.github.android%2Foauth&scope=repo%20notifications&state={state}&code_challenge={code_challenge}&code_challenge_method=S256"
     );
 
-    eprintln!("ghn needs one-time access to GitHub's exact notification Inbox.");
+    eprintln!("ghn needs one-time access to your GitHub repositories and notification Inbox.");
 
     #[cfg(target_os = "macos")]
     let callback = capture_macos_callback(&authorize_url, &state).await?;
@@ -88,10 +188,10 @@ async fn authorize(client: &Client) -> Result<String> {
         ])
         .send()
         .await
-        .context("failed to exchange GitHub notification authorization")?;
+        .context("failed to exchange GitHub authorization")?;
     if !response.status().is_success() {
         return Err(anyhow!(
-            "GitHub notification authorization failed: {}",
+            "GitHub authorization failed: {}",
             response.status()
         ));
     }
@@ -101,7 +201,7 @@ async fn authorize(client: &Client) -> Result<String> {
     }
 
     Err(anyhow!(
-        "GitHub notification authorization failed: {}",
+        "GitHub authorization failed: {}",
         payload
             .error_description
             .or(payload.error)
@@ -297,7 +397,7 @@ fn load_stored_token() -> Result<Option<String>> {
             "-w",
         ])
         .output()
-        .context("failed to read notification token from Keychain")?;
+        .context("failed to read GitHub token from Keychain")?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -319,12 +419,12 @@ fn store_token(token: &str) -> Result<()> {
             token,
         ])
         .output()
-        .context("failed to store notification token in Keychain")?;
+        .context("failed to store GitHub token in Keychain")?;
     if output.status.success() {
         return Ok(());
     }
     Err(anyhow!(
-        "failed to store notification token in Keychain: {}",
+        "failed to store GitHub token in Keychain: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     ))
 }
@@ -337,13 +437,13 @@ fn load_stored_token() -> Result<Option<String>> {
 #[cfg(not(target_os = "macos"))]
 fn store_token(_token: &str) -> Result<()> {
     Err(anyhow!(
-        "automatic credential storage is not available on this platform; set GHN_NOTIFICATIONS_TOKEN"
+        "automatic credential storage is not available on this platform; set GHN_TOKEN"
     ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_callback, pkce_challenge};
+    use super::{has_required_scopes, parse_callback, pkce_challenge};
 
     #[test]
     fn generates_rfc7636_pkce_challenge() {
@@ -351,6 +451,19 @@ mod tests {
             pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+
+    #[test]
+    fn accepts_required_oauth_scopes() {
+        assert!(has_required_scopes("repo, notifications"));
+        assert!(has_required_scopes("notifications, repo, user"));
+    }
+
+    #[test]
+    fn rejects_incomplete_oauth_scopes() {
+        assert!(!has_required_scopes("notifications"));
+        assert!(!has_required_scopes("public_repo, notifications"));
+        assert!(!has_required_scopes(""));
     }
 
     #[test]

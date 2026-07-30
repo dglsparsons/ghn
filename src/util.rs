@@ -34,46 +34,6 @@ pub fn format_relative_time(iso_timestamp: &str, now: DateTime<Utc>) -> String {
     format!("{}d", days)
 }
 
-pub fn gh_auth_token() -> Result<String> {
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.trim().is_empty() {
-            return Ok(token.trim().to_string());
-        }
-    }
-
-    let output = Command::new("gh")
-        .args(["auth", "token", "-h", "github.com"])
-        .output()
-        .context("failed to run 'gh auth token -h github.com'")?;
-
-    if output.status.success() {
-        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !token.is_empty() {
-            return Ok(token);
-        }
-    }
-
-    let output = Command::new("gh")
-        .args(["auth", "token"])
-        .output()
-        .context("failed to run 'gh auth token'")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "failed to read GitHub token (run 'gh auth login'): {}",
-            stderr.trim()
-        ));
-    }
-
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() {
-        return Err(anyhow!("GitHub token was empty; run 'gh auth login'"));
-    }
-
-    Ok(token)
-}
-
 pub fn open_in_browser(url: &str) -> Result<()> {
     let status = if cfg!(target_os = "macos") {
         Command::new("open").arg(url).status()

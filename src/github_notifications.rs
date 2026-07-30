@@ -149,7 +149,7 @@ pub async fn fetch_inbox(client: &Client, token: &str, unread_only: bool) -> Res
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(anyhow!(
-                "GitHub notification authorization failed ({status}). Re-run with --reauthorize-notifications. {}",
+                "GitHub authorization failed ({status}). {}",
                 body.trim()
             ));
         }
