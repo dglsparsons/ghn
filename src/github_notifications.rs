@@ -169,7 +169,7 @@ pub async fn fetch_inbox(client: &Client, token: &str, unread_only: bool) -> Res
             .json()
             .await
             .context("failed to decode GitHub Inbox")?;
-        check_errors(payload.errors.as_deref())?;
+        check_inbox_errors(payload.errors.as_deref())?;
         let data = payload
             .data
             .ok_or_else(|| anyhow!("GitHub Inbox returned no data"))?;
@@ -267,6 +267,29 @@ fn check_errors(errors: Option<&[GraphQlError]>) -> Result<()> {
         "GitHub notification GraphQL error: {}",
         error.message
     ))
+}
+
+fn check_inbox_errors(errors: Option<&[GraphQlError]>) -> Result<()> {
+    let error = errors.and_then(|errors| {
+        errors
+            .iter()
+            .find(|error| !is_unresolvable_notification_resource(error))
+    });
+    let Some(error) = error else {
+        return Ok(());
+    };
+
+    Err(anyhow!(
+        "GitHub notification GraphQL error: {}",
+        error.message
+    ))
+}
+
+fn is_unresolvable_notification_resource(error: &GraphQlError) -> bool {
+    // Deleted or inaccessible subjects can leave a valid inbox thread whose optional resource is stale.
+    error
+        .message
+        .starts_with("Could not resolve to a node with the global id of '")
 }
 
 async fn mutate(client: &Client, token: &str, mutation: &str, id: &str) -> Result<()> {
@@ -389,7 +412,11 @@ pub async fn subscribe(client: &Client, token: &str, subscribable_id: &str) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{infer_subject_kind, normalize_reason, repository_names};
+    use super::{
+        check_inbox_errors, infer_subject_kind, normalize_reason, repository_names,
+        transform_thread, PrivateNotificationThread,
+    };
+    use crate::types::GraphQlError;
 
     #[test]
     fn infers_pull_request_kind() {
@@ -413,5 +440,55 @@ mod tests {
             repository_names(None, "https://github.com/vercel/api/pull/42"),
             ("api".to_string(), "vercel/api".to_string())
         );
+    }
+
+    #[test]
+    fn tolerates_unresolvable_resources_in_inbox_pages() {
+        let errors = [GraphQlError {
+            r#type: Some("NOT_FOUND".to_string()),
+            message: "Could not resolve to a node with the global id of 'PR_stale'.".to_string(),
+        }];
+
+        check_inbox_errors(Some(&errors)).expect("stale optional resource should be ignored");
+    }
+
+    #[test]
+    fn preserves_other_inbox_graphql_errors() {
+        let errors = [
+            GraphQlError {
+                r#type: Some("NOT_FOUND".to_string()),
+                message: "Could not resolve to a node with the global id of 'PR_stale'."
+                    .to_string(),
+            },
+            GraphQlError {
+                r#type: Some("FORBIDDEN".to_string()),
+                message: "Resource not accessible".to_string(),
+            },
+        ];
+
+        let error = check_inbox_errors(Some(&errors)).expect_err("real error should be returned");
+        assert_eq!(
+            error.to_string(),
+            "GitHub notification GraphQL error: Resource not accessible"
+        );
+    }
+
+    #[test]
+    fn transforms_thread_with_unresolvable_optional_subject() {
+        let thread = transform_thread(PrivateNotificationThread {
+            id: "thread-1".to_string(),
+            title: "Deleted PR".to_string(),
+            is_unread: true,
+            last_updated_at: "2026-07-15T10:00:00Z".to_string(),
+            reason: serde_json::json!("MENTION"),
+            url: "https://github.com/acme/widgets/pull/42".to_string(),
+            is_archived: false,
+            optional_list: None,
+            optional_subject: None,
+        });
+
+        assert_eq!(thread.subject_kind, "PullRequest");
+        assert_eq!(thread.url, "https://github.com/acme/widgets/pull/42");
+        assert_eq!(thread.repository_full_name, "acme/widgets");
     }
 }
