@@ -507,6 +507,34 @@ fn activity_line(
             })
             .unwrap_or_else(|| "review thread".to_string())
     };
+    let comment_preview = |thread_id: &str, comment_id: Option<&str>| {
+        let thread = find_thread(thread_id)?;
+        let comment = match comment_id {
+            Some(comment_id) => thread
+                .comments
+                .iter()
+                .find(|comment| comment.id == comment_id),
+            None => thread
+                .comments
+                .iter()
+                .max_by_key(|comment| comment.created_at),
+        }?;
+        let author = comment
+            .author
+            .as_ref()
+            .map(|actor| actor.login.as_str())
+            .unwrap_or("unknown");
+        let body = comment
+            .body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(if body.is_empty() {
+            author.to_string()
+        } else {
+            format!("{author}: {body}")
+        })
+    };
     match activity {
         DiscussionActivity::HeadUpdated { previous, current } => (
             format!(
@@ -516,26 +544,31 @@ fn activity_line(
             ),
             Style::default().fg(Color::DarkGray),
         ),
-        DiscussionActivity::RelevantThreadAdded { thread_id } => (
-            format!("└─ ● New relevant thread · {}", location(thread_id)),
-            Style::default().fg(Color::Yellow),
-        ),
+        DiscussionActivity::RelevantThreadAdded { thread_id } => {
+            let thread_is_resolved =
+                find_thread(thread_id).is_some_and(|thread| thread.is_resolved);
+            let (marker, label, color) = if thread_is_resolved {
+                ("✓", "Resolved thread", Color::Green)
+            } else {
+                ("●", "New thread", Color::Yellow)
+            };
+            let preview = comment_preview(thread_id, None)
+                .map(|preview| format!(" · {preview}"))
+                .unwrap_or_default();
+            (
+                format!("└─ {marker} {label} · {}{preview}", location(thread_id)),
+                Style::default().fg(color),
+            )
+        }
         DiscussionActivity::ReplyAdded {
             thread_id,
             comment_id,
         } => {
-            let actor = find_thread(thread_id)
-                .and_then(|thread| {
-                    thread
-                        .comments
-                        .iter()
-                        .find(|comment| &comment.id == comment_id)
-                })
-                .and_then(|comment| comment.author.as_ref())
-                .map(|actor| actor.login.as_str())
-                .unwrap_or("unknown");
+            let preview = comment_preview(thread_id, Some(comment_id))
+                .map(|preview| format!(" · {preview}"))
+                .unwrap_or_default();
             (
-                format!("└─ ● New reply · {} · {actor}", location(thread_id)),
+                format!("└─ ● New reply · {}{preview}", location(thread_id)),
                 Style::default().fg(Color::Yellow),
             )
         }
@@ -561,10 +594,18 @@ fn activity_line(
             format!("└─ ◌ Thread outdated · {}", location(thread_id)),
             Style::default().fg(Color::DarkGray),
         ),
-        DiscussionActivity::CommentEdited { thread_id, .. } => (
-            format!("└─ ~ Comment edited · {}", location(thread_id)),
-            Style::default().fg(Color::Magenta),
-        ),
+        DiscussionActivity::CommentEdited {
+            thread_id,
+            comment_id,
+        } => {
+            let preview = comment_preview(thread_id, Some(comment_id))
+                .map(|preview| format!(" · {preview}"))
+                .unwrap_or_default();
+            (
+                format!("└─ ~ Comment edited · {}{preview}", location(thread_id)),
+                Style::default().fg(Color::Magenta),
+            )
+        }
     }
 }
 
@@ -1576,17 +1617,23 @@ fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_marker, base_notification_style, build_bucket_sections, build_pending_map,
-        build_status_lines, build_visible_pending_map, ci_indicator, collect_layout_max,
-        kind_color, layout_widths, notification_bucket, pending_style, render_repo_and_author,
-        review_indicator, select_legend_lines, split_bucket_area, status_prefixes,
-        truncate_with_suffix, visible_entries_for_height, BucketItem, LayoutMax,
+        action_marker, activity_line, base_notification_style, build_bucket_sections,
+        build_pending_map, build_status_lines, build_visible_pending_map, ci_indicator,
+        collect_layout_max, kind_color, layout_widths, notification_bucket, pending_style,
+        render_repo_and_author, review_indicator, select_legend_lines, split_bucket_area,
+        status_prefixes, truncate_with_suffix, visible_entries_for_height, BucketItem, LayoutMax,
         NotificationBucket, COMMANDS_FULL, READ_NOTIFICATION_COLOR, TARGETS_FULL,
+    };
+    use crate::discussion::{
+        Actor, DiscussionActivity, DiscussionComment, PullRequestDiscussion, ReviewLocation,
+        ReviewThread,
     };
     use crate::types::{
         Action, CiStatus, MergeStateStatus, MyPullRequest, Notification, Repository, ReviewStatus,
         Subject, SubjectStatus,
     };
+    use crate::DiscussionInboxUpdate;
+    use chrono::{TimeZone, Utc};
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier, Style};
     use std::collections::HashMap;
@@ -1662,6 +1709,59 @@ mod tests {
         }
     }
 
+    fn discussion_update(
+        thread: ReviewThread,
+        activity: DiscussionActivity,
+    ) -> DiscussionInboxUpdate {
+        DiscussionInboxUpdate {
+            pr_url: "https://github.com/acme/widgets/pull/1".to_string(),
+            viewer_login: "viewer".to_string(),
+            snapshot: PullRequestDiscussion {
+                pull_request_id: "PR_1".to_string(),
+                owner: "acme".to_string(),
+                repository: "widgets".to_string(),
+                number: 1,
+                author: None,
+                head_oid: "abcdef123456".to_string(),
+                fetched_at: Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap(),
+                threads: vec![thread],
+            },
+            activity: vec![activity],
+            complete: true,
+        }
+    }
+
+    fn review_thread(resolved: bool, comments: Vec<DiscussionComment>) -> ReviewThread {
+        ReviewThread {
+            id: "thread-1".to_string(),
+            location: ReviewLocation {
+                path: "src/lib.rs".to_string(),
+                line: Some(42),
+                start_line: None,
+            },
+            is_resolved: resolved,
+            resolved_by: resolved.then(|| Actor {
+                login: "maintainer".to_string(),
+            }),
+            is_outdated: false,
+            comments,
+        }
+    }
+
+    fn discussion_comment(id: &str, author: &str, body: &str, minute: u32) -> DiscussionComment {
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 16, 12, minute, 0).unwrap();
+        DiscussionComment {
+            id: id.to_string(),
+            author: Some(Actor {
+                login: author.to_string(),
+            }),
+            body: body.to_string(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            reply_to: None,
+        }
+    }
+
     #[test]
     fn hidden_entries_cannot_be_targeted_by_number() {
         let notifications = vec![
@@ -1681,6 +1781,83 @@ mod tests {
         assert_eq!(visible_entries_for_height(45, 2), 0);
         assert_eq!(visible_entries_for_height(45, 4), 1);
         assert_eq!(visible_entries_for_height(45, 7), 2);
+    }
+
+    #[test]
+    fn new_resolved_thread_preview_shows_state_and_latest_comment() {
+        let thread = review_thread(
+            true,
+            vec![
+                discussion_comment("root", "alice", "Initial note", 0),
+                discussion_comment("reply", "bob", "Fixed in the latest push", 1),
+            ],
+        );
+        let update = discussion_update(
+            thread,
+            DiscussionActivity::RelevantThreadAdded {
+                thread_id: "thread-1".to_string(),
+            },
+        );
+
+        let (text, style) = activity_line(&update.activity[0], &update);
+
+        assert_eq!(
+            text,
+            "└─ ✓ Resolved thread · src/lib.rs:42 · bob: Fixed in the latest push"
+        );
+        assert_eq!(style, Style::default().fg(Color::Green));
+    }
+
+    #[test]
+    fn reply_preview_uses_matching_comment_and_collapses_whitespace() {
+        let thread = review_thread(
+            false,
+            vec![
+                discussion_comment("root", "alice", "Initial note", 0),
+                discussion_comment("reply", "bob", "Please update\n  this check", 1),
+            ],
+        );
+        let update = discussion_update(
+            thread,
+            DiscussionActivity::ReplyAdded {
+                thread_id: "thread-1".to_string(),
+                comment_id: "reply".to_string(),
+            },
+        );
+
+        let (text, style) = activity_line(&update.activity[0], &update);
+
+        assert_eq!(
+            text,
+            "└─ ● New reply · src/lib.rs:42 · bob: Please update this check"
+        );
+        assert_eq!(style, Style::default().fg(Color::Yellow));
+    }
+
+    #[test]
+    fn edited_comment_preview_uses_matching_comment() {
+        let thread = review_thread(
+            false,
+            vec![
+                discussion_comment("edited", "alice", "Updated suggestion", 0),
+                discussion_comment("other", "bob", "Different comment", 1),
+            ],
+        );
+        let update = discussion_update(
+            thread,
+            DiscussionActivity::CommentEdited {
+                thread_id: "thread-1".to_string(),
+                comment_id: "edited".to_string(),
+            },
+        );
+
+        let (text, style) = activity_line(&update.activity[0], &update);
+
+        assert_eq!(
+            text,
+            "└─ ~ Comment edited · src/lib.rs:42 · alice: Updated suggestion"
+        );
+        assert_eq!(style, Style::default().fg(Color::Magenta));
     }
 
     #[test]
