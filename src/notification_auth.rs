@@ -10,8 +10,10 @@ use std::{
 use std::io::{self, Write};
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use reqwest::Client;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::util::open_in_browser;
 
@@ -51,8 +53,10 @@ pub async fn notification_token(client: &Client, reauthorize: bool) -> Result<St
 
 async fn authorize(client: &Client) -> Result<String> {
     let state = random_hex(32)?;
+    let code_verifier = random_hex(32)?;
+    let code_challenge = pkce_challenge(&code_verifier);
     let authorize_url = format!(
-        "https://github.com/login/oauth/authorize?client_id={MOBILE_CLIENT_ID}&redirect_uri=github%3A%2F%2Fcom.github.android%2Foauth&scope=notifications&state={state}"
+        "https://github.com/login/oauth/authorize?client_id={MOBILE_CLIENT_ID}&redirect_uri=github%3A%2F%2Fcom.github.android%2Foauth&scope=notifications&state={state}&code_challenge={code_challenge}&code_challenge_method=S256"
     );
 
     eprintln!("ghn needs one-time access to GitHub's exact notification Inbox.");
@@ -80,6 +84,7 @@ async fn authorize(client: &Client) -> Result<String> {
             ("code", code.as_str()),
             ("redirect_uri", CALLBACK_URL),
             ("state", state.as_str()),
+            ("code_verifier", code_verifier.as_str()),
         ])
         .send()
         .await
@@ -276,6 +281,10 @@ fn random_hex(bytes: usize) -> Result<String> {
     Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
 #[cfg(target_os = "macos")]
 fn load_stored_token() -> Result<Option<String>> {
     let output = Command::new("security")
@@ -334,7 +343,15 @@ fn store_token(_token: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_callback;
+    use super::{parse_callback, pkce_challenge};
+
+    #[test]
+    fn generates_rfc7636_pkce_challenge() {
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
 
     #[test]
     fn parses_oauth_callback() {
