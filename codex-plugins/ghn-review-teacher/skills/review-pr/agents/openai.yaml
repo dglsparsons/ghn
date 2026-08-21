@@ -1,4 +1,0 @@
-interface:
-  display_name: "Review PR"
-  short_description: "Understand a pull request before reviewing it."
-  default_prompt: "Use $review-pr https://github.com/owner/repo/pull/123 to explain this pull request."

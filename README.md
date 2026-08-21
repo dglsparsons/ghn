@@ -24,7 +24,7 @@ cargo build --release
 
 - Rust toolchain (`cargo`)
 - [Codex desktop](https://developers.openai.com/codex/) with the `review-pr`
-  skill for conversational PR reviews
+  skill installed separately for conversational PR reviews
 
 On first launch, `ghn` opens a browser for GitHub authorization with the `repo` and `notifications`
 scopes. GitHub's public notification API cannot distinguish Inbox items from items marked Done, so
