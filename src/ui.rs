@@ -272,7 +272,7 @@ fn layout_chunks(size: Rect, status_height: u16) -> std::rc::Rc<[Rect]> {
         .split(size)
 }
 
-pub fn visible_entry_count(size: Rect, app: &AppState) -> usize {
+pub fn visible_entry_indices(size: Rect, app: &AppState) -> HashSet<usize> {
     let status_height = build_status_lines(size.width, app.status.as_deref())
         .len()
         .max(1) as u16;
@@ -287,8 +287,18 @@ pub fn visible_entry_count(size: Rect, app: &AppState) -> usize {
     sections
         .iter()
         .zip(split_bucket_area(list_area, &sections, &app.discussions))
-        .map(|(section, area)| visible_entries_for_section(section, area.height, &app.discussions))
-        .sum()
+        .flat_map(|(section, area)| {
+            section
+                .entries
+                .iter()
+                .take(visible_entries_for_section(
+                    section,
+                    area.height,
+                    &app.discussions,
+                ))
+                .map(|entry| entry.index)
+        })
+        .collect()
 }
 
 fn draw_lists(f: &mut Frame, area: Rect, app: &AppState) {
@@ -362,14 +372,21 @@ fn draw_bucket_section(
     total_count: usize,
     layout_max: &LayoutMax,
 ) {
+    let visible_count = visible_entries_for_section(section, area.height, discussions);
     let title = Line::from(Span::styled(
-        format!("{} ({})", section.bucket.title(), section.entries.len()),
+        if section.bucket == NotificationBucket::MyPrs {
+            format!(
+                "My PRs · {visible_count} of {} shown · / find all",
+                section.entries.len()
+            )
+        } else {
+            format!("{} ({})", section.bucket.title(), section.entries.len())
+        },
         section.bucket.header_style(),
     ));
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner_area = block.inner(area);
     let widths = layout_widths(inner_area.width, total_count, layout_max);
-    let visible_count = visible_entries_for_section(section, area.height, discussions);
 
     let items: Vec<ListItem> = section
         .entries
@@ -683,12 +700,26 @@ fn build_list_item<T: ListItemLike>(
         remaining = remaining.saturating_sub(prefix_len);
         header_spans.push(Span::styled(prefix_text, prefix.style));
     }
-    let (repo_text, author_text, used) =
-        render_repo_and_author(item.repo_full_name(), subject.author.as_deref(), remaining);
+    let number = subject_number_label(subject);
+    // Keep the complete GitHub number visible when a long repository needs truncating.
+    let number = number.filter(|number| number.len() + 1 < remaining);
+    let number_width = number.as_ref().map_or(0, |number| number.len() + 1);
+    let (repo_text, author_text, used) = render_repo_and_author(
+        item.repo_full_name(),
+        subject.author.as_deref(),
+        remaining.saturating_sub(number_width),
+    );
+    let used = used + number_width;
     header_spans.push(Span::styled(
         repo_text,
         Style::default().add_modifier(Modifier::BOLD),
     ));
+    if let Some(number) = number {
+        header_spans.push(Span::styled(
+            format!(" {number}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     if let Some(author_text) = author_text {
         header_spans.push(Span::styled(
             REPO_AUTHOR_SEPARATOR,
@@ -800,6 +831,7 @@ fn update_layout_max<T: ListItemLike>(layout_max: &mut LayoutMax, items: &[T], t
             .map(|item| {
                 repo_label_width(item.repo_full_name(), item.subject().author.as_deref())
                     + status_prefix_len(item.subject())
+                    + subject_number_label(item.subject()).map_or(0, |number| number.len() + 1)
             })
             .max()
             .unwrap_or(0),
@@ -984,6 +1016,39 @@ fn pr_number(pr: &MyPullRequest) -> u64 {
         .unwrap_or(0)
 }
 
+pub fn my_pr_search_items(
+    app: &AppState,
+    results: &[(usize, usize)],
+    width: u16,
+) -> Vec<ListItem<'static>> {
+    let layout_max = collect_layout_max(&[], &[], &app.my_prs, &app.my_pr_relative_times);
+    let widths = layout_widths(
+        width,
+        app.notifications.len() + app.my_prs.len(),
+        &layout_max,
+    );
+    results
+        .iter()
+        .enumerate()
+        .map(|(position, &(index, pr_index))| {
+            let item = BucketItem::MyPullRequest(&app.my_prs[pr_index]);
+            build_list_item(
+                index,
+                &item,
+                app.my_pr_relative_times
+                    .get(pr_index)
+                    .map(String::as_str)
+                    .unwrap_or("?"),
+                &app.pending,
+                &app.executing,
+                activity_lines(&item, &app.discussions),
+                &widths,
+                position + 1 < results.len(),
+            )
+        })
+        .collect()
+}
+
 fn notification_bucket(item: &BucketItem<'_>) -> NotificationBucket {
     let subject = item.subject();
     if !subject.kind.eq_ignore_ascii_case("pullrequest") || is_terminal_pull_request(subject) {
@@ -1045,6 +1110,13 @@ fn draw_command(f: &mut Frame, area: Rect, app: &AppState) {
     let prompt = Paragraph::new("> ").style(Style::default().bg(Color::DarkGray));
     f.render_widget(prompt, chunks[0]);
     f.render_widget(&app.input, chunks[1]);
+    if app.command_draft.is_some() && area.height > 1 {
+        f.render_widget(
+            Paragraph::new("Targets locked · Esc clear")
+                .style(Style::default().fg(Color::DarkGray)),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+    }
 }
 
 fn draw_status(f: &mut Frame, area: Rect, lines: Vec<String>) {
@@ -1185,7 +1257,7 @@ fn ci_indicator(subject: &Subject) -> Option<CiIndicator> {
     let status = subject.ci_status?;
     let (text, color) = match status {
         CiStatus::Success => ("✓", Color::Green),
-        CiStatus::Pending => ("↻", Color::Yellow),
+        CiStatus::Pending => ("↻", Color::LightBlue),
         CiStatus::Failure => ("✗", Color::Red),
     };
     Some(CiIndicator {
@@ -1413,6 +1485,22 @@ fn truncate_with_suffix(value: &str, max: usize) -> String {
     truncated
 }
 
+fn subject_number_label(subject: &Subject) -> Option<String> {
+    if !subject.kind.eq_ignore_ascii_case("PullRequest")
+        && !subject.kind.eq_ignore_ascii_case("Issue")
+    {
+        return None;
+    }
+    subject
+        .url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .map(|number| format!("#{number}"))
+}
+
 fn repo_label_width(repo: &str, author: Option<&str>) -> usize {
     let repo_width = repo.chars().count();
     let author_width = author
@@ -1486,16 +1574,15 @@ fn kind_color(kind: &str) -> Color {
 fn build_target_map(
     notifications: &[Notification],
     my_prs: &[MyPullRequest],
-    visible_count: usize,
+    indices: &HashSet<usize>,
 ) -> HashMap<char, Vec<usize>> {
     let mut targets: HashMap<char, Vec<usize>> = HashMap::new();
 
-    for (display_idx, key) in display_order(notifications, my_prs)
-        .into_iter()
-        .take(visible_count)
-        .enumerate()
-    {
+    for (display_idx, key) in display_order(notifications, my_prs).into_iter().enumerate() {
         let index = display_idx + 1;
+        if !indices.contains(&index) {
+            continue;
+        }
         let Some(item) = bucket_item(key, notifications, my_prs) else {
             continue;
         };
@@ -1545,16 +1632,30 @@ pub fn build_pending_map(
     )
 }
 
+#[cfg(test)]
 pub fn build_visible_pending_map(
     input: &str,
     notifications: &[Notification],
     my_prs: &[MyPullRequest],
     visible_count: usize,
 ) -> HashMap<usize, Vec<Action>> {
-    let visible_count = visible_count.min(notifications.len() + my_prs.len());
-    let targets = build_target_map(notifications, my_prs, visible_count);
-    let parsed = crate::commands::parse_commands(input, visible_count, &targets);
+    let indices = (1..=visible_count.min(notifications.len() + my_prs.len())).collect();
+    build_pending_map_for_indices(input, notifications, my_prs, &indices)
+}
 
+pub fn build_pending_map_for_indices(
+    input: &str,
+    notifications: &[Notification],
+    my_prs: &[MyPullRequest],
+    indices: &HashSet<usize>,
+) -> HashMap<usize, Vec<Action>> {
+    let targets = build_target_map(notifications, my_prs, indices);
+    let mut parsed = crate::commands::parse_commands(
+        input,
+        indices.iter().copied().max().unwrap_or(0),
+        &targets,
+    );
+    parsed.retain(|index, _| indices.contains(index));
     filter_pending_actions(parsed, notifications, my_prs)
 }
 
@@ -1720,6 +1821,203 @@ mod tests {
             },
             url: format!("https://github.com/acme/widgets/pull/{id}"),
         }
+    }
+
+    #[test]
+    fn my_prs_order_is_stable_across_status_changes_and_all_rows_fit() {
+        let mut prs: Vec<_> = (1..=8)
+            .map(|id| sample_bucket_my_pr(&id.to_string(), None, None, None))
+            .collect();
+        prs[0].repository.full_name = "acme/aaa".to_string();
+        let before = super::display_order(&[], &prs);
+        assert_eq!(before[0], super::DisplayEntryKey::MyPullRequest(0));
+        assert_eq!(before[1], super::DisplayEntryKey::MyPullRequest(7));
+        prs[7].subject.ci_status = Some(CiStatus::Failure);
+        assert_eq!(before, super::display_order(&[], &prs));
+        let sections = build_bucket_sections(&[], &[], &prs, &[]);
+        assert_eq!(sections[0].required_height(&HashMap::new()), 25);
+        assert_eq!(
+            super::visible_entries_for_section(&sections[0], 40, &HashMap::new()),
+            8
+        );
+        assert!(sections
+            .iter()
+            .skip(1)
+            .all(|section| section.entries.is_empty()));
+    }
+
+    #[test]
+    fn my_pr_rows_align_with_other_sections() {
+        let mut app = crate::AppState::new(false, Default::default());
+        let mut mine = sample_bucket_my_pr("1", None, None, None);
+        mine.repository.full_name = "acme/long-repository".into();
+        mine.subject.title = "Own title".into();
+        let mut other =
+            sample_bucket_notification("2", "mention", "PullRequest", Vec::new(), None, None, None);
+        other.subject.title = "Other title".into();
+        app.my_prs = vec![mine];
+        app.notifications = vec![other];
+        app.my_pr_relative_times = vec!["9m".into()];
+        app.relative_times = vec!["2m".into()];
+        for width in [80, 120] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+            terminal
+                .draw(|frame| super::draw_lists(frame, frame.area(), &app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = buffer
+                .content
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            let own_header = rows
+                .iter()
+                .find(|row| row.contains("acme/long-repository"))
+                .unwrap();
+            let other_header = rows
+                .iter()
+                .find(|row| row.contains("acme/widgets"))
+                .unwrap();
+            assert_eq!(
+                own_header.find("PullRequest"),
+                other_header.find("PullRequest")
+            );
+            assert!(own_header.contains("PullRequest"));
+            assert!(own_header.contains("#1"));
+            assert!(other_header.contains("#2"));
+            assert_eq!(own_header.find("9m"), other_header.find("2m"));
+            let own_title = rows
+                .iter()
+                .position(|row| row.contains("Own title"))
+                .unwrap();
+            let other_title = rows
+                .iter()
+                .position(|row| row.contains("Other title"))
+                .unwrap();
+            assert_eq!(
+                rows[own_title].find("Own title"),
+                rows[other_title].find("Other title")
+            );
+            assert!(rows[own_title - 1].contains("acme/long-repository"));
+            assert!(rows[other_title - 1].contains("acme/widgets"));
+        }
+    }
+
+    #[test]
+    fn my_pr_header_counts_rows_that_fit_the_terminal() {
+        let mut app = crate::AppState::new(false, Default::default());
+        app.my_prs = (1..=12)
+            .map(|id| sample_bucket_my_pr(&id.to_string(), None, None, None))
+            .collect();
+        for (height, expected_count) in [(4, 1), (7, 2), (30, 9), (40, 12)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, height)).unwrap();
+            terminal
+                .draw(|frame| super::draw_lists(frame, frame.area(), &app))
+                .unwrap();
+            let header: String = terminal.backend().buffer().content[..100]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                header.contains(&format!(
+                    "My PRs · {expected_count} of 12 shown · / find all"
+                )),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_number_survives_repository_truncation_and_is_distinct_from_action_number() {
+        let mut app = crate::AppState::new(false, Default::default());
+        let mut mine = sample_bucket_my_pr("1842", None, None, None);
+        mine.repository.full_name = "acme/a-very-long-repository-name-that-needs-truncating".into();
+        app.my_prs = vec![mine];
+        for width in [40, 80, 120] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 10)).unwrap();
+            terminal
+                .draw(|frame| super::draw_lists(frame, frame.area(), &app))
+                .unwrap();
+            let cells = &terminal.backend().buffer().content[width as usize..2 * width as usize];
+            let header: String = cells.iter().map(|cell| cell.symbol()).collect();
+            assert!(header.contains("#1842"), "{header}");
+            let hash = cells.iter().position(|cell| cell.symbol() == "#").unwrap();
+            assert_eq!(cells[hash].fg, Color::DarkGray);
+            let action = cells[..hash]
+                .iter()
+                .find(|cell| cell.symbol() == "1")
+                .unwrap();
+            assert!(action.modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn status_colors_distinguish_progress_from_failures() {
+        let mut pr = sample_bucket_my_pr(
+            "1",
+            Some(CiStatus::Pending),
+            Some(ReviewStatus::Approved),
+            None,
+        );
+        assert_eq!(
+            ci_indicator(&pr.subject).unwrap().style.fg,
+            Some(Color::LightBlue)
+        );
+        assert_eq!(
+            super::review_indicator(&pr.subject).unwrap().style.fg,
+            Some(Color::Green)
+        );
+        pr.subject.ci_status = Some(CiStatus::Failure);
+        assert_eq!(
+            ci_indicator(&pr.subject).unwrap().style.fg,
+            Some(Color::Red)
+        );
+        pr.subject.review_status = Some(ReviewStatus::ChangesRequested);
+        assert_eq!(
+            super::review_indicator(&pr.subject).unwrap().style.fg,
+            Some(Color::Red)
+        );
+        pr.subject.merge_state_status = Some(MergeStateStatus::Dirty);
+        assert_eq!(
+            super::review_indicator(&pr.subject).unwrap().style.fg,
+            Some(Color::Red)
+        );
+        assert_eq!(super::status_color(SubjectStatus::Draft), Color::Gray);
+    }
+
+    #[test]
+    fn commands_cannot_target_hidden_preview_entries() {
+        let prs: Vec<_> = (1..=8)
+            .map(|id| {
+                sample_bucket_my_pr(
+                    &id.to_string(),
+                    None,
+                    Some(ReviewStatus::ReviewRequired),
+                    None,
+                )
+            })
+            .collect();
+        let indices = [1, 2, 3, 4, 5, 6, 9].into_iter().collect();
+        let notifications = vec![sample_bucket_notification(
+            "99",
+            "mention",
+            "Issue",
+            Vec::new(),
+            None,
+            None,
+            None,
+        )];
+        let pending = super::build_pending_map_for_indices("1-9o", &notifications, &prs, &indices);
+        assert_eq!(pending.len(), 7);
+        assert!(!pending.contains_key(&7));
+        assert!(!pending.contains_key(&8));
+        assert!(pending.contains_key(&9));
+        let grouped = super::build_pending_map_for_indices("?o", &notifications, &prs, &indices);
+        assert_eq!(grouped.len(), 6);
+        assert!(!grouped.contains_key(&7));
     }
 
     fn discussion_update(

@@ -5,7 +5,7 @@ A fast, keyboard-driven TUI for GitHub notifications. Built for power users who 
 ## Features
 
 - **Live feed**: Polls for new notifications in the background
-- **PR buckets**: Splits open pull requests into `Ready to Merge`, `Needs Action`, `Waiting on CI`, `Needs Review`, `Other`, and `Draft`
+- **My PRs**: A top section for your open PRs, with status labels and `/` search by title, repository, or PR number. Other items remain grouped into status buckets.
 - **Vim-style commands**: Batch actions with `1-3r` or `1 2 3o` then `Enter` to execute
 - **Visual feedback**: Notifications highlight based on pending action
 - **Full keyboard control**: Never touch the mouse
@@ -60,7 +60,11 @@ Commands: o open  y pretty yank  Y yank  r read  d done  q unsub/ignore  p Codex
 > 1-3r
 ```
 
-Open pull requests from both notifications and "My PRs" are shown in the same review/action/merge buckets, and My PRs are still de-duplicated from notifications. Item numbers follow the displayed bucket order.
+Your open pull requests appear in a **My PRs** section at the top, ordered by repository and then descending PR number. PRs use the same full rows as the other sections, with metadata, a separate title line, and discussion activity. GitHub PR numbers appear beside the repository, separately from the action numbers. The section takes priority for available terminal space and shows as many PRs as fit, reporting how many are actually shown; matching notifications are omitted from the buckets below. Item numbers follow the full display order, so numbers can skip over PRs that do not fit on screen.
+
+Press `/` with an empty command prompt to find any of your loaded open PRs, including drafts and those that do not fit on screen. Search matches words in the title, repository, and PR number (with or without `#`). Use `Up`/`Down` to select a result, `Enter` to pretty yank, `Ctrl+Y` to copy its URL, `Ctrl+O` to open it, and `Esc` to return. An empty search shows all your PRs. Copying keeps search open and shows “Copied” once it succeeds; the query and selected PR are preserved. Existing numbered commands such as `2y` still work on inbox rows.
+
+Command targets lock when you begin typing. Numbers, ranges, and status groups refer to the list as it was then; refreshes can move rows, but the pending highlight and action follow the original item. Resizing cannot redirect a locked command. If a target disappears, the entire batch is cancelled with a message. Press `Esc` or erase the command to start selecting from the current list. While a command is running, another batch waits for you to submit it after completion.
 Archived repositories are omitted, and any PR URLs listed in `~/.config/ghn/ignores.txt` are hidden.
 Use `q` on a My PR to add it to the ignore list.
 

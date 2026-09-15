@@ -4,6 +4,7 @@ mod github;
 mod github_discussions;
 mod github_notifications;
 mod ignore;
+mod my_pr_search;
 mod notification_auth;
 mod review;
 mod types;
@@ -132,11 +133,38 @@ struct ReviewRequest {
     pr_url: String,
 }
 
+struct CommandDraft {
+    notifications: Vec<Notification>,
+    my_prs: Vec<MyPullRequest>,
+    visible_indices: HashSet<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum TargetIdentity {
+    Notification(String),
+    MyPullRequest(String),
+}
+
+fn target_order(notifications: &[Notification], my_prs: &[MyPullRequest]) -> Vec<TargetIdentity> {
+    ui::display_order(notifications, my_prs)
+        .into_iter()
+        .map(|key| match key {
+            ui::DisplayEntryKey::Notification(index) => {
+                TargetIdentity::Notification(notifications[index].id.clone())
+            }
+            ui::DisplayEntryKey::MyPullRequest(index) => {
+                TargetIdentity::MyPullRequest(my_prs[index].url.clone())
+            }
+        })
+        .collect()
+}
+
 pub struct AppState {
     pub notifications: Vec<Notification>,
     pub my_prs: Vec<MyPullRequest>,
     pub input: TextArea<'static>,
     pub pending: HashMap<usize, Vec<Action>>,
+    command_draft: Option<CommandDraft>,
     pub executing: HashSet<String>,
     pub status: Option<String>,
     pub status_sticky: bool,
@@ -148,10 +176,13 @@ pub struct AppState {
     discussions: HashMap<String, DiscussionInboxUpdate>,
     screen: Screen,
     visible_count: usize,
+    visible_indices: HashSet<usize>,
+    my_pr_search: Option<my_pr_search::Search>,
     notification_overrides: HashMap<String, NotificationOverride>,
     last_undo: Option<UndoBatch>,
     undo_in_flight: bool,
     command_in_flight: bool,
+    copy_in_flight: bool,
     reauthorize_on_enter: bool,
 }
 
@@ -163,6 +194,7 @@ impl AppState {
             my_prs: Vec::new(),
             input,
             pending: HashMap::new(),
+            command_draft: None,
             executing: HashSet::new(),
             status: None,
             status_sticky: false,
@@ -174,10 +206,13 @@ impl AppState {
             discussions: HashMap::new(),
             screen: Screen::Inbox,
             visible_count: 0,
+            visible_indices: HashSet::new(),
+            my_pr_search: None,
             notification_overrides: HashMap::new(),
             last_undo: None,
             undo_in_flight: false,
             command_in_flight: false,
+            copy_in_flight: false,
             reauthorize_on_enter: false,
         }
     }
@@ -203,6 +238,7 @@ impl AppState {
     }
 
     fn set_data(&mut self, mut notifications: Vec<Notification>, mut my_prs: Vec<MyPullRequest>) {
+        my_pr_search::remember_selection(self);
         sort_by_updated_at(&mut notifications, |notification| &notification.updated_at);
         my_prs.retain(|pr| !self.ignored_prs.contains(&pr.url));
         sort_by_updated_at(&mut my_prs, |pr| &pr.updated_at);
@@ -281,21 +317,61 @@ impl AppState {
     }
 
     fn update_pending(&mut self) {
-        self.pending = ui::build_visible_pending_map(
-            &self.command_text(),
-            &self.notifications,
-            &self.my_prs,
-            self.visible_count,
-        );
+        if self.command_text().is_empty() {
+            self.command_draft = None;
+            self.pending.clear();
+            return;
+        }
+        // Capture before the first refresh after typing, including incomplete targets
+        // such as the first digit of a multi-digit number or a status-group selector.
+        if self.command_draft.is_none() {
+            self.command_draft = Some(CommandDraft {
+                notifications: self.notifications.clone(),
+                my_prs: self.my_prs.clone(),
+                visible_indices: self.visible_indices.clone(),
+            });
+        }
+        self.pending = self.resolve_command_targets().unwrap_or_default();
     }
 
+    fn resolve_command_targets(&self) -> Result<HashMap<usize, Vec<Action>>> {
+        let Some(draft) = &self.command_draft else {
+            return Ok(HashMap::new());
+        };
+        let parsed = ui::build_pending_map_for_indices(
+            &self.command_text(),
+            &draft.notifications,
+            &draft.my_prs,
+            &draft.visible_indices,
+        );
+        let current: HashMap<_, _> = target_order(&self.notifications, &self.my_prs)
+            .into_iter()
+            .enumerate()
+            .map(|(index, identity)| (identity, index + 1))
+            .collect();
+        let original = target_order(&draft.notifications, &draft.my_prs);
+        let mut resolved = HashMap::new();
+        for (index, actions) in parsed {
+            let Some(&current_index) = current.get(&original[index - 1]) else {
+                return Err(anyhow!(
+                    "Command cancelled: target {index} is no longer in the list. Select it again."
+                ));
+            };
+            resolved.insert(current_index, actions);
+        }
+        Ok(resolved)
+    }
+
+    #[cfg(test)]
     fn set_visible_count(&mut self, visible_count: usize) {
+        self.visible_indices = (1..=visible_count).collect();
         if self.visible_count != visible_count {
             self.visible_count = visible_count;
             self.update_pending();
         }
     }
 
+    #[cfg(test)]
     fn restrict_visible_count(&mut self, visible_count: usize) {
         self.set_visible_count(self.visible_count.min(visible_count));
     }
@@ -303,6 +379,7 @@ impl AppState {
     fn clear_commands(&mut self) {
         self.input = Self::new_input();
         self.pending.clear();
+        self.command_draft = None;
     }
 
     fn command_text(&self) -> String {
@@ -372,7 +449,13 @@ async fn run_app(
     loop {
         refresh_visible_count(terminal, &mut app)?;
         terminal
-            .draw(|f| ui::draw(f, &app))
+            .draw(|f| {
+                if app.my_pr_search.is_some() {
+                    my_pr_search::draw(f, &app);
+                } else {
+                    ui::draw(f, &app);
+                }
+            })
             .context("render failed")?;
 
         tokio::select! {
@@ -441,9 +524,6 @@ async fn run_app(
                     AppEvent::Error { generation, message } if generation == token_generation(&token) => {
                         set_error_status(&mut app, &message);
                         app.loading = false;
-                        if app.command_in_flight {
-                            app.command_in_flight = false;
-                        }
                     }
                     AppEvent::CommandResult { summary, snapshot } => {
                         handle_command_result(&mut app, &refresh_tx, summary, &snapshot);
@@ -501,8 +581,9 @@ fn refresh_visible_count(
     terminal: &Terminal<CrosstermBackend<Stdout>>,
     app: &mut AppState,
 ) -> Result<()> {
-    let visible_count = terminal_visible_count(terminal, app)?;
-    app.set_visible_count(visible_count);
+    app.visible_indices = terminal_visible_indices(terminal, app)?;
+    app.visible_count = app.visible_indices.len();
+    app.update_pending();
     Ok(())
 }
 
@@ -510,17 +591,19 @@ fn restrict_visible_count_to_terminal(
     terminal: &Terminal<CrosstermBackend<Stdout>>,
     app: &mut AppState,
 ) -> Result<()> {
-    let visible_count = terminal_visible_count(terminal, app)?;
-    app.restrict_visible_count(visible_count);
+    let indices = terminal_visible_indices(terminal, app)?;
+    app.visible_indices.retain(|index| indices.contains(index));
+    app.visible_count = app.visible_indices.len();
+    app.update_pending();
     Ok(())
 }
 
-fn terminal_visible_count(
+fn terminal_visible_indices(
     terminal: &Terminal<CrosstermBackend<Stdout>>,
     app: &AppState,
-) -> Result<usize> {
+) -> Result<HashSet<usize>> {
     let size = terminal.size().context("failed to read terminal size")?;
-    Ok(ui::visible_entry_count(
+    Ok(ui::visible_entry_indices(
         Rect::new(0, 0, size.width, size.height),
         app,
     ))
@@ -801,6 +884,30 @@ fn handle_input(
             return Ok(InputOutcome::Continue);
         }
 
+        if app.my_pr_search.is_some() {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(InputOutcome::Quit);
+            }
+            if let Some((index, action)) = my_pr_search::handle_key(app, key) {
+                return submit_pending(
+                    app,
+                    app_event_tx,
+                    client,
+                    token,
+                    HashMap::from([(index, vec![action])]),
+                )
+                .map(|()| InputOutcome::Continue);
+            }
+            return Ok(InputOutcome::Continue);
+        }
+        if key.code == KeyCode::Char('/')
+            && matches!(app.screen, Screen::Inbox)
+            && app.command_text().is_empty()
+        {
+            app.my_pr_search = Some(my_pr_search::Search::default());
+            return Ok(InputOutcome::Continue);
+        }
+
         if key.code == KeyCode::Enter && app.reauthorize_on_enter {
             if app.command_in_flight || app.undo_in_flight {
                 app.status = Some("Wait for actions to finish before reauthorizing".to_string());
@@ -921,12 +1028,31 @@ fn submit_commands(
         return submit_undo(app, app_event_tx, client, token);
     }
 
-    let pending = ui::build_visible_pending_map(
-        &app.command_text(),
-        &app.notifications,
-        &app.my_prs,
-        app.visible_count,
-    );
+    let pending = match app.resolve_command_targets() {
+        Ok(pending) => pending,
+        Err(error) => {
+            app.clear_commands();
+            app.status = Some(error.to_string());
+            app.status_sticky = true;
+            return Ok(());
+        }
+    };
+    submit_pending(app, app_event_tx, client, token, pending)
+}
+
+fn submit_pending(
+    app: &mut AppState,
+    app_event_tx: &mpsc::Sender<AppEvent>,
+    client: &reqwest::Client,
+    token: &str,
+    pending: HashMap<usize, Vec<Action>>,
+) -> Result<()> {
+    if app.command_in_flight || app.undo_in_flight {
+        app.status = Some("Wait for the current action to finish; your command is kept".into());
+        app.status_sticky = false;
+        my_pr_search::set_notice(app, "Wait for the current action to finish".into());
+        return Ok(());
+    }
     if pending.is_empty() {
         app.status = Some("No commands to run".to_string());
         app.status_sticky = false;
@@ -980,6 +1106,13 @@ fn submit_commands(
     app.status = Some(format!("Executing {} actions...", action_total));
     app.status_sticky = false;
     app.command_in_flight = true;
+    app.copy_in_flight = pending
+        .values()
+        .flatten()
+        .all(|action| matches!(action, Action::Yank | Action::PrettyYank));
+    if app.copy_in_flight {
+        my_pr_search::set_notice(app, "Copying…".into());
+    }
     app.clear_commands();
 
     let client = client.clone();
@@ -1343,6 +1476,7 @@ fn snapshot_state(app: &AppState) -> UndoSnapshot {
 }
 
 fn restore_snapshot(app: &mut AppState, snapshot: &UndoSnapshot) {
+    my_pr_search::remember_selection(app);
     app.notifications = snapshot.notifications.clone();
     app.my_prs = snapshot.my_prs.clone();
     app.ignored_prs = snapshot.ignored_prs.clone();
@@ -1512,6 +1646,17 @@ fn handle_command_result(
         app.last_undo = None;
     }
     let (message, refresh, sticky) = command_status(&result);
+    if app.copy_in_flight {
+        my_pr_search::set_notice(
+            app,
+            if result.failed == 0 {
+                "Copied".into()
+            } else {
+                message.clone()
+            },
+        );
+        app.copy_in_flight = false;
+    }
     if sticky {
         set_error_status(app, &message);
     } else {
@@ -1521,6 +1666,7 @@ fn handle_command_result(
     }
     app.executing.clear();
     app.command_in_flight = false;
+    app.update_pending();
     if refresh || result.failed > 0 {
         let _ = refresh_tx.try_send(());
     }
@@ -2280,9 +2426,12 @@ mod tests {
     }
 
     #[test]
-    fn visibility_change_revalidates_pending_commands() {
+    fn visibility_change_preserves_locked_command_targets() {
         let mut app = AppState::new(true, HashSet::new());
-        app.notifications = vec![sample_notification(true), sample_notification(true)];
+        let first = sample_notification(true);
+        let mut second = first.clone();
+        second.id = "thread-2".into();
+        app.notifications = vec![first, second];
         app.set_visible_count(2);
         handle_text_input(&mut app, key_event(KeyCode::Char('2'), KeyModifiers::NONE));
         handle_text_input(&mut app, key_event(KeyCode::Char('d'), KeyModifiers::NONE));
@@ -2290,7 +2439,116 @@ mod tests {
 
         app.set_visible_count(1);
 
+        assert_eq!(app.pending.get(&2), Some(&vec![Action::Done]));
+    }
+
+    fn type_command(app: &mut AppState, text: &str) {
+        for ch in text.chars() {
+            handle_text_input(app, key_event(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+    }
+
+    fn numbered_pr(number: usize) -> MyPullRequest {
+        sample_my_pr_with_url(
+            &format!("https://github.com/acme/widgets/pull/{number}"),
+            "2024-01-01T00:00:00Z",
+        )
+    }
+
+    #[test]
+    fn refresh_between_target_and_action_keeps_original_pr() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.set_data(vec![], vec![numbered_pr(1), numbered_pr(2)]);
+        app.set_visible_count(2);
+        type_command(&mut app, "2");
+        app.set_data(vec![], vec![numbered_pr(1), numbered_pr(2), numbered_pr(3)]);
+        app.set_visible_count(3);
+        type_command(&mut app, "y");
+        let pending = app.resolve_command_targets().unwrap();
+        assert_eq!(pending.get(&3), Some(&vec![Action::PrettyYank]));
+        assert!(!pending.contains_key(&2));
+        assert!(entry_for_index(3, &app.notifications, &app.my_prs)
+            .unwrap()
+            .url()
+            .ends_with("/1"));
+        app.clear_commands();
+        type_command(&mut app, "2y");
+        assert_eq!(
+            app.resolve_command_targets().unwrap().get(&2),
+            Some(&vec![Action::PrettyYank])
+        );
+    }
+
+    #[test]
+    fn partial_multi_digit_target_and_ranges_use_original_numbering() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.set_data(vec![], (1..=12).map(numbered_pr).collect());
+        app.set_visible_count(12);
+        type_command(&mut app, "1");
+        app.set_data(vec![], (1..=13).map(numbered_pr).collect());
+        type_command(&mut app, "2y 1-2Y");
+        let pending = app.resolve_command_targets().unwrap();
+        assert_eq!(pending.get(&13), Some(&vec![Action::PrettyYank]));
+        assert_eq!(pending.get(&2), Some(&vec![Action::Yank]));
+        assert_eq!(pending.get(&3), Some(&vec![Action::Yank]));
+        assert_eq!(pending.len(), 3);
+    }
+
+    #[test]
+    fn status_group_and_notification_targets_survive_bucket_changes() {
+        let mut app = AppState::new(true, HashSet::new());
+        let mut first = sample_notification(true);
+        first.id = "first".into();
+        first.subject.ci_status = Some(crate::types::CiStatus::Failure);
+        let mut second = sample_notification(true);
+        second.id = "second".into();
+        second.subject.review_status = Some(crate::types::ReviewStatus::ReviewRequired);
+        app.set_data(vec![first.clone(), second.clone()], vec![]);
+        app.set_visible_count(2);
+        type_command(&mut app, "1Y ?");
+        first.subject.ci_status = None;
+        first.subject.review_status = Some(crate::types::ReviewStatus::ReviewRequired);
+        second.subject.ci_status = Some(crate::types::CiStatus::Failure);
+        second.subject.review_status = Some(crate::types::ReviewStatus::Approved);
+        app.set_data(vec![first, second], vec![]);
+        type_command(&mut app, "y");
+        let pending = app.resolve_command_targets().unwrap();
+        assert_eq!(pending.get(&2), Some(&vec![Action::Yank]));
+        assert_eq!(pending.get(&1), Some(&vec![Action::PrettyYank]));
+    }
+
+    #[test]
+    fn removed_target_cancels_entire_batch_and_does_not_pick_replacement() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.set_data(vec![], vec![numbered_pr(1), numbered_pr(2)]);
+        app.set_visible_count(2);
+        type_command(&mut app, "1-2y");
+        app.set_data(vec![], vec![numbered_pr(2), numbered_pr(3)]);
+        let error = app.resolve_command_targets().unwrap_err().to_string();
+        assert!(error.contains("target 2"));
         assert!(app.pending.is_empty());
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        super::submit_commands(&mut app, &tx, &reqwest::Client::new(), "unused").unwrap();
+        assert!(!app.command_in_flight);
+        assert!(app.command_draft.is_none());
+        assert!(app.status.as_deref().unwrap().contains("Command cancelled"));
+    }
+
+    #[test]
+    fn deleting_command_releases_targets_for_next_command() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.set_data(vec![], vec![numbered_pr(1)]);
+        app.set_visible_count(1);
+        type_command(&mut app, "1");
+        handle_text_input(&mut app, key_event(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(app.command_draft.is_none());
+        app.set_data(vec![], vec![numbered_pr(1), numbered_pr(2)]);
+        app.set_visible_count(2);
+        type_command(&mut app, "1y");
+        assert_eq!(
+            app.resolve_command_targets().unwrap().get(&1),
+            Some(&vec![Action::PrettyYank])
+        );
     }
 
     #[test]
