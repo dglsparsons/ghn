@@ -971,12 +971,13 @@ pub async fn fetch_notifications_and_my_prs_cached(
         .map(str::trim)
         .filter(|login| !login.is_empty() && *login != "unknown");
 
-    let notifications = if let Some(viewer_login) = cached_viewer_login {
-        let (notifications, pull_requests) = tokio::try_join!(
+    let mut notifications = if let Some(viewer_login) = cached_viewer_login {
+        let (mut notifications, pull_requests) = tokio::try_join!(
             fetch_notifications(client, token, include_read),
             fetch_my_pull_requests(client, token, viewer_login),
         )?;
-        let pull_requests = dedupe_pull_requests(pull_requests, &notifications.notifications);
+        notifications.notifications =
+            dedupe_notifications(notifications.notifications, &pull_requests);
 
         return Ok(InboxPayload {
             viewer_login: notifications.viewer_login,
@@ -988,7 +989,7 @@ pub async fn fetch_notifications_and_my_prs_cached(
     };
 
     let pull_requests = fetch_my_pull_requests(client, token, &notifications.viewer_login).await?;
-    let pull_requests = dedupe_pull_requests(pull_requests, &notifications.notifications);
+    notifications.notifications = dedupe_notifications(notifications.notifications, &pull_requests);
 
     Ok(InboxPayload {
         viewer_login: notifications.viewer_login,
@@ -997,37 +998,36 @@ pub async fn fetch_notifications_and_my_prs_cached(
     })
 }
 
-fn dedupe_pull_requests(
-    pull_requests: Vec<MyPullRequest>,
-    notifications: &[Notification],
-) -> Vec<MyPullRequest> {
-    let mut ids = std::collections::HashSet::new();
-    let mut urls = std::collections::HashSet::new();
+fn dedupe_notifications(
+    notifications: Vec<Notification>,
+    pull_requests: &[MyPullRequest],
+) -> Vec<Notification> {
+    let ids: std::collections::HashSet<_> = pull_requests.iter().map(|pr| &pr.id).collect();
+    let urls: std::collections::HashSet<_> = pull_requests
+        .iter()
+        .map(|pr| normalize_pr_url(&pr.url))
+        .collect();
 
-    for notification in notifications {
-        if !notification
-            .subject
-            .kind
-            .eq_ignore_ascii_case("pullrequest")
-        {
-            continue;
-        }
-        if let Some(subject_id) = notification.subject_id.as_ref() {
-            ids.insert(subject_id.clone());
-        }
-        urls.insert(notification.subject.url.clone());
-    }
-
-    pull_requests
+    notifications
         .into_iter()
-        .filter(|pr| !ids.contains(&pr.id) && !urls.contains(&pr.url))
+        .filter(|notification| {
+            !notification
+                .subject
+                .kind
+                .eq_ignore_ascii_case("pullrequest")
+                || (!notification
+                    .subject_id
+                    .as_ref()
+                    .is_some_and(|id| ids.contains(id))
+                    && !urls.contains(&normalize_pr_url(&notification.subject.url)))
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        dedupe_pull_requests, filter_archived_pull_requests, normalize_pr_url,
+        dedupe_notifications, filter_archived_pull_requests, normalize_pr_url,
         parse_pull_request_key, parse_repo_from_url, parse_subject_type,
         transform_notification_thread, transform_pull_request, GraphQlPullRequest,
         GraphQlRepository, GraphQlSubject, RestNotificationRepository, RestNotificationSubject,
@@ -1383,8 +1383,8 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_pull_requests_removes_notification_dupes() {
-        let notifications = vec![Notification {
+    fn dedupe_notifications_preserves_other_notifications() {
+        let mut notifications = vec![Notification {
             id: "thread-1".to_string(),
             node_id: "node-1".to_string(),
             subject_id: Some("pr-1".to_string()),
@@ -1455,9 +1455,33 @@ mod tests {
             },
         ];
 
-        let deduped = dedupe_pull_requests(pull_requests, &notifications);
-        assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0].id, "pr-2");
+        // Match by ID even when the URL differs.
+        notifications[0].subject.url = "https://github.com/acme/widgets/pull/99".to_string();
+
+        let mut by_url = notifications[0].clone();
+        by_url.id = "thread-url".to_string();
+        by_url.subject_id = None;
+        by_url.subject.url = "https://github.com/acme/widgets/pull/2/files#diff-1".to_string();
+        notifications.push(by_url);
+
+        let mut other_pr = notifications[0].clone();
+        other_pr.id = "thread-other".to_string();
+        other_pr.subject_id = Some("other-pr".to_string());
+        other_pr.subject.url = "https://github.com/acme/widgets/pull/3".to_string();
+        notifications.push(other_pr);
+
+        let mut issue = notifications[0].clone();
+        issue.id = "thread-issue".to_string();
+        issue.subject.kind = "Issue".to_string();
+        notifications.push(issue);
+
+        let deduped = dedupe_notifications(notifications, &pull_requests);
+        let ids: Vec<_> = deduped
+            .iter()
+            .map(|notification| notification.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["thread-other", "thread-issue"]);
+        assert_eq!(pull_requests.len(), 2);
     }
 
     #[test]

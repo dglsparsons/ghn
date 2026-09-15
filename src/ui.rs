@@ -832,6 +832,7 @@ fn collect_layout_max(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotificationBucket {
+    MyPrs,
     NeedsReview,
     NeedsAction,
     WaitingOnCi,
@@ -843,6 +844,7 @@ enum NotificationBucket {
 impl NotificationBucket {
     fn title(self) -> &'static str {
         match self {
+            Self::MyPrs => "My PRs",
             Self::NeedsReview => "Needs Review",
             Self::NeedsAction => "Needs Action",
             Self::WaitingOnCi => "Waiting on CI",
@@ -854,6 +856,7 @@ impl NotificationBucket {
 
     fn header_style(self) -> Style {
         let color = match self {
+            Self::MyPrs => Color::Cyan,
             Self::NeedsReview => Color::Yellow,
             Self::NeedsAction => Color::Red,
             Self::WaitingOnCi => Color::LightBlue,
@@ -911,6 +914,7 @@ fn build_bucket_key_sections(
         let entry = DisplayEntryKey::Notification(idx);
 
         match notification_bucket(&BucketItem::Notification(notification)) {
+            NotificationBucket::MyPrs => unreachable!("notifications use status buckets"),
             NotificationBucket::NeedsReview => needs_review.push(entry),
             NotificationBucket::NeedsAction => needs_action.push(entry),
             NotificationBucket::WaitingOnCi => waiting_on_ci.push(entry),
@@ -920,20 +924,22 @@ fn build_bucket_key_sections(
         }
     }
 
-    for (idx, pr) in my_prs.iter().enumerate() {
-        let entry = DisplayEntryKey::MyPullRequest(idx);
-
-        match notification_bucket(&BucketItem::MyPullRequest(pr)) {
-            NotificationBucket::NeedsReview => needs_review.push(entry),
-            NotificationBucket::NeedsAction => needs_action.push(entry),
-            NotificationBucket::WaitingOnCi => waiting_on_ci.push(entry),
-            NotificationBucket::ReadyToMerge => ready_to_merge.push(entry),
-            NotificationBucket::Other => other.push(entry),
-            NotificationBucket::Draft => draft.push(entry),
-        }
-    }
+    let mut mine: Vec<_> = (0..my_prs.len()).collect();
+    mine.sort_by(|&a, &b| {
+        my_prs[a]
+            .repository
+            .full_name
+            .cmp(&my_prs[b].repository.full_name)
+            .then_with(|| pr_number(&my_prs[b]).cmp(&pr_number(&my_prs[a])))
+    });
 
     let mut sections = vec![
+        (
+            NotificationBucket::MyPrs,
+            mine.into_iter()
+                .map(DisplayEntryKey::MyPullRequest)
+                .collect(),
+        ),
         (NotificationBucket::ReadyToMerge, ready_to_merge),
         (NotificationBucket::NeedsAction, needs_action),
         (NotificationBucket::WaitingOnCi, waiting_on_ci),
@@ -967,6 +973,15 @@ pub fn display_entry_key(
     }
 
     display_order(notifications, my_prs).get(index - 1).copied()
+}
+
+fn pr_number(pr: &MyPullRequest) -> u64 {
+    pr.url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .and_then(|number| number.parse().ok())
+        .unwrap_or(0)
 }
 
 fn notification_bucket(item: &BucketItem<'_>) -> NotificationBucket {
@@ -2336,11 +2351,11 @@ mod tests {
             url: "https://github.com/acme/widgets/pull/2".to_string(),
         }];
 
-        let pending = build_pending_map("2dq", &notifications, &my_prs);
-        assert_eq!(pending.get(&2), Some(&vec![Action::Unsubscribe]));
+        let pending = build_pending_map("1dq", &notifications, &my_prs);
+        assert_eq!(pending.get(&1), Some(&vec![Action::Unsubscribe]));
 
-        let pending = build_pending_map("2o", &notifications, &my_prs);
-        assert_eq!(pending.get(&2), Some(&vec![Action::Open]));
+        let pending = build_pending_map("1o", &notifications, &my_prs);
+        assert_eq!(pending.get(&1), Some(&vec![Action::Open]));
     }
 
     #[test]
@@ -2532,22 +2547,23 @@ mod tests {
         let sections =
             build_bucket_sections(&notifications, &notification_times, &my_prs, &my_pr_times);
 
-        assert_eq!(sections.len(), 6);
-        assert_eq!(sections[0].bucket, NotificationBucket::ReadyToMerge);
+        assert_eq!(sections.len(), 7);
+        assert_eq!(sections[0].bucket, NotificationBucket::MyPrs);
         assert_eq!(sections[0].entries[0].index, 1);
         assert_eq!(sections[0].entries[0].relative_time, "9m");
-        assert_eq!(sections[1].bucket, NotificationBucket::NeedsAction);
-        assert_eq!(sections[1].entries[0].index, 2);
-        assert_eq!(sections[2].bucket, NotificationBucket::WaitingOnCi);
-        assert_eq!(sections[2].entries[0].index, 3);
-        assert_eq!(sections[2].entries[0].relative_time, "4m");
-        assert_eq!(sections[3].bucket, NotificationBucket::NeedsReview);
-        assert_eq!(sections[3].entries[0].index, 4);
-        assert_eq!(sections[3].entries[0].relative_time, "1m");
-        assert_eq!(sections[4].bucket, NotificationBucket::Other);
-        assert_eq!(sections[4].entries[0].index, 5);
-        assert_eq!(sections[5].bucket, NotificationBucket::Draft);
-        assert!(sections[5].entries.is_empty());
+        assert!(sections[1].entries.is_empty());
+        assert_eq!(sections[2].bucket, NotificationBucket::NeedsAction);
+        assert_eq!(sections[2].entries[0].index, 2);
+        assert_eq!(sections[3].bucket, NotificationBucket::WaitingOnCi);
+        assert_eq!(sections[3].entries[0].index, 3);
+        assert_eq!(sections[3].entries[0].relative_time, "4m");
+        assert_eq!(sections[4].bucket, NotificationBucket::NeedsReview);
+        assert_eq!(sections[4].entries[0].index, 4);
+        assert_eq!(sections[4].entries[0].relative_time, "1m");
+        assert_eq!(sections[5].bucket, NotificationBucket::Other);
+        assert_eq!(sections[5].entries[0].index, 5);
+        assert_eq!(sections[6].bucket, NotificationBucket::Draft);
+        assert!(sections[6].entries.is_empty());
     }
 
     #[test]
@@ -2632,7 +2648,7 @@ mod tests {
         .map(|rect| rect.height)
         .collect();
 
-        assert_eq!(heights, vec![4, 4, 4, 4, 4, 0]);
+        assert_eq!(heights, vec![4, 0, 4, 4, 4, 4, 0]);
     }
 
     #[test]
@@ -2717,7 +2733,7 @@ mod tests {
         .map(|rect| rect.height)
         .collect();
 
-        assert_eq!(heights, vec![4, 4, 4, 4, 4, 7]);
+        assert_eq!(heights, vec![4, 0, 4, 4, 4, 4, 7]);
         assert_eq!(heights.iter().sum::<u16>(), 27);
     }
 

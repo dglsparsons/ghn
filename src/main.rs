@@ -2734,10 +2734,10 @@ mod tests {
         assert_eq!(
             urls,
             vec![
+                "https://github.com/acme/widgets/pull/3".to_string(),
                 "https://github.com/acme/widgets/pull/1".to_string(),
                 "https://github.com/acme/widgets/issues/2".to_string(),
-                "https://github.com/acme/widgets/pull/3".to_string(),
-                "https://github.com/acme/widgets/pull/3".to_string(),
+                "https://github.com/acme/widgets/issues/2".to_string(),
             ]
         );
     }
@@ -2769,17 +2769,17 @@ mod tests {
         assert_eq!(targets[0].count, 1);
         assert_eq!(
             targets[0].entry.url(),
-            "https://github.com/acme/widgets/pull/1"
+            "https://github.com/acme/widgets/pull/3"
         );
         assert_eq!(targets[1].count, 1);
         assert_eq!(
             targets[1].entry.url(),
-            "https://github.com/acme/widgets/pull/2"
+            "https://github.com/acme/widgets/pull/1"
         );
         assert_eq!(targets[2].count, 2);
         assert_eq!(
             targets[2].entry.url(),
-            "https://github.com/acme/widgets/pull/3"
+            "https://github.com/acme/widgets/pull/2"
         );
     }
 
@@ -3046,11 +3046,11 @@ mod tests {
         let my_prs = vec![sample_my_pr()];
 
         assert!(matches!(
-            entry_for_index(1, &notifications, &my_prs),
+            entry_for_index(2, &notifications, &my_prs),
             Some(EntrySnapshot::Notification(_))
         ));
         assert!(matches!(
-            entry_for_index(3, &notifications, &my_prs),
+            entry_for_index(1, &notifications, &my_prs),
             Some(EntrySnapshot::MyPullRequest(_))
         ));
         assert!(entry_for_index(0, &notifications, &my_prs).is_none());
