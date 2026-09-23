@@ -122,6 +122,7 @@ This also applies to range endpoints (e.g., with 10 items `1-23r` -> `1-2` and `
 | `Enter` | Execute all queued commands |
 | `U` | Undo last executed batch (press `U` then `Enter`) |
 | `Esc` | Clear command buffer |
+| `Up` / `Down` | Browse this session's prompt history; Down past the newest restores unfinished input |
 | `Backspace` | Delete last character |
 | `Ctrl+A` | Move cursor to start of input |
 | `Ctrl+E` | Move cursor to end of input |

@@ -133,6 +133,7 @@ struct ReviewRequest {
     pr_url: String,
 }
 
+#[derive(Clone)]
 struct CommandDraft {
     notifications: Vec<Notification>,
     my_prs: Vec<MyPullRequest>,
@@ -165,6 +166,9 @@ pub struct AppState {
     pub input: TextArea<'static>,
     pub pending: HashMap<usize, Vec<Action>>,
     command_draft: Option<CommandDraft>,
+    command_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: Option<(TextArea<'static>, Option<CommandDraft>)>,
     pub executing: HashSet<String>,
     pub status: Option<String>,
     pub status_sticky: bool,
@@ -195,6 +199,9 @@ impl AppState {
             input,
             pending: HashMap::new(),
             command_draft: None,
+            command_history: Vec::new(),
+            history_index: None,
+            history_draft: None,
             executing: HashSet::new(),
             status: None,
             status_sticky: false,
@@ -380,6 +387,33 @@ impl AppState {
         self.input = Self::new_input();
         self.pending.clear();
         self.command_draft = None;
+        self.history_index = None;
+        self.history_draft = None;
+    }
+
+    fn navigate_history(&mut self, older: bool) {
+        let index = match (older, self.history_index) {
+            (true, None) if !self.command_history.is_empty() => {
+                self.history_draft = Some((self.input.clone(), self.command_draft.clone()));
+                Some(self.command_history.len() - 1)
+            }
+            (true, Some(0)) => return,
+            (true, Some(index)) => Some(index - 1),
+            (false, Some(index)) if index + 1 < self.command_history.len() => Some(index + 1),
+            (false, Some(_)) => None,
+            _ => return,
+        };
+        self.history_index = index;
+        if let Some(index) = index {
+            self.input = Self::new_input();
+            self.input.insert_str(&self.command_history[index]);
+            // Recalled prompts select from the current list, just like newly typed input.
+            self.command_draft = None;
+        } else if let Some((input, draft)) = self.history_draft.take() {
+            self.input = input;
+            self.command_draft = draft;
+        }
+        self.update_pending();
     }
 
     fn command_text(&self) -> String {
@@ -935,7 +969,8 @@ fn handle_input(
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(InputOutcome::Quit);
             }
-            KeyCode::Down | KeyCode::Up => {}
+            KeyCode::Up => app.navigate_history(true),
+            KeyCode::Down => app.navigate_history(false),
             KeyCode::Char('R') => {
                 let _ = refresh_tx.try_send(());
                 app.status = Some("Refreshing...".to_string());
@@ -1024,6 +1059,9 @@ fn submit_commands(
     token: &str,
 ) -> Result<()> {
     let command_text = app.command_text();
+    if !command_text.trim().is_empty() && app.command_history.last() != Some(&command_text) {
+        app.command_history.push(command_text.clone());
+    }
     if is_undo_command(&command_text) {
         return submit_undo(app, app_event_tx, client, token);
     }
@@ -2395,6 +2433,69 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn arrow_keys_recall_submitted_prompts_and_restore_draft() {
+        let mut app = AppState::new(true, HashSet::new());
+        let (refresh_tx, _refresh_rx) = tokio::sync::mpsc::channel(1);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
+        let client = reqwest::Client::new();
+        let press = |app: &mut AppState, code| {
+            handle_input(
+                crossterm::event::Event::Key(key_event(code, KeyModifiers::NONE)),
+                app,
+                &refresh_tx,
+                &event_tx,
+                &client,
+                "token",
+            )
+            .unwrap();
+        };
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.command_text(), "");
+        for text in ["", "1r", "2d", "2d"] {
+            type_command(&mut app, text);
+            press(&mut app, KeyCode::Enter);
+        }
+        assert_eq!(app.command_history, vec!["1r", "2d"]);
+        type_command(&mut app, "3o");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.command_text(), "2d");
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.command_text(), "1r");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.command_text(), "2d");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.command_text(), "3o");
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.command_text(), "");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.command_text(), "2d");
+    }
+
+    #[test]
+    fn history_uses_current_targets_and_restores_locked_draft() {
+        let mut app = AppState::new(true, HashSet::new());
+        let first = sample_notification(true);
+        let mut second = first.clone();
+        second.id = "thread-2".into();
+        app.notifications = vec![first, second];
+        app.set_visible_count(2);
+        type_command(&mut app, "1r");
+        app.command_history.push("1d".into());
+        app.notifications.swap(0, 1);
+        app.navigate_history(true);
+        assert_eq!(app.pending.get(&1), Some(&vec![Action::Done]));
+        type_command(&mut app, " ");
+        assert_eq!(app.command_history[0], "1d");
+        app.navigate_history(false);
+        assert_eq!(app.command_text(), "1r");
+        assert_eq!(app.pending.get(&2), Some(&vec![Action::Read]));
     }
 
     fn sample_notification(unread: bool) -> Notification {
