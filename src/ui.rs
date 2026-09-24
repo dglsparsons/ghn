@@ -43,6 +43,7 @@ const REPO_META_GAP: usize = 2;
 const REPO_AUTHOR_SEPARATOR: &str = " · ";
 const MIN_AUTHOR_WIDTH: usize = 4;
 const MAX_AUTHOR_WIDTH: usize = 18;
+const MAX_ACTIVITY_PREVIEW_LINES: usize = 5;
 const CI_REVIEW_GAP: usize = 1;
 const INDICATOR_KIND_GAP: usize = 1;
 
@@ -372,7 +373,8 @@ fn draw_bucket_section(
     total_count: usize,
     layout_max: &LayoutMax,
 ) {
-    let visible_count = visible_entries_for_section(section, area.height, discussions);
+    let activity_limits = visible_activity_limits(section, area.height, discussions);
+    let visible_count = activity_limits.len();
     let title = Line::from(Span::styled(
         if section.bucket == NotificationBucket::MyPrs {
             format!(
@@ -391,16 +393,16 @@ fn draw_bucket_section(
     let items: Vec<ListItem> = section
         .entries
         .iter()
-        .take(visible_count)
+        .zip(activity_limits)
         .enumerate()
-        .map(|(idx, entry)| {
+        .map(|(idx, (entry, activity_limit))| {
             build_list_item(
                 entry.index,
                 &entry.item,
                 entry.relative_time,
                 pending,
                 executing,
-                activity_lines(&entry.item, discussions),
+                activity_lines(&entry.item, discussions, activity_limit),
                 &widths,
                 idx + 1 < visible_count,
             )
@@ -455,17 +457,26 @@ fn visible_entries_for_section(
     height: u16,
     discussions: &HashMap<String, DiscussionInboxUpdate>,
 ) -> usize {
+    visible_activity_limits(section, height, discussions).len()
+}
+
+fn visible_activity_limits(
+    section: &BucketSection<'_>,
+    height: u16,
+    discussions: &HashMap<String, DiscussionInboxUpdate>,
+) -> Vec<usize> {
     let mut remaining = height.saturating_sub(2) as usize;
-    let mut visible = 0;
+    let mut limits = Vec::new();
     for entry in &section.entries {
-        let rows = 3 + activity_line_count(&entry.item, discussions);
-        if rows.saturating_sub(1) > remaining {
+        if remaining < 2 {
             break;
         }
-        remaining = remaining.saturating_sub(rows);
-        visible += 1;
+        // Preserve the PR header and title even when its activity cannot fit.
+        let activity_limit = activity_line_count(&entry.item, discussions).min(remaining - 2);
+        limits.push(activity_limit);
+        remaining = remaining.saturating_sub(3 + activity_limit);
     }
-    visible
+    limits
 }
 
 fn activity_line_count(
@@ -474,21 +485,39 @@ fn activity_line_count(
 ) -> usize {
     discussions
         .get(&item.subject().url)
-        .map(|discussion| discussion.activity.len())
+        .map(|discussion| discussion.activity.len().min(MAX_ACTIVITY_PREVIEW_LINES))
         .unwrap_or(0)
 }
 
 fn activity_lines(
     item: &BucketItem<'_>,
     discussions: &HashMap<String, DiscussionInboxUpdate>,
+    limit: usize,
 ) -> Vec<(String, Style)> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let Some(discussion) = discussions.get(&item.subject().url) else {
         return Vec::new();
     };
-    ordered_activity(&discussion.activity)
+    let truncated = discussion.activity.len() > limit;
+    let shown = if truncated {
+        limit - 1
+    } else {
+        discussion.activity.len()
+    };
+    let mut lines: Vec<_> = ordered_activity(&discussion.activity)
         .into_iter()
+        .take(shown)
         .map(|activity| activity_line(activity, discussion))
-        .collect()
+        .collect();
+    if truncated {
+        lines.push((
+            format!("└ … {} more updates", discussion.activity.len() - shown),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines
 }
 
 fn ordered_activity(activity: &[DiscussionActivity]) -> Vec<&DiscussionActivity> {
@@ -1041,7 +1070,7 @@ pub fn my_pr_search_items(
                     .unwrap_or("?"),
                 &app.pending,
                 &app.executing,
-                activity_lines(&item, &app.discussions),
+                activity_lines(&item, &app.discussions, MAX_ACTIVITY_PREVIEW_LINES),
                 &widths,
                 position + 1 < results.len(),
             )
@@ -1902,6 +1931,70 @@ mod tests {
             assert!(rows[own_title - 1].contains("acme/long-repository"));
             assert!(rows[other_title - 1].contains("acme/widgets"));
         }
+    }
+
+    #[test]
+    fn oversized_activity_keeps_review_rows_visible_and_targetable() {
+        let mut app = crate::AppState::new(false, Default::default());
+        app.notifications = (1..=3)
+            .map(|id| {
+                sample_bucket_notification(
+                    &id.to_string(),
+                    "review_requested",
+                    "PullRequest",
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        let activity = DiscussionActivity::HeadUpdated {
+            previous: "abcdef1".into(),
+            current: "abcdef2".into(),
+        };
+        for notification in &app.notifications {
+            let mut update = discussion_update(review_thread(false, Vec::new()), activity.clone());
+            update.activity = vec![activity.clone(); 100];
+            update.pr_url = notification.subject.url.clone();
+            app.discussions.insert(update.pr_url.clone(), update);
+        }
+
+        for (height, expected_count) in [(3, 0), (4, 1), (5, 1), (25, 3)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, height)).unwrap();
+            terminal
+                .draw(|frame| super::draw_lists(frame, frame.area(), &app))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("Needs Review (3)"));
+            assert_eq!(rendered.matches("Notification ").count(), expected_count);
+            let sections = build_bucket_sections(&app.notifications, &[], &[], &[]);
+            let section = sections
+                .iter()
+                .find(|section| section.bucket == NotificationBucket::NeedsReview)
+                .unwrap();
+            assert_eq!(
+                super::visible_entries_for_section(section, height, &app.discussions),
+                expected_count
+            );
+            if height == 5 {
+                assert!(rendered.contains("100 more updates"));
+            }
+            if height == 25 {
+                assert_eq!(rendered.matches("96 more updates").count(), 3);
+            }
+        }
+        assert_eq!(
+            super::visible_entry_indices(Rect::new(0, 0, 100, 80), &app),
+            [1, 2, 3].into_iter().collect()
+        );
     }
 
     #[test]
