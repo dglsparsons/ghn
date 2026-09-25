@@ -376,9 +376,13 @@ fn draw_bucket_section(
     let activity_limits = visible_activity_limits(section, area.height, discussions);
     let visible_count = activity_limits.len();
     let title = Line::from(Span::styled(
-        if section.bucket == NotificationBucket::MyPrs {
+        if matches!(
+            section.bucket,
+            NotificationBucket::MyDraftPrs | NotificationBucket::MyPrs
+        ) {
             format!(
-                "My PRs · {visible_count} of {} shown · / find all",
+                "{} · {visible_count} of {} shown · / find all",
+                section.bucket.title(),
                 section.entries.len()
             )
         } else {
@@ -893,6 +897,7 @@ fn collect_layout_max(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotificationBucket {
+    MyDraftPrs,
     MyPrs,
     NeedsReview,
     NeedsAction,
@@ -905,6 +910,7 @@ enum NotificationBucket {
 impl NotificationBucket {
     fn title(self) -> &'static str {
         match self {
+            Self::MyDraftPrs => "My Draft PRs",
             Self::MyPrs => "My PRs",
             Self::NeedsReview => "Needs Review",
             Self::NeedsAction => "Needs Action",
@@ -917,6 +923,7 @@ impl NotificationBucket {
 
     fn header_style(self) -> Style {
         let color = match self {
+            Self::MyDraftPrs => Color::Gray,
             Self::MyPrs => Color::Cyan,
             Self::NeedsReview => Color::Yellow,
             Self::NeedsAction => Color::Red,
@@ -975,7 +982,9 @@ fn build_bucket_key_sections(
         let entry = DisplayEntryKey::Notification(idx);
 
         match notification_bucket(&BucketItem::Notification(notification)) {
-            NotificationBucket::MyPrs => unreachable!("notifications use status buckets"),
+            NotificationBucket::MyDraftPrs | NotificationBucket::MyPrs => {
+                unreachable!("notifications use status buckets")
+            }
             NotificationBucket::NeedsReview => needs_review.push(entry),
             NotificationBucket::NeedsAction => needs_action.push(entry),
             NotificationBucket::WaitingOnCi => waiting_on_ci.push(entry),
@@ -994,18 +1003,30 @@ fn build_bucket_key_sections(
             .then_with(|| pr_number(&my_prs[b]).cmp(&pr_number(&my_prs[a])))
     });
 
-    let mut sections = vec![
-        (
-            NotificationBucket::MyPrs,
-            mine.into_iter()
+    let (my_drafts, mine): (Vec<_>, Vec<_>) = mine
+        .into_iter()
+        .partition(|&idx| is_draft_pull_request(&my_prs[idx].subject));
+    let mut sections = vec![(
+        NotificationBucket::MyPrs,
+        mine.into_iter()
+            .map(DisplayEntryKey::MyPullRequest)
+            .collect(),
+    )];
+    if !my_drafts.is_empty() {
+        sections.push((
+            NotificationBucket::MyDraftPrs,
+            my_drafts
+                .into_iter()
                 .map(DisplayEntryKey::MyPullRequest)
                 .collect(),
-        ),
+        ));
+    }
+    sections.extend([
         (NotificationBucket::ReadyToMerge, ready_to_merge),
         (NotificationBucket::NeedsAction, needs_action),
         (NotificationBucket::WaitingOnCi, waiting_on_ci),
         (NotificationBucket::NeedsReview, needs_review),
-    ];
+    ]);
     if !other.is_empty() {
         sections.push((NotificationBucket::Other, other));
     }
@@ -1873,6 +1894,29 @@ mod tests {
             .iter()
             .skip(1)
             .all(|section| section.entries.is_empty()));
+    }
+
+    #[test]
+    fn my_draft_prs_follow_non_drafts_and_keep_action_indices() {
+        let mut prs: Vec<_> = (1..=4)
+            .map(|id| sample_bucket_my_pr(&id.to_string(), None, None, None))
+            .collect();
+        prs[0].subject.status = vec![SubjectStatus::Draft];
+        prs[2].subject.status = vec![SubjectStatus::Draft];
+        prs[3].subject.status = vec![SubjectStatus::Draft, SubjectStatus::Closed];
+        let sections = build_bucket_sections(&[], &[], &prs, &[]);
+        assert_eq!(sections[0].bucket, NotificationBucket::MyPrs);
+        assert_eq!(sections[0].entries.len(), 2);
+        assert_eq!(sections[1].bucket, NotificationBucket::MyDraftPrs);
+        assert_eq!(sections[1].bucket.title(), "My Draft PRs");
+        assert_eq!(sections[1].entries.len(), 2);
+
+        let expected = [3, 1, 2, 0].map(super::DisplayEntryKey::MyPullRequest);
+        assert_eq!(super::display_order(&[], &prs), expected);
+        for (offset, key) in expected.into_iter().enumerate() {
+            assert_eq!(super::display_entry_key(offset + 1, &[], &prs), Some(key));
+        }
+        assert_eq!(sections[1].entries[0].index, 3);
     }
 
     #[test]
