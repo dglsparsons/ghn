@@ -11,6 +11,8 @@ use crate::types::{
 
 const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
 const GITHUB_API: &str = "https://api.github.com";
+// Large metadata queries can exceed GitHub's per-request execution limit.
+const NOTIFICATION_SUBJECT_BATCH_SIZE: usize = 20;
 
 #[derive(Debug, Deserialize)]
 struct RestNotificationThread {
@@ -158,6 +160,7 @@ struct GraphQlSearchConnection {
 pub struct NotificationsPayload {
     pub notifications: Vec<Notification>,
     pub viewer_login: String,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +185,7 @@ pub struct InboxPayload {
     pub notifications: Vec<Notification>,
     pub my_prs: Vec<MyPullRequest>,
     pub viewer_login: String,
+    pub warning: Option<String>,
 }
 
 const MY_PULL_REQUESTS_QUERY: &str = r#"
@@ -683,11 +687,28 @@ async fn fetch_notification_subjects(
     client: &Client,
     token: &str,
     urls: &[String],
-) -> Result<Vec<GraphQlSubjectResource>> {
-    if urls.is_empty() {
-        return Ok(Vec::new());
+    endpoint: &str,
+) -> (Vec<GraphQlSubjectResource>, Option<String>) {
+    let mut subjects = Vec::new();
+    let mut warning = None;
+    for batch in urls.chunks(NOTIFICATION_SUBJECT_BATCH_SIZE) {
+        match fetch_notification_subject_batch(client, token, batch, endpoint).await {
+            Ok(batch_subjects) => subjects.extend(batch_subjects),
+            Err(err) => {
+                warning
+                    .get_or_insert_with(|| format!("Some notification details unavailable: {err}"));
+            }
+        }
     }
+    (subjects, warning)
+}
 
+async fn fetch_notification_subject_batch(
+    client: &Client,
+    token: &str,
+    urls: &[String],
+    endpoint: &str,
+) -> Result<Vec<GraphQlSubjectResource>> {
     let mut query = String::from("query NotificationSubjects {\n");
     for (idx, url) in urls.iter().enumerate() {
         let url = serde_json::to_string(url).context("failed to encode notification url")?;
@@ -733,7 +754,7 @@ async fn fetch_notification_subjects(
     query.push_str("}\n");
 
     let response = client
-        .post(GITHUB_GRAPHQL)
+        .post(endpoint)
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
         .header("User-Agent", "ghn")
@@ -810,7 +831,8 @@ pub async fn fetch_notifications(
         }
     }
 
-    let subject_details = fetch_notification_subjects(client, token, &subject_urls).await?;
+    let (subject_details, warning) =
+        fetch_notification_subjects(client, token, &subject_urls, GITHUB_GRAPHQL).await;
     let mut subjects_by_url = std::collections::HashMap::new();
     for resource in subject_details {
         if let Some(subject) = resource.subject {
@@ -834,6 +856,7 @@ pub async fn fetch_notifications(
     Ok(NotificationsPayload {
         notifications,
         viewer_login,
+        warning,
     })
 }
 
@@ -983,6 +1006,7 @@ pub async fn fetch_notifications_and_my_prs_cached(
             viewer_login: notifications.viewer_login,
             notifications: notifications.notifications,
             my_prs: pull_requests,
+            warning: notifications.warning,
         });
     } else {
         fetch_notifications(client, token, include_read).await?
@@ -995,6 +1019,7 @@ pub async fn fetch_notifications_and_my_prs_cached(
         viewer_login: notifications.viewer_login,
         notifications: notifications.notifications,
         my_prs: pull_requests,
+        warning: notifications.warning,
     })
 }
 
@@ -1027,8 +1052,8 @@ fn dedupe_notifications(
 #[cfg(test)]
 mod tests {
     use super::{
-        dedupe_notifications, filter_archived_pull_requests, normalize_pr_url,
-        parse_pull_request_key, parse_repo_from_url, parse_subject_type,
+        dedupe_notifications, fetch_notification_subjects, filter_archived_pull_requests,
+        normalize_pr_url, parse_pull_request_key, parse_repo_from_url, parse_subject_type,
         transform_notification_thread, transform_pull_request, GraphQlPullRequest,
         GraphQlRepository, GraphQlSubject, RestNotificationRepository, RestNotificationSubject,
         RestNotificationThread,
@@ -1036,6 +1061,117 @@ mod tests {
     use crate::types::{
         CiStatus, MyPullRequest, Notification, Repository, ReviewStatus, Subject, SubjectStatus,
     };
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn mock_subject_batches(statuses: Vec<u16>) -> (String, thread::JoinHandle<Vec<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for status in statuses {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "metadata request never arrived");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(err) => panic!("failed to accept metadata request: {err}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut content_length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        content_length = Some(length.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let mut body = vec![0; content_length.unwrap()];
+                reader.read_exact(&mut body).unwrap();
+                let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let mut urls = Vec::new();
+                let mut data = serde_json::Map::new();
+                for line in payload["query"].as_str().unwrap().lines() {
+                    let Some((alias, url)) = line.trim().split_once(": resource(url: ") else {
+                        continue;
+                    };
+                    let url: String = serde_json::from_str(url.trim_end_matches(") {")).unwrap();
+                    data.insert(
+                        alias.to_string(),
+                        serde_json::json!({"id": format!("subject:{url}"), "state": "OPEN"}),
+                    );
+                    urls.push(url);
+                }
+                requests.push(urls);
+                let body = serde_json::json!({"data": data}).to_string();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn notification_metadata_is_batched_and_survives_a_failed_batch() {
+        let urls: Vec<_> = (1..=98)
+            .map(|number| format!("https://github.com/acme/widgets/pull/{number}"))
+            .collect();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        for statuses in [vec![200; 5], vec![200, 502, 200, 200, 200], vec![502; 5]] {
+            let (endpoint, server) = mock_subject_batches(statuses.clone());
+            let (subjects, warning) =
+                fetch_notification_subjects(&client, "test-token", &urls, &endpoint).await;
+            let requests = server.join().unwrap();
+            assert_eq!(
+                requests.iter().map(Vec::len).collect::<Vec<_>>(),
+                vec![20, 20, 20, 20, 18]
+            );
+            assert_eq!(requests.concat(), urls);
+            let expected_urls: Vec<_> = requests
+                .into_iter()
+                .zip(&statuses)
+                .filter(|(_, status)| **status == 200)
+                .flat_map(|(urls, _)| urls)
+                .collect();
+            assert_eq!(
+                subjects
+                    .iter()
+                    .map(|subject| &subject.url)
+                    .collect::<Vec<_>>(),
+                expected_urls.iter().collect::<Vec<_>>()
+            );
+            for subject in subjects {
+                assert_eq!(
+                    subject.subject.unwrap().id.unwrap(),
+                    format!("subject:{}", subject.url)
+                );
+            }
+            assert_eq!(warning.is_some(), statuses.contains(&502));
+            if let Some(warning) = warning {
+                assert!(warning.contains("502 Bad Gateway"));
+            }
+        }
+    }
 
     fn sample_graphql_pr(id: &str, is_archived: bool) -> GraphQlPullRequest {
         GraphQlPullRequest {

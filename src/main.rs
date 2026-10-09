@@ -77,6 +77,7 @@ enum AppEvent {
         generation: u64,
         notifications: Vec<Notification>,
         my_prs: Vec<MyPullRequest>,
+        warning: Option<String>,
     },
     Discussions {
         generation: u64,
@@ -539,15 +540,9 @@ async fn run_app(
             }
             Some(app_event) = event_rx.recv() => {
                 match app_event {
-                    AppEvent::Data { generation, notifications, my_prs } if generation == token_generation(&token) => {
+                    AppEvent::Data { generation, notifications, my_prs, warning } if generation == token_generation(&token) => {
                         app.set_data(notifications, my_prs);
-                        if app.reauthorize_on_enter {
-                            app.reauthorize_on_enter = false;
-                            app.status_sticky = false;
-                        }
-                        if !app.status_sticky {
-                            app.status = None;
-                        }
+                        set_fetch_status(&mut app, warning.as_deref());
                     }
                     AppEvent::Discussions { generation, discussions } if generation == token_generation(&token) => {
                         for mut discussion in discussions {
@@ -556,7 +551,7 @@ async fn run_app(
                         }
                     }
                     AppEvent::Error { generation, message } if generation == token_generation(&token) => {
-                        set_error_status(&mut app, &message);
+                        set_fetch_status(&mut app, Some(&message));
                         app.loading = false;
                     }
                     AppEvent::CommandResult { summary, snapshot } => {
@@ -688,6 +683,7 @@ fn spawn_poller(
                             generation: active_token.generation,
                             notifications: notifications.clone(),
                             my_prs: my_prs.clone(),
+                            warning: payload.warning,
                         })
                         .await;
                     let discussions = fetch_inbox_discussions(
@@ -2175,6 +2171,25 @@ fn clean_error_message(message: &str) -> String {
     text
 }
 
+fn set_fetch_status(app: &mut AppState, warning: Option<&str>) {
+    if let Some(message) = warning {
+        if app.status_sticky && !app.reauthorize_on_enter && !is_authorization_error(message) {
+            return;
+        }
+        set_error_status(app, message);
+        // Transient fetch errors should clear when the next refresh succeeds.
+        app.status_sticky = app.reauthorize_on_enter;
+        return;
+    }
+    if app.reauthorize_on_enter {
+        app.reauthorize_on_enter = false;
+        app.status_sticky = false;
+    }
+    if !app.status_sticky {
+        app.status = None;
+    }
+}
+
 fn set_error_status(app: &mut AppState, message: &str) {
     let message = clean_error_message(message);
     app.reauthorize_on_enter = is_authorization_error(&message);
@@ -2416,10 +2431,10 @@ mod tests {
         collect_pretty_yank_targets, collect_yank_targets, command_status, entry_for_index,
         format_pretty_pull_request, handle_command_result, handle_discussion_input, handle_input,
         handle_text_input, is_api_action, is_authorization_error, parse_updated_at,
-        set_error_status, snapshot_state, sort_by_updated_at, split_review_action,
-        split_view_action, undo_status, AppEvent, AppState, EntrySnapshot, ExecSummary,
-        InputOutcome, NotificationOverride, NotificationOverrideState, PrettyPullRequest, Screen,
-        UndoSummary,
+        set_error_status, set_fetch_status, snapshot_state, sort_by_updated_at,
+        split_review_action, split_view_action, undo_status, AppEvent, AppState, EntrySnapshot,
+        ExecSummary, InputOutcome, NotificationOverride, NotificationOverrideState,
+        PrettyPullRequest, Screen, UndoSummary,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -3349,6 +3364,57 @@ mod tests {
             app.status.as_deref(),
             Some("GitHub authorization failed (401 Unauthorized). Press Enter to reauthorize.")
         );
+    }
+
+    #[test]
+    fn successful_refresh_clears_fetch_errors_and_metadata_warnings() {
+        let mut app = AppState::new(true, HashSet::new());
+        for message in [
+            "GitHub API error: 502 Bad Gateway",
+            "Some notification details unavailable: GitHub API error: 502 Bad Gateway",
+        ] {
+            set_fetch_status(&mut app, Some(message));
+            assert!(app.status.is_some());
+            assert!(!app.status_sticky);
+            assert!(!app.reauthorize_on_enter);
+            app.set_data(vec![sample_notification(true)], vec![]);
+            assert_eq!(app.notifications.len(), 1);
+            set_fetch_status(&mut app, None);
+            assert!(app.status.is_none());
+        }
+    }
+
+    #[test]
+    fn successful_refresh_preserves_command_errors() {
+        let mut app = AppState::new(true, HashSet::new());
+        set_error_status(&mut app, "mutation rejected");
+        set_fetch_status(
+            &mut app,
+            Some("Some notification details unavailable: GitHub API error: 502 Bad Gateway"),
+        );
+        assert_eq!(app.status.as_deref(), Some("mutation rejected"));
+        assert!(app.status_sticky);
+        set_fetch_status(&mut app, None);
+        assert_eq!(app.status.as_deref(), Some("mutation rejected"));
+        assert!(app.status_sticky);
+    }
+
+    #[test]
+    fn metadata_authorization_warning_prompts_for_retry_until_recovery() {
+        let mut app = AppState::new(true, HashSet::new());
+        set_error_status(&mut app, "mutation rejected");
+        set_fetch_status(&mut app, Some("Some notification details unavailable: GitHub authentication failed (401 Unauthorized)"));
+        assert!(app.reauthorize_on_enter);
+        assert!(app.status_sticky);
+        assert!(app
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("Press Enter to reauthorize"));
+        set_fetch_status(&mut app, None);
+        assert!(app.status.is_none());
+        assert!(!app.status_sticky);
+        assert!(!app.reauthorize_on_enter);
     }
 
     #[test]
