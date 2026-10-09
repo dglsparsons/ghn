@@ -2596,6 +2596,37 @@ mod tests {
     }
 
     #[test]
+    fn approval_reorders_my_prs_without_changing_locked_targets() {
+        let mut app = AppState::new(true, HashSet::new());
+        app.set_data(vec![], vec![numbered_pr(1), numbered_pr(2)]);
+        app.set_visible_count(2);
+        type_command(&mut app, "1");
+
+        let mut approved = numbered_pr(1);
+        approved.subject.review_status = Some(crate::types::ReviewStatus::Approved);
+        app.set_data(vec![], vec![approved, numbered_pr(2)]);
+        type_command(&mut app, "y");
+        let pending = app.resolve_command_targets().unwrap();
+        assert_eq!(pending.get(&2), Some(&vec![Action::PrettyYank]));
+        assert!(!pending.contains_key(&1));
+        assert!(entry_for_index(2, &app.notifications, &app.my_prs)
+            .unwrap()
+            .url()
+            .ends_with("/2"));
+
+        app.clear_commands();
+        type_command(&mut app, "1y");
+        assert_eq!(
+            app.resolve_command_targets().unwrap().get(&1),
+            Some(&vec![Action::PrettyYank])
+        );
+        assert!(entry_for_index(1, &app.notifications, &app.my_prs)
+            .unwrap()
+            .url()
+            .ends_with("/1"));
+    }
+
+    #[test]
     fn partial_multi_digit_target_and_ranges_use_original_numbering() {
         let mut app = AppState::new(true, HashSet::new());
         app.set_data(vec![], (1..=12).map(numbered_pr).collect());

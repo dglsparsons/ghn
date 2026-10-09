@@ -996,11 +996,14 @@ fn build_bucket_key_sections(
 
     let mut mine: Vec<_> = (0..my_prs.len()).collect();
     mine.sort_by(|&a, &b| {
-        my_prs[a]
-            .repository
-            .full_name
-            .cmp(&my_prs[b].repository.full_name)
-            .then_with(|| pr_number(&my_prs[b]).cmp(&pr_number(&my_prs[a])))
+        let a = &my_prs[a];
+        let b = &my_prs[b];
+        let a_approved = matches!(a.subject.review_status, Some(ReviewStatus::Approved));
+        let b_approved = matches!(b.subject.review_status, Some(ReviewStatus::Approved));
+        b_approved
+            .cmp(&a_approved)
+            .then_with(|| a.repository.full_name.cmp(&b.repository.full_name))
+            .then_with(|| pr_number(b).cmp(&pr_number(a)))
     });
 
     let (my_drafts, mine): (Vec<_>, Vec<_>) = mine
@@ -1874,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn my_prs_order_is_stable_across_status_changes_and_all_rows_fit() {
+    fn my_prs_order_is_stable_across_ci_changes_and_all_rows_fit() {
         let mut prs: Vec<_> = (1..=8)
             .map(|id| sample_bucket_my_pr(&id.to_string(), None, None, None))
             .collect();
@@ -1894,6 +1897,37 @@ mod tests {
             .iter()
             .skip(1)
             .all(|section| section.entries.is_empty()));
+    }
+
+    #[test]
+    fn approved_my_prs_come_first_with_drafts_last() {
+        let mut prs: Vec<_> = (1..=6)
+            .map(|id| sample_bucket_my_pr(&id.to_string(), None, None, None))
+            .collect();
+        prs[0].repository.full_name = "acme/aaa".into();
+        prs[1].repository.full_name = "acme/zzz".into();
+        prs[1].subject.review_status = Some(ReviewStatus::Approved);
+        prs[1].subject.ci_status = Some(CiStatus::Failure);
+        prs[1].subject.merge_state_status = Some(MergeStateStatus::Dirty);
+        for pr in &mut prs[2..4] {
+            pr.repository.full_name = "acme/bbb".into();
+            pr.subject.review_status = Some(ReviewStatus::Approved);
+        }
+        prs[3].subject.ci_status = Some(CiStatus::Pending);
+        prs[5].repository.full_name = "acme/aaa".into();
+        prs[5].subject.review_status = Some(ReviewStatus::Approved);
+        prs[5].subject.status = vec![SubjectStatus::Draft];
+
+        let expected = [3, 2, 1, 0, 4, 5].map(super::DisplayEntryKey::MyPullRequest);
+        assert_eq!(super::display_order(&[], &prs), expected);
+        let sections = build_bucket_sections(&[], &[], &prs, &[]);
+        assert_eq!(sections[0].bucket, NotificationBucket::MyPrs);
+        assert_eq!(sections[0].entries.len(), 5);
+        assert_eq!(sections[1].bucket, NotificationBucket::MyDraftPrs);
+        for (offset, key) in expected.into_iter().enumerate() {
+            assert_eq!(super::display_entry_key(offset + 1, &[], &prs), Some(key));
+        }
+        assert_eq!(sections[1].entries[0].index, 6);
     }
 
     #[test]
