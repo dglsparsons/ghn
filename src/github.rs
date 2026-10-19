@@ -107,9 +107,17 @@ struct GraphQlPullRequest {
     review_decision: Option<String>,
     merge_state_status: Option<String>,
     head_ref_name: String,
+    base_ref_name: Option<String>,
+    head_repository: Option<GraphQlHeadRepository>,
     author: Option<GraphQlActor>,
     repository: GraphQlRepository,
     commits: Option<GraphQlPullRequestCommits>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlHeadRepository {
+    name_with_owner: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,6 +209,8 @@ query GetMyPullRequests($query: String!) {
         reviewDecision
         mergeStateStatus
         headRefName
+        baseRefName
+        headRepository { nameWithOwner }
         author { login }
         repository {
           name
@@ -615,6 +625,8 @@ fn transform_pull_request(pr: GraphQlPullRequest) -> MyPullRequest {
     };
 
     MyPullRequest {
+        base_ref: pr.base_ref_name,
+        head_repository: pr.head_repository.map(|repo| repo.name_with_owner),
         id: pr.id,
         updated_at: pr.updated_at,
         subject,
@@ -1183,6 +1195,10 @@ mod tests {
             review_decision: None,
             merge_state_status: None,
             head_ref_name: format!("feature/{id}"),
+            base_ref_name: Some("main".to_string()),
+            head_repository: Some(super::GraphQlHeadRepository {
+                name_with_owner: "acme/widgets".to_string(),
+            }),
             author: None,
             repository: GraphQlRepository {
                 name: "widgets".to_string(),
@@ -1487,6 +1503,10 @@ mod tests {
             review_decision: Some("APPROVED".to_string()),
             merge_state_status: Some("CLEAN".to_string()),
             head_ref_name: "feature/one".to_string(),
+            base_ref_name: Some("main".to_string()),
+            head_repository: Some(super::GraphQlHeadRepository {
+                name_with_owner: "acme/widgets".to_string(),
+            }),
             author: Some(super::GraphQlActor {
                 login: "hubot".to_string(),
             }),
@@ -1513,9 +1533,29 @@ mod tests {
         assert_eq!(pr.subject.ci_status, Some(CiStatus::Success));
         assert_eq!(pr.subject.review_status, Some(ReviewStatus::Approved));
         assert_eq!(pr.subject.head_ref.as_deref(), Some("feature/one"));
+        assert_eq!(pr.base_ref.as_deref(), Some("main"));
+        assert_eq!(pr.head_repository.as_deref(), Some("acme/widgets"));
         assert_eq!(pr.subject.author.as_deref(), Some("hubot"));
         assert_eq!(pr.repository.full_name, "acme/widgets");
         assert_eq!(pr.repository.name, "widgets");
+    }
+
+    #[test]
+    fn transform_pull_request_preserves_fork_stack_metadata() {
+        let mut gql = sample_graphql_pr("pr-fork", false);
+        gql.base_ref_name = Some("feature/parent".to_string());
+        gql.head_repository = Some(super::GraphQlHeadRepository {
+            name_with_owner: "contributor/widgets".to_string(),
+        });
+
+        let pr = transform_pull_request(gql);
+        assert_eq!(pr.base_ref.as_deref(), Some("feature/parent"));
+        assert_eq!(pr.head_repository.as_deref(), Some("contributor/widgets"));
+        assert_eq!(pr.repository.full_name, "acme/widgets");
+
+        let mut gql = sample_graphql_pr("pr-deleted-fork", false);
+        gql.head_repository = None;
+        assert!(transform_pull_request(gql).head_repository.is_none());
     }
 
     #[test]
@@ -1548,6 +1588,8 @@ mod tests {
 
         let pull_requests = vec![
             MyPullRequest {
+                base_ref: None,
+                head_repository: None,
                 id: "pr-1".to_string(),
                 updated_at: "2024-01-02T00:00:00Z".to_string(),
                 subject: Subject {
@@ -1569,6 +1611,8 @@ mod tests {
                 url: "https://github.com/acme/widgets/pull/1".to_string(),
             },
             MyPullRequest {
+                base_ref: None,
+                head_repository: None,
                 id: "pr-2".to_string(),
                 updated_at: "2024-01-03T00:00:00Z".to_string(),
                 subject: Subject {

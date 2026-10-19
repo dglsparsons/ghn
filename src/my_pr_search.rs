@@ -191,6 +191,8 @@ mod tests {
         let mut app = AppState::new(false, HashSet::new());
         app.my_prs = (1..=9)
             .map(|number| MyPullRequest {
+                base_ref: None,
+                head_repository: None,
                 id: number.to_string(),
                 updated_at: String::new(),
                 url: format!("https://github.com/acme/api/pull/{number}"),

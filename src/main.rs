@@ -2721,6 +2721,8 @@ mod tests {
 
     fn sample_my_pr_with_url(url: &str, updated_at: &str) -> MyPullRequest {
         MyPullRequest {
+            base_ref: None,
+            head_repository: None,
             id: "pr-1".to_string(),
             updated_at: updated_at.to_string(),
             subject: Subject {

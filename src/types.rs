@@ -15,6 +15,8 @@ pub struct Notification {
 
 #[derive(Debug, Clone)]
 pub struct MyPullRequest {
+    pub base_ref: Option<String>,
+    pub head_repository: Option<String>,
     pub id: String,
     pub updated_at: String,
     pub subject: Subject,

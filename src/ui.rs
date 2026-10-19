@@ -349,17 +349,44 @@ impl BucketSection<'_> {
         let content_height = self
             .entries
             .iter()
-            .map(|entry| 3 + activity_line_count(&entry.item, discussions))
-            .sum::<usize>()
-            .saturating_sub(1);
+            .enumerate()
+            .map(|(idx, entry)| {
+                entry.row_height()
+                    + if entry.depth == 0 {
+                        activity_line_count(&entry.item, discussions)
+                    } else {
+                        0
+                    }
+                    + usize::from(self.spacer_after(idx))
+            })
+            .sum::<usize>();
         content_height.saturating_add(2).min(u16::MAX as usize) as u16
     }
 }
 
+impl BucketSection<'_> {
+    fn spacer_after(&self, index: usize) -> bool {
+        self.entries
+            .get(index + 1)
+            .is_some_and(|next| next.depth == 0)
+    }
+}
+
 struct BucketEntry<'a> {
+    depth: usize,
     index: usize,
     item: BucketItem<'a>,
     relative_time: &'a str,
+}
+
+impl BucketEntry<'_> {
+    fn row_height(&self) -> usize {
+        if self.depth == 0 {
+            2
+        } else {
+            1
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -400,6 +427,17 @@ fn draw_bucket_section(
         .zip(activity_limits)
         .enumerate()
         .map(|(idx, (entry, activity_limit))| {
+            let add_spacer = idx + 1 < visible_count && section.spacer_after(idx);
+            if entry.depth > 0 {
+                return build_stack_item(
+                    entry,
+                    pending,
+                    executing,
+                    discussions,
+                    &widths,
+                    add_spacer,
+                );
+            }
             build_list_item(
                 entry.index,
                 &entry.item,
@@ -408,7 +446,7 @@ fn draw_bucket_section(
                 executing,
                 activity_lines(&entry.item, discussions, activity_limit),
                 &widths,
-                idx + 1 < visible_count,
+                add_spacer,
             )
         })
         .collect();
@@ -471,14 +509,20 @@ fn visible_activity_limits(
 ) -> Vec<usize> {
     let mut remaining = height.saturating_sub(2) as usize;
     let mut limits = Vec::new();
-    for entry in &section.entries {
-        if remaining < 2 {
+    for (idx, entry) in section.entries.iter().enumerate() {
+        let row_height = entry.row_height();
+        if remaining < row_height {
             break;
         }
         // Preserve the PR header and title even when its activity cannot fit.
-        let activity_limit = activity_line_count(&entry.item, discussions).min(remaining - 2);
+        let activity_limit = if entry.depth == 0 {
+            activity_line_count(&entry.item, discussions).min(remaining - row_height)
+        } else {
+            0
+        };
         limits.push(activity_limit);
-        remaining = remaining.saturating_sub(3 + activity_limit);
+        remaining = remaining
+            .saturating_sub(row_height + activity_limit + usize::from(section.spacer_after(idx)));
     }
     limits
 }
@@ -937,6 +981,75 @@ impl NotificationBucket {
     }
 }
 
+fn build_stack_item(
+    entry: &BucketEntry<'_>,
+    pending: &HashMap<usize, Vec<Action>>,
+    executing: &HashSet<String>,
+    discussions: &HashMap<String, DiscussionInboxUpdate>,
+    widths: &LayoutWidths,
+    add_spacer: bool,
+) -> ListItem<'static> {
+    let subject = entry.item.subject();
+    let marker = action_marker(false, executing.contains(&subject.url));
+    let mut spans = vec![
+        Span::styled(
+            pad_left(&entry.index.to_string(), widths.index),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(NUMBER_MARKER_GAP)),
+        Span::styled(marker.text, marker.style),
+        Span::raw(" ".repeat(MARKER_REPO_GAP)),
+    ];
+    let mut content = vec![Span::styled(
+        format!(
+            "{}↳ {} ",
+            "  ".repeat(entry.depth.min(3)),
+            subject_number_label(subject).unwrap_or_default()
+        ),
+        Style::default().fg(Color::DarkGray),
+    )];
+    if let Some(indicator) = ci_indicator(subject) {
+        content.push(Span::styled(
+            format!("{} ", indicator.text),
+            indicator.style,
+        ));
+    }
+    if let Some(indicator) = review_indicator(subject) {
+        content.push(Span::styled(
+            format!("{} ", indicator.text),
+            indicator.style,
+        ));
+    }
+    for prefix in status_prefixes(subject) {
+        content.push(Span::styled(prefix.text, prefix.style));
+    }
+    if let Some(update) = discussions
+        .get(&subject.url)
+        .filter(|update| !update.activity.is_empty())
+    {
+        content.push(Span::styled(
+            format!("[{} updates] ", update.activity.len()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    content.push(Span::raw(subject.title.clone()));
+    let mut remaining = widths.title;
+    for span in content {
+        let text = truncate_with_suffix(&span.content, remaining);
+        remaining = remaining.saturating_sub(text.chars().count());
+        spans.push(Span::styled(text, span.style));
+        if remaining == 0 {
+            break;
+        }
+    }
+    let mut lines = vec![Line::from(spans)];
+    if add_spacer {
+        lines.push(Line::from(" "));
+    }
+    ListItem::new(lines)
+        .style(base_notification_style(false).patch(pending_style(pending.get(&entry.index))))
+}
+
 fn build_bucket_sections<'a>(
     notifications: &'a [Notification],
     notification_times: &'a [String],
@@ -947,11 +1060,23 @@ fn build_bucket_sections<'a>(
     let mut sections = Vec::new();
 
     for (bucket, keys) in build_bucket_key_sections(notifications, my_prs) {
+        let mine: Vec<_> = keys
+            .iter()
+            .filter_map(|key| match key {
+                DisplayEntryKey::MyPullRequest(idx) => Some(*idx),
+                _ => None,
+            })
+            .collect();
+        let depths: HashMap<_, _> = stack_order(&mine, my_prs).into_iter().collect();
         let entries: Vec<BucketEntry<'a>> = keys
             .into_iter()
             .filter_map(|key| {
                 let item = bucket_item(key, notifications, my_prs)?;
                 let entry = BucketEntry {
+                    depth: match key {
+                        DisplayEntryKey::MyPullRequest(idx) => depths[&idx],
+                        _ => 0,
+                    },
                     index: next_index,
                     item,
                     relative_time: relative_time_for_key(key, notification_times, my_pr_times),
@@ -965,6 +1090,62 @@ fn build_bucket_sections<'a>(
     }
 
     sections
+}
+
+// Only connect branches in the same repository; identical fork branch names are unrelated.
+fn stack_order(indices: &[usize], prs: &[MyPullRequest]) -> Vec<(usize, usize)> {
+    let mut parents = HashMap::new();
+    for &child in indices {
+        let Some(base) = prs[child].base_ref.as_deref() else {
+            continue;
+        };
+        let candidates: Vec<_> = indices
+            .iter()
+            .copied()
+            .filter(|&parent| {
+                parent != child
+                    && prs[parent].repository.full_name == prs[child].repository.full_name
+                    && prs[parent].head_repository.as_deref()
+                        == Some(prs[child].repository.full_name.as_str())
+                    && prs[parent].subject.head_ref.as_deref() == Some(base)
+            })
+            .collect();
+        if let [parent] = candidates.as_slice() {
+            parents.insert(child, *parent);
+        }
+    }
+    fn append(
+        index: usize,
+        depth: usize,
+        indices: &[usize],
+        parents: &HashMap<usize, usize>,
+        seen: &mut HashSet<usize>,
+        result: &mut Vec<(usize, usize)>,
+    ) {
+        if !seen.insert(index) {
+            return;
+        }
+        result.push((index, depth));
+        for &child in indices {
+            if parents.get(&child) == Some(&index) {
+                append(child, depth + 1, indices, parents, seen, result);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for &index in indices {
+        let mut root = index;
+        let mut path = HashSet::new();
+        while let Some(&parent) = parents.get(&root) {
+            if !path.insert(root) {
+                break;
+            }
+            root = parent;
+        }
+        append(root, 0, indices, &parents, &mut seen, &mut result);
+    }
+    result
 }
 
 fn build_bucket_key_sections(
@@ -1009,11 +1190,14 @@ fn build_bucket_key_sections(
     let (my_drafts, mine): (Vec<_>, Vec<_>) = mine
         .into_iter()
         .partition(|&idx| is_draft_pull_request(&my_prs[idx].subject));
+    let mine = stack_order(&mine, my_prs).into_iter().map(|(idx, _)| idx);
+    let my_drafts: Vec<_> = stack_order(&my_drafts, my_prs)
+        .into_iter()
+        .map(|(idx, _)| idx)
+        .collect();
     let mut sections = vec![(
         NotificationBucket::MyPrs,
-        mine.into_iter()
-            .map(DisplayEntryKey::MyPullRequest)
-            .collect(),
+        mine.map(DisplayEntryKey::MyPullRequest).collect(),
     )];
     if !my_drafts.is_empty() {
         sections.push((
@@ -1783,6 +1967,7 @@ fn action_allowed(action: &Action, entry: &PendingEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::DisplayEntryKey;
     use super::{
         action_marker, activity_line, base_notification_style, build_bucket_sections,
         build_pending_map, build_status_lines, build_visible_pending_map, ci_indicator,
@@ -1804,6 +1989,7 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier, Style};
     use std::collections::HashMap;
+    use std::collections::HashSet;
 
     fn sample_bucket_notification(
         id: &str,
@@ -1854,6 +2040,8 @@ mod tests {
         merge_state_status: Option<MergeStateStatus>,
     ) -> MyPullRequest {
         MyPullRequest {
+            base_ref: None,
+            head_repository: None,
             id: format!("pr-{id}"),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             subject: Subject {
@@ -1874,6 +2062,99 @@ mod tests {
             },
             url: format!("https://github.com/acme/widgets/pull/{id}"),
         }
+    }
+
+    fn stacked_prs() -> Vec<MyPullRequest> {
+        (1..=3)
+            .map(|id| {
+                let mut pr =
+                    sample_bucket_my_pr(&id.to_string(), Some(CiStatus::Success), None, None);
+                pr.subject.head_ref = Some(format!("rollout-{id}"));
+                pr.base_ref = Some(if id == 1 {
+                    "main".to_string()
+                } else {
+                    format!("rollout-{}", id - 1)
+                });
+                pr.head_repository = Some("acme/widgets".to_string());
+                pr
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stacks_follow_dependency_order_and_keep_each_target() {
+        let prs = stacked_prs();
+        assert_eq!(
+            super::stack_order(&[2, 1, 0], &prs),
+            vec![(0, 0), (1, 1), (2, 2)]
+        );
+        assert_eq!(
+            super::display_order(&[], &prs),
+            vec![
+                DisplayEntryKey::MyPullRequest(0),
+                DisplayEntryKey::MyPullRequest(1),
+                DisplayEntryKey::MyPullRequest(2),
+            ]
+        );
+        let sections = build_bucket_sections(&[], &[], &prs, &[]);
+        let section = &sections[0];
+        assert_eq!(section.required_height(&HashMap::new()), 6);
+        assert_eq!(
+            super::visible_entries_for_section(section, 5, &HashMap::new()),
+            2
+        );
+        assert_eq!(
+            super::visible_entries_for_section(section, 6, &HashMap::new()),
+            3
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 6)).unwrap();
+        let max = super::collect_layout_max(&[], &[], &prs, &[]);
+        terminal
+            .draw(|frame| {
+                super::draw_bucket_section(
+                    frame,
+                    frame.area(),
+                    section,
+                    &HashMap::new(),
+                    &HashSet::new(),
+                    &HashMap::new(),
+                    3,
+                    &max,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("3 of 3 shown"));
+        assert!(text.contains("↳ #2"));
+        assert!(text.contains("↳ #3"));
+        assert!(text.contains("My PR 3"));
+    }
+
+    #[test]
+    fn stacks_require_unambiguous_repository_branches_and_handle_cycles() {
+        let mut prs = stacked_prs();
+        prs[0].head_repository = Some("someone/widgets".to_string());
+        assert_eq!(
+            super::stack_order(&[2, 1, 0], &prs),
+            vec![(1, 0), (2, 1), (0, 0)]
+        );
+        prs[0].head_repository = Some("acme/widgets".to_string());
+        prs[0].base_ref = Some("rollout-3".to_string());
+        let order = super::stack_order(&[2, 1, 0], &prs);
+        assert_eq!(order.len(), 3);
+        assert_eq!(
+            order
+                .iter()
+                .map(|(idx, _)| idx)
+                .collect::<HashSet<_>>()
+                .len(),
+            3
+        );
+        prs[0].base_ref = None;
+        prs[2].subject.head_ref = prs[0].subject.head_ref.clone();
+        assert!(super::stack_order(&[2, 1, 0], &prs).contains(&(1, 0)));
     }
 
     #[test]
@@ -2407,6 +2688,8 @@ mod tests {
     fn build_pending_map_allows_review_for_my_prs() {
         let notifications = Vec::new();
         let my_prs = vec![MyPullRequest {
+            base_ref: None,
+            head_repository: None,
             id: "pr-1".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             subject: Subject {
@@ -2799,6 +3082,8 @@ mod tests {
         }];
 
         let my_prs = vec![MyPullRequest {
+            base_ref: None,
+            head_repository: None,
             id: "pr-2".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             subject: Subject {
@@ -3345,6 +3630,8 @@ mod tests {
             url: "https://github.com/acme/widgets/pull/1".to_string(),
         }];
         let my_prs = vec![MyPullRequest {
+            base_ref: None,
+            head_repository: None,
             id: "pr-1".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             subject: Subject {
